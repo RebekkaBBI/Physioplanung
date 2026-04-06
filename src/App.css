@@ -94,6 +94,18 @@
   min-width: 0;
 }
 
+.side-panels .export-buttons-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  flex-shrink: 0;
+}
+
+.side-panels .export-buttons-stack .btn-today {
+  width: 100%;
+  box-sizing: border-box;
+}
+
 /* Kürzere Patientenliste — Platz für Panel Kollision darunter (links neben dem Bereich mit Belegungsmuster) */
 .panel-patients {
   display: flex;
@@ -1238,12 +1250,120 @@
   line-height: 1.35;
 }
 
+.patient-export-modal {
+  max-width: min(92vw, 26rem);
+  max-height: min(88vh, 34rem);
+  display: flex;
+  flex-direction: column;
+}
+
+.patient-export-search-wrap {
+  margin-bottom: 0.5rem;
+}
+
+.patient-export-search-wrap .staff-modal-name-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.patient-export-list {
+  list-style: none;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  max-height: 14rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.patient-export-empty {
+  padding: 0.65rem 0.75rem;
+  font-size: 0.8rem;
+}
+
+.patient-export-pick {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  width: 100%;
+  margin: 0;
+  padding: 0.5rem 0.65rem;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  color: var(--text-h);
+  transition: background 0.12s;
+}
+
+.patient-export-pick:last-child {
+  border-bottom: none;
+}
+
+.patient-export-pick:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.patient-export-pick.is-selected {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.patient-export-pick-name {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.patient-export-pick-id {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.patient-export-date-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  margin: 0.35rem 0 0.75rem;
+}
+
+.patient-export-date-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.patient-export-date-label input {
+  font: inherit;
+  font-size: 0.875rem;
+  padding: 0.45rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-h);
+}
+
+.patient-export-footer-step2 {
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
 .staff-avail-scroll {
   overflow: auto;
   max-height: min(52vh, 420px);
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
   background: var(--surface-2);
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .staff-avail-table {
@@ -1305,7 +1425,8 @@
   border: 1px solid var(--border);
   border-radius: 3px;
   background: var(--surface);
-  cursor: pointer;
+  cursor: cell;
+  touch-action: none;
 }
 
 .staff-avail-slot.is-on {
@@ -1316,6 +1437,19 @@
 
 .staff-avail-slot:hover {
   filter: brightness(1.05);
+}
+
+.staff-art-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0 0 0.5rem;
+}
+
+.staff-art-bulk .btn-edit-save:disabled,
+.staff-art-bulk .btn-edit-cancel:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .staff-art-checklist {

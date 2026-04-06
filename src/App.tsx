@@ -11,7 +11,18 @@ import {
   type MutableRefObject,
   type SetStateAction,
 } from 'react'
+import {
+  PDFDocument,
+  StandardFonts,
+  rgb,
+  type PDFFont,
+  type PDFPage,
+} from 'pdf-lib'
+import JSZip from 'jszip'
 import './App.css'
+// YELLOW_BACKUP: automatische Voll-Backups — Schlüssel & Ring in ./backup.ts (Suche: YELLOW_BACKUP)
+import { startWeeklyBackupScheduler } from './backup'
+// YELLOW_AI: KI-API (Chat) — siehe src/ai/ (Suche: YELLOW_AI)
 
 const ROOMS = [
   'Physio 1',
@@ -53,6 +64,8 @@ type BelegungsmusterItem = {
   id: string
   label: string
   templateCells: Record<string, MusterTemplateCell>
+  /** 1 = nur eine Woche im Editor; Standard 3 Wochen wenn fehlend */
+  templateWeekCount?: 1 | 3
 }
 
 type MitarbeiterItem = {
@@ -146,6 +159,12 @@ function makeSlotKey(dateKeyStr: string, room: string, slotIndex: number): strin
 function parseDateKey(dk: string): Date {
   const [y, m, d] = dk.split('-').map(Number)
   return new Date(y, m - 1, d, 12, 0, 0)
+}
+
+function defaultPatientExportDateRange(): { from: string; to: string } {
+  const weekStart = startOfWeekMonday(new Date())
+  const weekEnd = addDays(weekStart, 6)
+  return { from: dateKey(weekStart), to: dateKey(weekEnd) }
 }
 
 /** Montag = 0 … Sonntag = 6 */
@@ -339,6 +358,8 @@ function isCellBooked(data: CellData | undefined): boolean {
 const STORAGE_KEY_V1 = 'physio-planung-bookings-v1'
 const STORAGE_KEY_V2 = 'physio-planung-slots-v2'
 const STORAGE_PANELS = 'physio-planung-panels-v1'
+/** Ansicht & Kalenderdatum (Auto-Save bei jeder Änderung) */
+const STORAGE_UI = 'physio-planung-ui-v1'
 /** Erhöhen, wenn sich die feste Belegungsarten-Liste ändert (Migration aus localStorage). */
 const ARTEN_CATALOG_VERSION = 3
 
@@ -373,9 +394,14 @@ const DEFAULT_ARTEN: BelegungsartItem[] = [
   { id: 'art-stretching-3', label: 'Stretching 3', color: '#c026d3', slots: 2 },
 ]
 
-/** Erster Dienstag im Muster (Woche 1), 08:00–12:00 Uhr, alle Räume mit Art OP */
-function buildOberschenkelOpDienstagTemplate(
+/**
+ * Woche 1, gewählter Wochentag (Mo=0 … So=6), ab 08:00 Uhr, alle Räume mit Art OP.
+ * @param slotToExclusive Erster Slot nach dem Block (je 30 Min); 8 = bis 12:00, 4 = bis 10:00.
+ */
+function buildOberschenkelOpWeekdayTemplate(
   opArt: BelegungsartItem,
+  weekdayMon0: number,
+  slotToExclusive: number = 8,
 ): Record<string, MusterTemplateCell> {
   const cell: MusterTemplateCell = {
     art: opArt.label,
@@ -384,13 +410,12 @@ function buildOberschenkelOpDienstagTemplate(
   }
   const max = slotCount()
   const weekIndex = 0
-  const wdDienstag = 1
   const slotFrom = 0
-  const slotTo = Math.min(8, max)
+  const slotTo = Math.min(slotToExclusive, max)
   const out: Record<string, MusterTemplateCell> = {}
   for (const room of ROOMS) {
     for (let sl = slotFrom; sl < slotTo; sl++) {
-      out[`${weekIndex}|${wdDienstag}|${room}|${sl}`] = { ...cell }
+      out[`${weekIndex}|${weekdayMon0}|${room}|${sl}`] = { ...cell }
     }
   }
   return out
@@ -402,7 +427,33 @@ const DEFAULT_MUSTER: BelegungsmusterItem[] = [
   {
     id: 'muster-oberschenkel-op-dienstag',
     label: 'Oberschenkelverlängerung OP Tag Dienstag',
-    templateCells: buildOberschenkelOpDienstagTemplate(_defaultOpArt),
+    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 1),
+  },
+  {
+    id: 'muster-unterschenkel-op-dienstag',
+    label: 'Unterschenkelverlängerung OP Tag Dienstag',
+    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 1),
+  },
+  {
+    id: 'muster-oberschenkel-op-mittwoch',
+    label: 'Oberschenkelverlängerung OP Tag Mittwoch',
+    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 2),
+  },
+  {
+    id: 'muster-unterschenkel-op-mittwoch',
+    label: 'Unterschenkelverlängerung OP Tag Mittwoch',
+    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 2),
+  },
+  {
+    id: 'muster-oberschenkel-op-freitag',
+    label: 'Oberschenkelverlängerung OP Tag Freitag',
+    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 4, 4),
+  },
+  {
+    id: 'muster-verlaengerungswoche',
+    label: 'Verlängerungswoche',
+    templateCells: {},
+    templateWeekCount: 1,
   },
   { id: 'm1', label: 'Kurzblock 30 Min', templateCells: {} },
   { id: 'm2', label: 'Standard 60 Min', templateCells: {} },
@@ -456,11 +507,23 @@ function saveSlotCells(next: Record<string, CellData>) {
   localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(next))
 }
 
+function normalizeMusterUsageCountById(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, number> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+      out[k] = Math.floor(v)
+    }
+  }
+  return out
+}
+
 function loadPanels(): {
   patients: PatientItem[]
   arten: BelegungsartItem[]
   muster: BelegungsmusterItem[]
   mitarbeiter: MitarbeiterItem[]
+  musterUsageCountById: Record<string, number>
 } | null {
   try {
     const raw = localStorage.getItem(STORAGE_PANELS)
@@ -471,6 +534,7 @@ function loadPanels(): {
       muster?: BelegungsmusterItem[]
       mitarbeiter?: MitarbeiterItem[]
       artenCatalogVersion?: number
+      musterUsageCountById?: unknown
     }
     const catalogOk =
       (o.artenCatalogVersion ?? 0) >= ARTEN_CATALOG_VERSION &&
@@ -487,11 +551,13 @@ function loadPanels(): {
           }))
         : DEFAULT_PATIENTS,
       arten: resolvedArten,
-      muster: ensureOberschenkelOpMusterPreset(
-        Array.isArray(o.muster)
-          ? o.muster.map(normalizeMusterItem)
-          : DEFAULT_MUSTER,
-        resolvedArten,
+      muster: ensureVerlaengerungswocheMusterPreset(
+        ensureOberschenkelOpMusterPreset(
+          Array.isArray(o.muster)
+            ? o.muster.map(normalizeMusterItem)
+            : DEFAULT_MUSTER,
+          resolvedArten,
+        ),
       ),
       mitarbeiter: Array.isArray(o.mitarbeiter)
         ? o.mitarbeiter
@@ -506,6 +572,7 @@ function loadPanels(): {
               ),
             )
         : DEFAULT_MITARBEITER,
+      musterUsageCountById: normalizeMusterUsageCountById(o.musterUsageCountById),
     }
   } catch {
     return null
@@ -517,6 +584,7 @@ function savePanelsState(p: {
   arten: BelegungsartItem[]
   muster: BelegungsmusterItem[]
   mitarbeiter: MitarbeiterItem[]
+  musterUsageCountById: Record<string, number>
 }) {
   localStorage.setItem(
     STORAGE_PANELS,
@@ -525,6 +593,904 @@ function savePanelsState(p: {
       artenCatalogVersion: ARTEN_CATALOG_VERSION,
     }),
   )
+}
+
+function loadUiState(): { viewMode: ViewMode; anchorDateKey: string } | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_UI)
+    if (!raw) return null
+    const o = JSON.parse(raw) as { viewMode?: unknown; anchorDateKey?: unknown }
+    const vm =
+      o.viewMode === 'day' || o.viewMode === 'week' ? o.viewMode : null
+    const ak =
+      typeof o.anchorDateKey === 'string' &&
+      /^\d{4}-\d{2}-\d{2}$/.test(o.anchorDateKey)
+        ? o.anchorDateKey
+        : null
+    if (!vm || !ak) return null
+    return { viewMode: vm, anchorDateKey: ak }
+  } catch {
+    return null
+  }
+}
+
+function saveUiState(viewMode: ViewMode, anchorDate: Date) {
+  localStorage.setItem(
+    STORAGE_UI,
+    JSON.stringify({
+      viewMode,
+      anchorDateKey: dateKey(anchorDate),
+    }),
+  )
+}
+
+function icsUtcStampNow(): string {
+  return new Date()
+    .toISOString()
+    .replace(/\.\d{3}Z$/, 'Z')
+    .replace(/[-:]/g, '')
+}
+
+function icsEscapeText(s: string): string {
+  return s
+    .replace(/\\/g, '\\\\')
+    .replace(/\n/g, '\\n')
+    .replace(/;/g, '\\;')
+    .replace(/,/g, '\\,')
+}
+
+function formatIcsLocalDateTime(dk: string, slotIndex: number): string {
+  const [y, m, d] = dk.split('-').map(Number)
+  const mins = DAY_START_HOUR * 60 + slotIndex * SLOT_MINUTES
+  const hh = Math.floor(mins / 60)
+  const mm = mins % 60
+  return `${String(y).padStart(4, '0')}${String(m).padStart(2, '0')}${String(d).padStart(2, '0')}T${String(hh).padStart(2, '0')}${String(mm).padStart(2, '0')}00`
+}
+
+function formatIcsLocalDateTimeEnd(dk: string, endSlotInclusive: number): string {
+  const n = slotCount()
+  const ex = endSlotInclusive + 1
+  if (ex >= n) {
+    const [y, m, d] = dk.split('-').map(Number)
+    return `${String(y).padStart(4, '0')}${String(m).padStart(2, '0')}${String(d).padStart(2, '0')}T${String(DAY_END_HOUR).padStart(2, '0')}0000`
+  }
+  return formatIcsLocalDateTime(dk, ex)
+}
+
+type PatientAppointmentExportRow = {
+  dk: string
+  room: Room
+  startSlot: number
+  endSlot: number
+  staffLabel: string
+  artLabel?: string
+}
+
+type StaffAppointmentExportRow = {
+  dk: string
+  room: Room
+  startSlot: number
+  endSlot: number
+  artLabel?: string
+  patientLabel: string
+}
+
+function slotEndTimeLabelExclusive(endSlotInclusive: number): string {
+  const n = slotCount()
+  const ex = endSlotInclusive + 1
+  if (ex >= n) {
+    return `${String(DAY_END_HOUR).padStart(2, '0')}:00`
+  }
+  return slotIndexToLabel(ex)
+}
+
+/**
+ * Vorlage A4 (595×842 pt). Maske: Fließtext ab ca. drittem Absatz („At the core…“) bis unten;
+ * Kopf inkl. erster Absätze bleibt sichtbar (vgl. Referenz-Screenshot).
+ */
+const PDF_TEMPLATE_BODY_MASK = { x: 45, y: 42, width: 505, height: 493 } as const
+
+const PATIENT_EXPORT_INTRO_DE = `Anbei erhalten Sie Ihre persönliche Trainings- und Terminübersicht aus dem BeckerBetzInstitute. Zusätzlich senden wir Ihnen die Termine auch als .ICS-Dateien, damit Sie diese bequem in Ihren Kalender übernehmen können.
+
+Wir bitten Sie höflich um Einhaltung der Termine sowie um Pünktlichkeit, um einen reibungslosen Ablauf zu gewährleisten. Sollte sich einmal ein Termin verschieben, informieren wir Sie selbstverständlich so früh wie möglich und bitten hierfür um Ihr Verständnis.`
+
+const PATIENT_EXPORT_INTRO_EN = `Please find attached your personal training and appointment schedule from the BeckerBetzInstitute. In addition, we are sending you the appointments as .ICS files so that you can easily add them to your calendar.
+
+We kindly ask you to adhere to the scheduled appointments and to arrive on time in order to ensure a smooth process. Should any appointment need to be rescheduled, we will inform you as early as possible and kindly ask for your understanding.`
+
+/** Fallback, wenn erste Seite ohne Einleitung (nur Tabellenkopf) gezeichnet wird */
+const PDF_TABLE = {
+  rowH: 13,
+  headerY: 448,
+  firstRowY: 432,
+  colDate: 52,
+  colTime: 102,
+  colRoom: 158,
+  colTermin: 228,
+} as const
+/** Zeilenhöhe, wenn Name / Belegungsart / Mitarbeiter untereinander stehen */
+const PDF_TERM_STACK_ROW_H = 28
+const PDF_TERM_STACK_FS = 7
+const PDF_TERM_STACK_MAX_W =
+  PDF_TEMPLATE_BODY_MASK.x + PDF_TEMPLATE_BODY_MASK.width - PDF_TABLE.colTermin - 8
+/** Patienten-PDF: weniger Zeilen pro Seite wegen Einleitung + höherer Terminzeilen */
+const PDF_ROWS_PATIENT_TERM_STACK_PAGE = 10
+const PDF_ROWS_STAFF_TERM_STACK_PAGE = 12
+
+
+function wrapPdfPlainParagraphs(
+  text: string,
+  font: PDFFont,
+  fontSize: number,
+  maxWidth: number,
+): string[] {
+  const out: string[] = []
+  const paragraphs = text.split(/\n\s*\n/)
+  for (const raw of paragraphs) {
+    const para = raw.replace(/\s+/g, ' ').trim()
+    if (!para) continue
+    const words = para.split(/\s+/)
+    let line = ''
+    for (const w of words) {
+      const test = line ? `${line} ${w}` : w
+      if (font.widthOfTextAtSize(test, fontSize) <= maxWidth) {
+        line = test
+      } else {
+        if (line) out.push(line)
+        line = w
+      }
+    }
+    if (line) out.push(line)
+  }
+  return out
+}
+
+function truncatePdfLineToWidth(
+  text: string,
+  font: PDFFont,
+  fontSize: number,
+  maxWidth: number,
+): string {
+  const t = text.trim() || '—'
+  if (font.widthOfTextAtSize(t, fontSize) <= maxWidth) return t
+  let lo = 0
+  let hi = t.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    const s = `${t.slice(0, mid)}…`
+    if (font.widthOfTextAtSize(s, fontSize) <= maxWidth) lo = mid
+    else hi = mid - 1
+  }
+  return lo > 0 ? `${t.slice(0, lo)}…` : '…'
+}
+
+/** Name, Belegungsart, Mitarbeiter jeweils eigene Zeile (oberste Baseline = topBaselineY). */
+function drawPdfTerminThreeLines(
+  page: PDFPage,
+  x: number,
+  topBaselineY: number,
+  line1: string,
+  line2: string,
+  line3: string,
+  font: PDFFont,
+  fontSize: number,
+  maxWidth: number,
+  color: ReturnType<typeof rgb>,
+): void {
+  const lh = fontSize + 2
+  let y = topBaselineY
+  for (const raw of [line1, line2, line3]) {
+    const t = truncatePdfLineToWidth(raw, font, fontSize, maxWidth)
+    page.drawText(t, { x, y, size: fontSize, font, color })
+    y -= lh
+  }
+}
+
+function pdfRgbFromHex(hex: string | undefined): { r: number; g: number; b: number } {
+  const h = (hex ?? '#cbd5e1').trim()
+  const m = /^#?([0-9a-f]{6})$/i.exec(h)
+  if (!m) return { r: 0.85, g: 0.87, b: 0.9 }
+  const n = parseInt(m[1], 16)
+  return {
+    r: ((n >> 16) & 255) / 255,
+    g: ((n >> 8) & 255) / 255,
+    b: (n & 255) / 255,
+  }
+}
+
+/** Alle Kalenderwochen (Montag-Datum), die den Zeitraum [fromDk, toDk] schneiden. */
+function listWeekMondaysBetween(fromDk: string, toDk: string): string[] {
+  const out: string[] = []
+  let mon = dateKey(startOfWeekMonday(parseDateKey(fromDk)))
+  const toD = parseDateKey(toDk)
+  while (parseDateKey(mon) <= toD) {
+    out.push(mon)
+    mon = dateKey(addDays(parseDateKey(mon), 7))
+  }
+  return out
+}
+
+async function downloadPatientAppointmentsPdf(
+  patient: PatientItem,
+  rows: PatientAppointmentExportRow[],
+  fileBase: string,
+) {
+  const templateUrl = `${import.meta.env.BASE_URL}vorlage-termine.pdf`
+  let templateBytes: ArrayBuffer
+  try {
+    const res = await fetch(templateUrl)
+    if (!res.ok) throw new Error(String(res.status))
+    templateBytes = await res.arrayBuffer()
+  } catch {
+    window.alert(
+      'Die PDF-Vorlage konnte nicht geladen werden (vorlage-termine.pdf im Ordner public).',
+    )
+    return
+  }
+
+  const templateDoc = await PDFDocument.load(templateBytes)
+  const outDoc = await PDFDocument.create()
+  const font = await outDoc.embedFont(StandardFonts.Helvetica)
+  const fontBold = await outDoc.embedFont(StandardFonts.HelveticaBold)
+
+  const chunks: PatientAppointmentExportRow[][] = []
+  for (let i = 0; i < rows.length; i += PDF_ROWS_PATIENT_TERM_STACK_PAGE) {
+    chunks.push(rows.slice(i, i + PDF_ROWS_PATIENT_TERM_STACK_PAGE))
+  }
+
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci]
+    const [embedded] = await outDoc.copyPages(templateDoc, [0])
+    outDoc.addPage(embedded)
+    const page = outDoc.getPage(outDoc.getPageCount() - 1)
+
+    page.drawRectangle({
+      x: PDF_TEMPLATE_BODY_MASK.x,
+      y: PDF_TEMPLATE_BODY_MASK.y,
+      width: PDF_TEMPLATE_BODY_MASK.width,
+      height: PDF_TEMPLATE_BODY_MASK.height,
+      color: rgb(1, 1, 1),
+      borderWidth: 0,
+    })
+
+    const sub = `${patient.name}${patient.patientCode.trim() ? ` · ${patient.patientCode}` : ''} · ${rows.length} Termin${rows.length === 1 ? '' : 'e'}`
+
+    let termY: number
+    let subY: number
+    let headerRowY: number
+    let firstDataRowY: number
+
+    if (ci === 0) {
+      termY = 500
+      subY = 482
+      const introW = PDF_TEMPLATE_BODY_MASK.width
+      let introSize = 8
+      let introLineH = 10
+      let linesDe = wrapPdfPlainParagraphs(PATIENT_EXPORT_INTRO_DE, font, introSize, introW)
+      let linesEn = wrapPdfPlainParagraphs(PATIENT_EXPORT_INTRO_EN, font, introSize, introW)
+      let introLines = [...linesDe, '', '', ...linesEn]
+      let introStartY = subY - 14
+      let yAfterIntro = introStartY - introLines.length * introLineH
+      if (yAfterIntro < 300) {
+        introSize = 7
+        introLineH = 9
+        linesDe = wrapPdfPlainParagraphs(PATIENT_EXPORT_INTRO_DE, font, introSize, introW)
+        linesEn = wrapPdfPlainParagraphs(PATIENT_EXPORT_INTRO_EN, font, introSize, introW)
+        introLines = [...linesDe, '', '', ...linesEn]
+        introStartY = subY - 12
+        yAfterIntro = introStartY - introLines.length * introLineH
+      }
+      page.drawText('Terminübersicht', {
+        x: PDF_TABLE.colDate,
+        y: termY,
+        size: 11,
+        font: fontBold,
+        color: rgb(0.15, 0.15, 0.15),
+      })
+      page.drawText(sub, {
+        x: PDF_TABLE.colDate,
+        y: subY,
+        size: 9,
+        font,
+        color: rgb(0.25, 0.25, 0.25),
+      })
+      let y = introStartY
+      for (const line of introLines) {
+        if (line) {
+          page.drawText(line, {
+            x: PDF_TEMPLATE_BODY_MASK.x,
+            y,
+            size: introSize,
+            font,
+            color: rgb(0.22, 0.22, 0.22),
+          })
+        }
+        y -= introLineH
+      }
+      headerRowY = y - 10
+      firstDataRowY = headerRowY - 14
+    } else {
+      termY = PDF_TABLE.headerY + 52
+      subY = PDF_TABLE.headerY + 34
+      headerRowY = PDF_TABLE.headerY
+      firstDataRowY = PDF_TABLE.firstRowY
+      page.drawText('Terminübersicht', {
+        x: PDF_TABLE.colDate,
+        y: termY,
+        size: 11,
+        font: fontBold,
+        color: rgb(0.15, 0.15, 0.15),
+      })
+      page.drawText(`${sub} · Fortsetzung`, {
+        x: PDF_TABLE.colDate,
+        y: subY,
+        size: 9,
+        font,
+        color: rgb(0.25, 0.25, 0.25),
+      })
+    }
+
+    page.drawText('Datum', {
+      x: PDF_TABLE.colDate,
+      y: headerRowY,
+      size: 8,
+      font: fontBold,
+      color: rgb(0, 0, 0),
+    })
+    page.drawText('Uhrzeit', {
+      x: PDF_TABLE.colTime,
+      y: headerRowY,
+      size: 8,
+      font: fontBold,
+      color: rgb(0, 0, 0),
+    })
+    page.drawText('Raum', {
+      x: PDF_TABLE.colRoom,
+      y: headerRowY,
+      size: 8,
+      font: fontBold,
+      color: rgb(0, 0, 0),
+    })
+    page.drawText('Termin', {
+      x: PDF_TABLE.colTermin,
+      y: headerRowY,
+      size: 8,
+      font: fontBold,
+      color: rgb(0, 0, 0),
+    })
+
+    let rowY = firstDataRowY
+    for (const r of chunk) {
+      if (rowY < 72) break
+      const dStr = parseDateKey(r.dk).toLocaleDateString('de-DE', {
+        weekday: 'short',
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+      })
+      const tStr = `${slotIndexToLabel(r.startSlot)}–${slotEndTimeLabelExclusive(r.endSlot)}`
+      const nameLine = `${patient.name}${patient.patientCode.trim() ? ` (${patient.patientCode})` : ''}`
+      const artLine = (r.artLabel || '—').trim() || '—'
+      const staffLine = (r.staffLabel || '—').trim() || '—'
+      page.drawText(dStr, {
+        x: PDF_TABLE.colDate,
+        y: rowY,
+        size: 8,
+        font,
+        color: rgb(0, 0, 0),
+      })
+      page.drawText(tStr, {
+        x: PDF_TABLE.colTime,
+        y: rowY,
+        size: 8,
+        font,
+        color: rgb(0, 0, 0),
+      })
+      page.drawText(r.room, {
+        x: PDF_TABLE.colRoom,
+        y: rowY,
+        size: 8,
+        font,
+        color: rgb(0, 0, 0),
+      })
+      drawPdfTerminThreeLines(
+        page,
+        PDF_TABLE.colTermin,
+        rowY,
+        nameLine,
+        artLine,
+        staffLine,
+        font,
+        PDF_TERM_STACK_FS,
+        PDF_TERM_STACK_MAX_W,
+        rgb(0, 0, 0),
+      )
+      rowY -= PDF_TERM_STACK_ROW_H
+    }
+  }
+
+  const pdfBytes = await outDoc.save()
+  const blob = new Blob([new Uint8Array(pdfBytes)], { type: 'application/pdf' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${fileBase}.pdf`
+  a.rel = 'noopener'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+async function downloadStaffAppointmentsPdf(
+  staff: MitarbeiterItem,
+  rows: StaffAppointmentExportRow[],
+  fileBase: string,
+) {
+  const templateUrl = `${import.meta.env.BASE_URL}vorlage-termine.pdf`
+  let templateBytes: ArrayBuffer
+  try {
+    const res = await fetch(templateUrl)
+    if (!res.ok) throw new Error(String(res.status))
+    templateBytes = await res.arrayBuffer()
+  } catch {
+    window.alert(
+      'Die PDF-Vorlage konnte nicht geladen werden (vorlage-termine.pdf im Ordner public).',
+    )
+    return
+  }
+
+  const templateDoc = await PDFDocument.load(templateBytes)
+  const outDoc = await PDFDocument.create()
+  const font = await outDoc.embedFont(StandardFonts.Helvetica)
+  const fontBold = await outDoc.embedFont(StandardFonts.HelveticaBold)
+
+  const chunks: StaffAppointmentExportRow[][] = []
+  for (let i = 0; i < rows.length; i += PDF_ROWS_STAFF_TERM_STACK_PAGE) {
+    chunks.push(rows.slice(i, i + PDF_ROWS_STAFF_TERM_STACK_PAGE))
+  }
+
+  const subAll = `${staff.name} · ${rows.length} Termin${rows.length === 1 ? '' : 'e'}`
+
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci]
+    const [embedded] = await outDoc.copyPages(templateDoc, [0])
+    outDoc.addPage(embedded)
+    const page = outDoc.getPage(outDoc.getPageCount() - 1)
+
+    page.drawRectangle({
+      x: PDF_TEMPLATE_BODY_MASK.x,
+      y: PDF_TEMPLATE_BODY_MASK.y,
+      width: PDF_TEMPLATE_BODY_MASK.width,
+      height: PDF_TEMPLATE_BODY_MASK.height,
+      color: rgb(1, 1, 1),
+      borderWidth: 0,
+    })
+
+    const termY = PDF_TABLE.headerY + 52
+    const subY = PDF_TABLE.headerY + 34
+    const headerRowY = PDF_TABLE.headerY
+    const firstDataRowY = PDF_TABLE.firstRowY
+
+    page.drawText('Terminübersicht Mitarbeiter', {
+      x: PDF_TABLE.colDate,
+      y: termY,
+      size: 11,
+      font: fontBold,
+      color: rgb(0.15, 0.15, 0.15),
+    })
+    page.drawText(ci === 0 ? subAll : `${subAll} · Fortsetzung`, {
+      x: PDF_TABLE.colDate,
+      y: subY,
+      size: 9,
+      font,
+      color: rgb(0.25, 0.25, 0.25),
+    })
+
+    page.drawText('Datum', {
+      x: PDF_TABLE.colDate,
+      y: headerRowY,
+      size: 8,
+      font: fontBold,
+      color: rgb(0, 0, 0),
+    })
+    page.drawText('Uhrzeit', {
+      x: PDF_TABLE.colTime,
+      y: headerRowY,
+      size: 8,
+      font: fontBold,
+      color: rgb(0, 0, 0),
+    })
+    page.drawText('Raum', {
+      x: PDF_TABLE.colRoom,
+      y: headerRowY,
+      size: 8,
+      font: fontBold,
+      color: rgb(0, 0, 0),
+    })
+    page.drawText('Termin', {
+      x: PDF_TABLE.colTermin,
+      y: headerRowY,
+      size: 8,
+      font: fontBold,
+      color: rgb(0, 0, 0),
+    })
+
+    let rowY = firstDataRowY
+    for (const r of chunk) {
+      if (rowY < 72) break
+      const dStr = parseDateKey(r.dk).toLocaleDateString('de-DE', {
+        weekday: 'short',
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+      })
+      const tStr = `${slotIndexToLabel(r.startSlot)}–${slotEndTimeLabelExclusive(r.endSlot)}`
+      const nameLine = (r.patientLabel || '—').trim() || '—'
+      const artLine = (r.artLabel || '—').trim() || '—'
+      const staffLine = staff.name.trim() || '—'
+      page.drawText(dStr, {
+        x: PDF_TABLE.colDate,
+        y: rowY,
+        size: 8,
+        font,
+        color: rgb(0, 0, 0),
+      })
+      page.drawText(tStr, {
+        x: PDF_TABLE.colTime,
+        y: rowY,
+        size: 8,
+        font,
+        color: rgb(0, 0, 0),
+      })
+      page.drawText(r.room, {
+        x: PDF_TABLE.colRoom,
+        y: rowY,
+        size: 8,
+        font,
+        color: rgb(0, 0, 0),
+      })
+      drawPdfTerminThreeLines(
+        page,
+        PDF_TABLE.colTermin,
+        rowY,
+        nameLine,
+        artLine,
+        staffLine,
+        font,
+        PDF_TERM_STACK_FS,
+        PDF_TERM_STACK_MAX_W,
+        rgb(0, 0, 0),
+      )
+      rowY -= PDF_TERM_STACK_ROW_H
+    }
+  }
+
+  const pdfBytes = await outDoc.save()
+  const blob = new Blob([new Uint8Array(pdfBytes)], { type: 'application/pdf' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${fileBase}.pdf`
+  a.rel = 'noopener'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+async function downloadRoomWeekLandscapePdf(
+  cells: Record<string, CellData>,
+  room: Room,
+  fromDk: string,
+  toDk: string,
+  fileBase: string,
+) {
+  const weeks = listWeekMondaysBetween(fromDk, toDk)
+  if (weeks.length === 0) {
+    window.alert('Kein gültiger Zeitraum.')
+    return
+  }
+
+  const outDoc = await PDFDocument.create()
+  const font = await outDoc.embedFont(StandardFonts.Helvetica)
+  const fontBold = await outDoc.embedFont(StandardFonts.HelveticaBold)
+
+  const W = 842
+  const H = 595
+  const M = 32
+  const timeColW = 38
+  const titleBlockH = 42
+  const dayHeaderH = 20
+  const slotsN = slotCount()
+  const gridTop = H - M - titleBlockH - dayHeaderH
+  const gridBottom = M
+  const gridH = gridTop - gridBottom
+  const slotH = gridH / slotsN
+  const gridX0 = M + timeColW
+  const gridW = W - 2 * M - timeColW
+  const dayColW = gridW / 7
+  const lineGray = rgb(0.78, 0.78, 0.82)
+  const gridMuted = rgb(0.94, 0.94, 0.95)
+  const textDark = rgb(0.12, 0.12, 0.14)
+
+  for (let wi = 0; wi < weeks.length; wi++) {
+    const weekMon = weeks[wi]
+    const page = outDoc.addPage([W, H])
+    const monD = parseDateKey(weekMon)
+    const sunD = addDays(monD, 6)
+    const title = `Raum ${room}`
+    const subtitle = `${monD.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' })} – ${sunD.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' })}${weeks.length > 1 ? ` · Woche ${wi + 1}/${weeks.length}` : ''}`
+
+    page.drawText(title, {
+      x: M,
+      y: H - M - 18,
+      size: 14,
+      font: fontBold,
+      color: textDark,
+    })
+    page.drawText(subtitle, {
+      x: M,
+      y: H - M - 34,
+      size: 8,
+      font,
+      color: rgb(0.38, 0.38, 0.42),
+    })
+
+    const dayHeaderBaseline = gridTop + 6
+
+    for (let di = 0; di < 7; di++) {
+      const dk = dateKey(addDays(monD, di))
+      const colLeft = gridX0 + di * dayColW
+      const label = parseDateKey(dk).toLocaleDateString('de-DE', {
+        weekday: 'short',
+        day: '2-digit',
+        month: '2-digit',
+      })
+      const lw = fontBold.widthOfTextAtSize(label, 8)
+      page.drawText(label, {
+        x: colLeft + (dayColW - lw) / 2,
+        y: dayHeaderBaseline,
+        size: 8,
+        font: fontBold,
+        color: textDark,
+      })
+      if (dk < fromDk || dk > toDk) {
+        page.drawRectangle({
+          x: colLeft + 0.5,
+          y: gridBottom,
+          width: dayColW - 1,
+          height: gridTop - gridBottom,
+          color: gridMuted,
+          borderWidth: 0,
+        })
+      }
+    }
+
+    for (let sl = 0; sl <= slotsN; sl++) {
+      const y = gridTop - sl * slotH
+      page.drawLine({
+        start: { x: M, y },
+        end: { x: gridX0 + gridW, y },
+        thickness: sl % 2 === 0 ? 0.6 : 0.25,
+        color: lineGray,
+      })
+    }
+    for (let di = 0; di <= 7; di++) {
+      const x = gridX0 + di * dayColW
+      page.drawLine({
+        start: { x, y: gridBottom },
+        end: { x, y: gridTop },
+        thickness: 0.6,
+        color: lineGray,
+      })
+    }
+    page.drawLine({
+      start: { x: M, y: gridBottom },
+      end: { x: M, y: gridTop },
+      thickness: 0.6,
+      color: lineGray,
+    })
+
+    for (let sl = 0; sl < slotsN; sl += 2) {
+      const lab = slotIndexToLabel(sl)
+      const y = gridTop - sl * slotH - slotH * 0.35
+      page.drawText(lab, {
+        x: M + 2,
+        y,
+        size: 6,
+        font,
+        color: rgb(0.35, 0.35, 0.4),
+      })
+    }
+
+    for (let di = 0; di < 7; di++) {
+      const dk = dateKey(addDays(monD, di))
+      if (dk < fromDk || dk > toDk) continue
+      const colLeft = gridX0 + di * dayColW
+      for (let sl = 0; sl < slotsN; sl++) {
+        const seg = daySlotBlockSegment(cells, dk, room, sl, slotsN)
+        if (seg !== 'start' && seg !== 'single') continue
+        const anchor = cells[makeSlotKey(dk, room, sl)]
+        if (!isCellBooked(anchor)) continue
+        const { start, end } = findBlockBounds(cells, dk, room, sl)
+        const topY = gridTop - start * slotH
+        const bottomY = gridTop - (end + 1) * slotH
+        const h = topY - bottomY
+        const hex = cellAccentColor(anchor)
+        const { r: rr, g: gg, b: bb } = pdfRgbFromHex(hex)
+        const fill = rgb(0.7 + 0.3 * rr, 0.7 + 0.3 * gg, 0.7 + 0.3 * bb)
+        page.drawRectangle({
+          x: colLeft + 1.5,
+          y: bottomY + 0.5,
+          width: dayColW - 3,
+          height: h - 1,
+          color: fill,
+          borderColor: rgb(0.45, 0.45, 0.5),
+          borderWidth: 0.35,
+        })
+        const parts = cellTerminLabelParts(anchor)
+        const l1 = parts.patient ?? '—'
+        const l2 = parts.art ?? '—'
+        const l3 = parts.staffName ?? 'Mitarbeiter zuteilen'
+        const maxW = dayColW - 6
+        const innerH = h - 4
+        const topInsetFor = (f: number) => 6 + f * 0.45
+        let fs = 5.5
+        let lh = fs + 2
+        while (fs > 3.75 && topInsetFor(fs) + 3 * lh > innerH) {
+          fs -= 0.35
+          lh = fs + 2
+        }
+        const topBaseline = topY - topInsetFor(fs)
+        drawPdfTerminThreeLines(
+          page,
+          colLeft + 3,
+          topBaseline,
+          l1,
+          l2,
+          l3,
+          font,
+          fs,
+          maxW,
+          textDark,
+        )
+      }
+    }
+  }
+
+  const pdfBytes = await outDoc.save()
+  const blob = new Blob([new Uint8Array(pdfBytes)], { type: 'application/pdf' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${fileBase}.pdf`
+  a.rel = 'noopener'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+function safeIcsZipPathSegment(s: string, maxLen = 80): string {
+  const t = s
+    .replace(/[/\\:*?"<>|]/g, '-')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+  return t.length > maxLen ? t.slice(0, maxLen) : t
+}
+
+function buildSingleAppointmentIcsContent(
+  patient: PatientItem,
+  r: PatientAppointmentExportRow,
+  dtStamp: string,
+  eventUid: string,
+): string {
+  const dtStart = formatIcsLocalDateTime(r.dk, r.startSlot)
+  const dtEnd = formatIcsLocalDateTimeEnd(r.dk, r.endSlot)
+  const sum = `Termin: ${patient.name}`
+  const descParts = [
+    `Patient: ${patient.name}`,
+    patient.patientCode.trim() ? `Patienten-ID: ${patient.patientCode}` : '',
+    `Raum: ${r.room}`,
+    `Behandler: ${r.staffLabel}`,
+    r.artLabel?.trim() ? `Belegungsart: ${r.artLabel.trim()}` : 'Belegungsart: —',
+  ].filter(Boolean)
+  const lines = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Physioplanung//Patientexport//DE',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    'BEGIN:VEVENT',
+    `UID:${eventUid}`,
+    `DTSTAMP:${dtStamp}`,
+    `DTSTART:${dtStart}`,
+    `DTEND:${dtEnd}`,
+    `SUMMARY:${icsEscapeText(sum)}`,
+    `DESCRIPTION:${icsEscapeText(descParts.join('\n'))}`,
+    `LOCATION:${icsEscapeText(r.room)}`,
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ]
+  return lines.join('\r\n') + '\r\n'
+}
+
+function cellDataToPatientExportPair(
+  cells: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  anchorSlot: number,
+): { patient: PatientItem; row: PatientAppointmentExportRow } | null {
+  const { start, end } = findBlockBounds(cells, dk, room, anchorSlot)
+  const anchor = cells[makeSlotKey(dk, room, start)]
+  if (!anchor || !isCellBooked(anchor)) return null
+  const patient: PatientItem = {
+    id: 'ics-export',
+    name: anchor.patient?.trim() || 'Termin',
+    patientCode: anchor.patientCode?.trim() ?? '',
+  }
+  const row: PatientAppointmentExportRow = {
+    dk,
+    room,
+    startSlot: start,
+    endSlot: end,
+    staffLabel: anchor.staff?.trim() || '—',
+    artLabel: anchor.art?.trim() || undefined,
+  }
+  return { patient, row }
+}
+
+function downloadSingleTerminIcsFile(
+  patient: PatientItem,
+  row: PatientAppointmentExportRow,
+  fileBase: string,
+) {
+  const dtStamp = icsUtcStampNow()
+  const uid = `physio-${row.dk}-s${row.startSlot}-ics-${row.room.replace(/\s+/g, '')}@physioplanung`
+  const body = buildSingleAppointmentIcsContent(patient, row, dtStamp, uid)
+  const blob = new Blob([body], { type: 'text/calendar;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${fileBase}.ics`
+  a.rel = 'noopener'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+async function downloadPatientAppointmentsIcsZipFolder(
+  patient: PatientItem,
+  rows: PatientAppointmentExportRow[],
+  fileBase: string,
+) {
+  const dtStamp = icsUtcStampNow()
+  const zip = new JSZip()
+  const folderLabel = safeIcsZipPathSegment(
+    `${patient.name}_${patient.patientCode.trim() || 'Patient'}`,
+    72,
+  )
+  const folder = zip.folder(`Termine_${folderLabel}`)
+  if (!folder) return
+  rows.forEach((r, i) => {
+    const n = String(i + 1).padStart(3, '0')
+    const uid = `physio-${r.dk}-s${r.startSlot}-${n}-${r.room.replace(/\s+/g, '')}@physioplanung`
+    const fileName = `${safeIcsZipPathSegment(`termin-${n}-${r.dk}-${r.room}`, 100)}.ics`
+    const body = buildSingleAppointmentIcsContent(patient, r, dtStamp, uid)
+    folder.file(fileName, body)
+  })
+  const blob = await zip.generateAsync({ type: 'blob' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${fileBase}-termine-ics.zip`
+  a.rel = 'noopener'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
 }
 
 function bookingsForDayRoom(
@@ -557,6 +1523,10 @@ function isRoomString(x: unknown): x is Room {
 const MUSTER_TEMPLATE_MONDAY = calendarDate(new Date(1970, 0, 5))
 const MUSTER_TEMPLATE_WEEK_COUNT = 3
 const MUSTER_TEMPLATE_DAY_COUNT = MUSTER_TEMPLATE_WEEK_COUNT * 7
+
+function effectiveMusterTemplateWeekCount(m: BelegungsmusterItem): number {
+  return m.templateWeekCount === 1 ? 1 : MUSTER_TEMPLATE_WEEK_COUNT
+}
 
 function templateDkForDayIndex(dayIndex: number): string {
   return dateKey(addDays(MUSTER_TEMPLATE_MONDAY, dayIndex))
@@ -692,14 +1662,17 @@ function tryApplyMusterWeekToSlots(
   weekStart: Date,
   templateCells: Record<string, MusterTemplateCell>,
   artenList: BelegungsartItem[],
+  templateWeekCount: number,
+  musterStamp: MusterApplyStamp | null,
 ): { next: Record<string, CellData> } | { error: string } {
   const virt = musterTemplateToVirtual(templateCells)
   const seen = new Set<string>()
   type Op = { targetKeys: string[]; cells: CellData[] }
   const ops: Op[] = []
   const max = slotCount()
+  const dayCount = templateWeekCount * 7
 
-  for (let dayIndex = 0; dayIndex < MUSTER_TEMPLATE_DAY_COUNT; dayIndex++) {
+  for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
     const vdk = templateDkForDayIndex(dayIndex)
     for (const room of ROOMS) {
       for (let sl = 0; sl < max; sl++) {
@@ -729,14 +1702,23 @@ function tryApplyMusterWeekToSlots(
       if (isCellBooked(next[tk])) {
         return {
           error:
-            'In den drei Zielwochen sind Zellen bereits belegt. Bitte freie Bereiche wählen oder Zellen leeren.',
+            templateWeekCount === 1
+              ? 'In der Zielwoche sind Zellen bereits belegt. Bitte freie Bereiche wählen oder Zellen leeren.'
+              : 'In den Zielwochen des Musters sind Zellen bereits belegt. Bitte freie Bereiche wählen oder Zellen leeren.',
         }
       }
     }
   }
   for (const op of ops) {
     for (let i = 0; i < op.targetKeys.length; i++) {
-      next[op.targetKeys[i]] = { ...op.cells[i] }
+      const src = op.cells[i]!
+      const placed: CellData = { ...src }
+      if (musterStamp) {
+        placed.muster = musterStamp.label
+        const ac = src.artColor
+        if (ac) placed.musterColor = ac
+      }
+      next[op.targetKeys[i]] = placed
     }
   }
   return { next }
@@ -876,15 +1858,23 @@ function staffAllowsMusterPlacement(
   return true
 }
 
+type MusterApplyStamp = { label: string }
+
 function mergePatientIntoMusterCell(
   tpl: CellData,
   patientName: string,
   patientCode: string | undefined,
   terminKollision: boolean,
+  musterStamp: MusterApplyStamp | null,
 ): CellData {
   const out: CellData = { ...tpl, patient: patientName, patientCode }
   if (terminKollision) out.terminKollision = true
   else delete out.terminKollision
+  if (musterStamp) {
+    out.muster = musterStamp.label
+    const ac = tpl.artColor
+    if (ac) out.musterColor = ac
+  }
   return out
 }
 
@@ -898,6 +1888,8 @@ function applyMusterWithPatientWeek(
   artenList: BelegungsartItem[],
   staffList: MitarbeiterItem[],
   clearAnchor: { dk: string; room: Room; slotIndex: number },
+  templateWeekCount: number,
+  musterStamp: MusterApplyStamp | null,
 ): Record<string, CellData> {
   const virt = musterTemplateToVirtual(templateCells)
   const seen = new Set<string>()
@@ -910,8 +1902,9 @@ function applyMusterWithPatientWeek(
   }
   const ops: Op[] = []
   const max = slotCount()
+  const dayCount = templateWeekCount * 7
 
-  for (let dayIndex = 0; dayIndex < MUSTER_TEMPLATE_DAY_COUNT; dayIndex++) {
+  for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
     const vdk = templateDkForDayIndex(dayIndex)
     const tDk = dateKey(addDays(weekStart, dayIndex))
     const wd = weekdayMon0FromDate(parseDateKey(tDk))
@@ -1008,6 +2001,7 @@ function applyMusterWithPatientWeek(
           patientName,
           patientCode,
           collision,
+          musterStamp,
         )
     }
   }
@@ -1265,6 +2259,7 @@ function normalizeMusterItem(raw: unknown): BelegungsmusterItem {
     id?: string
     label?: string
     templateCells?: Record<string, MusterTemplateCell>
+    templateWeekCount?: unknown
   }
   if (!r || typeof r.id !== 'string' || typeof r.label !== 'string') {
     return {
@@ -1273,34 +2268,87 @@ function normalizeMusterItem(raw: unknown): BelegungsmusterItem {
       templateCells: {},
     }
   }
+  const tw =
+    r.templateWeekCount === 1 || r.templateWeekCount === 3
+      ? r.templateWeekCount
+      : undefined
   if (r.templateCells && typeof r.templateCells === 'object') {
     return {
       id: r.id,
       label: r.label,
       templateCells: { ...r.templateCells },
+      ...(tw !== undefined ? { templateWeekCount: tw } : {}),
     }
   }
-  return { id: r.id, label: r.label, templateCells: {} }
+  return {
+    id: r.id,
+    label: r.label,
+    templateCells: {},
+    ...(tw !== undefined ? { templateWeekCount: tw } : {}),
+  }
 }
 
-/** Fehlendes Standard-Muster nachziehen (z. B. nach Update), sofern Belegungsart OP existiert */
+/** Fehlende Standard-Muster nachziehen (z. B. nach Update), sofern Belegungsart OP existiert */
 function ensureOberschenkelOpMusterPreset(
   list: BelegungsmusterItem[],
   artenList: BelegungsartItem[],
 ): BelegungsmusterItem[] {
-  if (list.some((m) => m.id === 'muster-oberschenkel-op-dienstag')) {
-    return list
-  }
   const opArt = artenList.find((a) => a.id === OP_BELEGUNGSART_ID)
   if (!opArt) return list
-  return [
-    {
+  const prefix: BelegungsmusterItem[] = []
+  if (!list.some((m) => m.id === 'muster-oberschenkel-op-dienstag')) {
+    prefix.push({
       id: 'muster-oberschenkel-op-dienstag',
       label: 'Oberschenkelverlängerung OP Tag Dienstag',
-      templateCells: buildOberschenkelOpDienstagTemplate(opArt),
-    },
-    ...list,
-  ]
+      templateCells: buildOberschenkelOpWeekdayTemplate(opArt, 1),
+    })
+  }
+  if (!list.some((m) => m.id === 'muster-unterschenkel-op-dienstag')) {
+    prefix.push({
+      id: 'muster-unterschenkel-op-dienstag',
+      label: 'Unterschenkelverlängerung OP Tag Dienstag',
+      templateCells: buildOberschenkelOpWeekdayTemplate(opArt, 1),
+    })
+  }
+  if (!list.some((m) => m.id === 'muster-oberschenkel-op-mittwoch')) {
+    prefix.push({
+      id: 'muster-oberschenkel-op-mittwoch',
+      label: 'Oberschenkelverlängerung OP Tag Mittwoch',
+      templateCells: buildOberschenkelOpWeekdayTemplate(opArt, 2),
+    })
+  }
+  if (!list.some((m) => m.id === 'muster-unterschenkel-op-mittwoch')) {
+    prefix.push({
+      id: 'muster-unterschenkel-op-mittwoch',
+      label: 'Unterschenkelverlängerung OP Tag Mittwoch',
+      templateCells: buildOberschenkelOpWeekdayTemplate(opArt, 2),
+    })
+  }
+  if (!list.some((m) => m.id === 'muster-oberschenkel-op-freitag')) {
+    prefix.push({
+      id: 'muster-oberschenkel-op-freitag',
+      label: 'Oberschenkelverlängerung OP Tag Freitag',
+      templateCells: buildOberschenkelOpWeekdayTemplate(opArt, 4, 4),
+    })
+  }
+  return prefix.length > 0 ? [...prefix, ...list] : list
+}
+
+function ensureVerlaengerungswocheMusterPreset(
+  list: BelegungsmusterItem[],
+): BelegungsmusterItem[] {
+  if (list.some((m) => m.id === 'muster-verlaengerungswoche')) return list
+  const entry: BelegungsmusterItem = {
+    id: 'muster-verlaengerungswoche',
+    label: 'Verlängerungswoche',
+    templateCells: {},
+    templateWeekCount: 1,
+  }
+  const m1Idx = list.findIndex((m) => m.id === 'm1')
+  if (m1Idx >= 0) {
+    return [...list.slice(0, m1Idx), entry, ...list.slice(m1Idx)]
+  }
+  return [...list, entry]
 }
 
 function parseDragPayload(dt: DataTransfer): DragPayload | null {
@@ -1400,6 +2448,99 @@ function parseSlotCellKey(
   return { dk, room, slot }
 }
 
+function cellMatchesPatientRecord(c: CellData, p: PatientItem): boolean {
+  if (!c?.patient?.trim()) return false
+  if (c.patient.trim() !== p.name.trim()) return false
+  const cc = (c.patientCode ?? '').trim()
+  const pc = (p.patientCode ?? '').trim()
+  if (pc === '') return true
+  return cc === pc
+}
+
+function collectPatientAppointmentsInRange(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+  fromDk: string,
+  toDk: string,
+): PatientAppointmentExportRow[] {
+  const seen = new Set<string>()
+  const out: PatientAppointmentExportRow[] = []
+  for (const [key, data] of Object.entries(cells)) {
+    if (!isCellBooked(data)) continue
+    if (!cellMatchesPatientRecord(data, patient)) continue
+    const pos = parseSlotCellKey(key)
+    if (!pos) continue
+    if (pos.dk < fromDk || pos.dk > toDk) continue
+    const { start, end } = findBlockBounds(cells, pos.dk, pos.room, pos.slot)
+    const canon = `${pos.dk}|${pos.room}|${start}`
+    if (seen.has(canon)) continue
+    seen.add(canon)
+    const anchor = cells[makeSlotKey(pos.dk, pos.room, start)]
+    const staffLabel = anchor?.staff?.trim() || '—'
+    out.push({
+      dk: pos.dk,
+      room: pos.room,
+      startSlot: start,
+      endSlot: end,
+      staffLabel,
+      artLabel: anchor?.art?.trim() || undefined,
+    })
+  }
+  out.sort((a, b) => {
+    if (a.dk !== b.dk) return a.dk.localeCompare(b.dk)
+    if (a.room !== b.room) return a.room.localeCompare(b.room)
+    return a.startSlot - b.startSlot
+  })
+  return out
+}
+
+function cellMatchesStaffRecord(
+  data: CellData | undefined,
+  staff: MitarbeiterItem,
+): boolean {
+  if (!data) return false
+  const sid = (data.staffId ?? '').trim()
+  if (sid !== '') return sid === staff.id
+  const sn = (data.staff ?? '').trim()
+  return sn !== '' && sn === staff.name.trim()
+}
+
+function collectStaffAppointmentsInRange(
+  cells: Record<string, CellData>,
+  staff: MitarbeiterItem,
+  fromDk: string,
+  toDk: string,
+): StaffAppointmentExportRow[] {
+  const seen = new Set<string>()
+  const out: StaffAppointmentExportRow[] = []
+  for (const [key, data] of Object.entries(cells)) {
+    if (!isCellBooked(data)) continue
+    if (!cellMatchesStaffRecord(data, staff)) continue
+    const pos = parseSlotCellKey(key)
+    if (!pos) continue
+    if (pos.dk < fromDk || pos.dk > toDk) continue
+    const { start, end } = findBlockBounds(cells, pos.dk, pos.room, pos.slot)
+    const canon = `${pos.dk}|${pos.room}|${start}`
+    if (seen.has(canon)) continue
+    seen.add(canon)
+    const anchor = cells[makeSlotKey(pos.dk, pos.room, start)]
+    out.push({
+      dk: pos.dk,
+      room: pos.room,
+      startSlot: start,
+      endSlot: end,
+      artLabel: anchor?.art?.trim() || undefined,
+      patientLabel: anchor?.patient?.trim() || '—',
+    })
+  }
+  out.sort((a, b) => {
+    if (a.dk !== b.dk) return a.dk.localeCompare(b.dk)
+    if (a.room !== b.room) return a.room.localeCompare(b.room)
+    return a.startSlot - b.startSlot
+  })
+  return out
+}
+
 function formatKollisionDatumZeile(dk: string, room: Room, startSlot: number) {
   const d = parseDateKey(dk)
   const dateStr = d.toLocaleDateString('de-DE', {
@@ -1481,6 +2622,7 @@ function cellAccentColor(data: CellData | undefined): string | undefined {
 const SLOT_UNDO_MAX = 50
 
 type MusterWeekEditorGridProps = {
+  weekCount: number
   draftCells: Record<string, CellData>
   dragOverKey: string | null
   setDragOverKey: Dispatch<SetStateAction<string | null>>
@@ -1505,6 +2647,7 @@ type MusterWeekEditorGridProps = {
 }
 
 function MusterWeekEditorGrid({
+  weekCount,
   draftCells,
   dragOverKey,
   setDragOverKey,
@@ -1519,7 +2662,7 @@ function MusterWeekEditorGrid({
   const slotsN = slotCount()
   return (
     <div className="muster-three-weeks-editor">
-      {Array.from({ length: MUSTER_TEMPLATE_WEEK_COUNT }, (_, weekIndex) => (
+      {Array.from({ length: weekCount }, (_, weekIndex) => (
         <div key={weekIndex} className="muster-week-block">
           <div className="muster-week-block-head">
             Woche {weekIndex + 1}
@@ -1843,8 +2986,16 @@ function cloneSlotMap(c: Record<string, CellData>): Record<string, CellData> {
 
 export default function App() {
   const initialPanels = useMemo(() => loadPanels(), [])
-  const [viewMode, setViewMode] = useState<ViewMode>('week')
-  const [anchorDate, setAnchorDate] = useState(() => calendarDate(new Date()))
+  const initialUi = useMemo(() => loadUiState(), [])
+  const [viewMode, setViewMode] = useState<ViewMode>(
+    () => initialUi?.viewMode ?? 'week',
+  )
+  const [anchorDate, setAnchorDate] = useState(
+    () =>
+      initialUi?.anchorDateKey
+        ? parseDateKey(initialUi.anchorDateKey)
+        : calendarDate(new Date()),
+  )
   const [slotCells, setSlotCellsBase] = useState<Record<string, CellData>>(
     loadSlotCells,
   )
@@ -1892,8 +3043,13 @@ export default function App() {
   const [muster, setMuster] = useState<BelegungsmusterItem[]>(
     () => initialPanels?.muster ?? DEFAULT_MUSTER,
   )
+  const [musterUsageCountById, setMusterUsageCountById] = useState<
+    Record<string, number>
+  >(() => initialPanels?.musterUsageCountById ?? {})
   const [musterModal, setMusterModal] = useState<
-    null | { mode: 'create' } | { mode: 'edit'; id: string }
+    | null
+    | { mode: 'create'; templateWeekCount: 1 | 3 }
+    | { mode: 'edit'; id: string; templateWeekCount: 1 | 3 }
   >(null)
   const [musterDraftLabel, setMusterDraftLabel] = useState('')
   const [musterDraftCells, setMusterDraftCells] = useState<Record<string, CellData>>(
@@ -1929,10 +3085,37 @@ export default function App() {
   const [editPatientName, setEditPatientName] = useState('')
   const [editPatientCode, setEditPatientCode] = useState('')
   const [patientSearchQuery, setPatientSearchQuery] = useState('')
+  const [patientExportOpen, setPatientExportOpen] = useState(false)
+  const [patientExportStep, setPatientExportStep] = useState<1 | 2>(1)
+  const [patientExportQuery, setPatientExportQuery] = useState('')
+  const [patientExportSelectedId, setPatientExportSelectedId] = useState<
+    string | null
+  >(null)
+  const [patientExportFrom, setPatientExportFrom] = useState('')
+  const [patientExportTo, setPatientExportTo] = useState('')
+  const [staffExportOpen, setStaffExportOpen] = useState(false)
+  const [staffExportStep, setStaffExportStep] = useState<1 | 2>(1)
+  const [staffExportQuery, setStaffExportQuery] = useState('')
+  const [staffExportSelectedId, setStaffExportSelectedId] = useState<string | null>(
+    null,
+  )
+  const [staffExportFrom, setStaffExportFrom] = useState('')
+  const [staffExportTo, setStaffExportTo] = useState('')
+  const [roomExportOpen, setRoomExportOpen] = useState(false)
+  const [roomExportStep, setRoomExportStep] = useState<1 | 2>(1)
+  const [roomExportRoom, setRoomExportRoom] = useState<Room | null>(null)
+  const [roomExportFrom, setRoomExportFrom] = useState('')
+  const [roomExportTo, setRoomExportTo] = useState('')
   const dayGridRef = useRef<HTMLDivElement>(null)
   const pendingScrollToNow = useRef(false)
   const dragSourceRef = useRef<'panel' | 'cell' | 'resize' | null>(null)
   const suppressSlotClickAfterDrag = useRef(0)
+  /** Mitarbeiter-Verfügbarkeit: Klick+Ziehen zum Markieren/Demarkieren */
+  const staffAvailPaintRef = useRef<{
+    active: boolean
+    targetOn: boolean
+  } | null>(null)
+  /* Automatisches Speichern: Kalender, Stammdaten, Ansicht — bei jeder Änderung */
   useEffect(() => {
     saveSlotCells(slotCells)
   }, [slotCells])
@@ -1942,8 +3125,22 @@ export default function App() {
   }, [slotCells])
 
   useEffect(() => {
-    savePanelsState({ patients, arten, muster, mitarbeiter })
-  }, [patients, arten, muster, mitarbeiter])
+    savePanelsState({
+      patients,
+      arten,
+      muster,
+      mitarbeiter,
+      musterUsageCountById,
+    })
+  }, [patients, arten, muster, mitarbeiter, musterUsageCountById])
+
+  useEffect(() => {
+    saveUiState(viewMode, anchorDate)
+  }, [viewMode, anchorDate])
+
+  useEffect(() => {
+    return startWeeklyBackupScheduler()
+  }, [])
 
   useEffect(() => {
     if (!pendingScrollToNow.current || viewMode !== 'day') return
@@ -1984,6 +3181,36 @@ export default function App() {
     () => listKollisionPanelItems(slotCells, arten, mitarbeiter),
     [slotCells, arten, mitarbeiter],
   )
+
+  /** Panel: nach Häufigkeit im Hauptkalender (Slot-Zellen), bei Gleichstand Katalogreihenfolge */
+  const artenSortedForPanel = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const a of arten) counts.set(a.id, 0)
+    for (const d of Object.values(slotCells)) {
+      if (!isCellBooked(d)) continue
+      const id = findArtIdForCell(d, arten)
+      if (!id) continue
+      counts.set(id, (counts.get(id) ?? 0) + 1)
+    }
+    const indexById = new Map(arten.map((a, i) => [a.id, i] as const))
+    return [...arten].sort((a, b) => {
+      const ca = counts.get(a.id) ?? 0
+      const cb = counts.get(b.id) ?? 0
+      if (cb !== ca) return cb - ca
+      return (indexById.get(a.id) ?? 0) - (indexById.get(b.id) ?? 0)
+    })
+  }, [arten, slotCells])
+
+  /** Panel: nach Häufigkeit der Benutzung (je erfolgreichem Auftragen), bei Gleichstand Katalogreihenfolge */
+  const musterSortedForPanel = useMemo(() => {
+    const indexById = new Map(muster.map((m, i) => [m.id, i] as const))
+    return [...muster].sort((a, b) => {
+      const ca = musterUsageCountById[a.id] ?? 0
+      const cb = musterUsageCountById[b.id] ?? 0
+      if (cb !== ca) return cb - ca
+      return (indexById.get(a.id) ?? 0) - (indexById.get(b.id) ?? 0)
+    })
+  }, [muster, musterUsageCountById])
 
   const weekStart = useMemo(() => startOfWeekMonday(anchorDate), [anchorDate])
   const weekDays = useMemo(() => {
@@ -2143,11 +3370,18 @@ export default function App() {
         if (payload.kind === 'muster') {
           const m = musterById(payload.id)
           if (!m) return prev
+          const musterStamp: MusterApplyStamp = { label: m.label }
           const weekStart = startOfWeekMonday(parseDateKey(dk))
           const { start: blockStart } = findBlockBounds(prev, dk, room, startSlot)
           const anchorK = makeSlotKey(dk, room, blockStart)
           const anchor = prev[anchorK]
           if (anchor?.patient?.trim()) {
+            queueMicrotask(() =>
+              setMusterUsageCountById((c) => ({
+                ...c,
+                [m.id]: (c[m.id] ?? 0) + 1,
+              })),
+            )
             return applyMusterWithPatientWeek(
               prev,
               weekStart,
@@ -2157,6 +3391,8 @@ export default function App() {
               arten,
               mitarbeiter,
               { dk, room, slotIndex: blockStart },
+              effectiveMusterTemplateWeekCount(m),
+              musterStamp,
             )
           }
           const res = tryApplyMusterWeekToSlots(
@@ -2164,11 +3400,19 @@ export default function App() {
             weekStart,
             m.templateCells,
             arten,
+            effectiveMusterTemplateWeekCount(m),
+            musterStamp,
           )
           if ('error' in res) {
             window.alert(res.error)
             return prev
           }
+          queueMicrotask(() =>
+            setMusterUsageCountById((c) => ({
+              ...c,
+              [m.id]: (c[m.id] ?? 0) + 1,
+            })),
+          )
           return res.next
         }
 
@@ -2251,6 +3495,7 @@ export default function App() {
       if (payload.kind === 'muster') {
         const m = muster.find((x) => x.id === payload.id)
         if (!m) return
+        const musterStamp: MusterApplyStamp = { label: m.label }
         const weekStart = startOfWeekMonday(parseDateKey(dk))
         const max = slotCount()
         setSlotCells((prev) => {
@@ -2275,6 +3520,12 @@ export default function App() {
             }
           }
           if (anchorPatient) {
+            queueMicrotask(() =>
+              setMusterUsageCountById((c) => ({
+                ...c,
+                [m.id]: (c[m.id] ?? 0) + 1,
+              })),
+            )
             return applyMusterWithPatientWeek(
               prev,
               weekStart,
@@ -2284,6 +3535,8 @@ export default function App() {
               arten,
               mitarbeiter,
               { dk, room, slotIndex: anchorPatient.anchorSlot },
+              effectiveMusterTemplateWeekCount(m),
+              musterStamp,
             )
           }
           const res = tryApplyMusterWeekToSlots(
@@ -2291,11 +3544,19 @@ export default function App() {
             weekStart,
             m.templateCells,
             arten,
+            effectiveMusterTemplateWeekCount(m),
+            musterStamp,
           )
           if ('error' in res) {
             window.alert(res.error)
             return prev
           }
+          queueMicrotask(() =>
+            setMusterUsageCountById((c) => ({
+              ...c,
+              [m.id]: (c[m.id] ?? 0) + 1,
+            })),
+          )
           return res.next
         })
         return
@@ -2321,6 +3582,21 @@ export default function App() {
   const closeTerminPickerModal = useCallback(() => {
     setTerminPickerModal(null)
   }, [])
+
+  const exportTerminToIcs = useCallback(() => {
+    if (!terminPickerModal) return
+    const { dk, room, anchorSlot } = terminPickerModal
+    const pair = cellDataToPatientExportPair(slotCells, dk, room, anchorSlot)
+    if (!pair) {
+      window.alert('Kein gültiger Termin für den Export.')
+      return
+    }
+    const fileBase = safeIcsZipPathSegment(
+      `termin-${pair.row.dk}-${pair.row.room}-s${pair.row.startSlot}`,
+      90,
+    )
+    downloadSingleTerminIcsFile(pair.patient, pair.row, fileBase)
+  }, [terminPickerModal, slotCells])
 
   const assignArtToTerminFromModal = useCallback(
     (artId: string) => {
@@ -2576,6 +3852,161 @@ export default function App() {
     if (editingPatientId === p.id) cancelEditPatient()
   }
 
+  const openPatientExportModal = useCallback(() => {
+    const { from, to } = defaultPatientExportDateRange()
+    setPatientExportFrom(from)
+    setPatientExportTo(to)
+    setPatientExportQuery('')
+    setPatientExportSelectedId(null)
+    setPatientExportStep(1)
+    setPatientExportOpen(true)
+  }, [])
+
+  const closePatientExportModal = useCallback(() => {
+    setPatientExportOpen(false)
+  }, [])
+
+  const openStaffExportModal = useCallback(() => {
+    const { from, to } = defaultPatientExportDateRange()
+    setStaffExportFrom(from)
+    setStaffExportTo(to)
+    setStaffExportQuery('')
+    setStaffExportSelectedId(null)
+    setStaffExportStep(1)
+    setStaffExportOpen(true)
+  }, [])
+
+  const closeStaffExportModal = useCallback(() => {
+    setStaffExportOpen(false)
+  }, [])
+
+  const openRoomExportModal = useCallback(() => {
+    const { from, to } = defaultPatientExportDateRange()
+    setRoomExportFrom(from)
+    setRoomExportTo(to)
+    setRoomExportRoom(null)
+    setRoomExportStep(1)
+    setRoomExportOpen(true)
+  }, [])
+
+  const closeRoomExportModal = useCallback(() => {
+    setRoomExportOpen(false)
+  }, [])
+
+  const patientsFilteredForExport = useMemo(() => {
+    const q = patientExportQuery.trim().toLowerCase()
+    if (q === '') return patients
+    return patients.filter(
+      (p) =>
+        p.name.toLowerCase().includes(q) ||
+        p.patientCode.toLowerCase().includes(q),
+    )
+  }, [patients, patientExportQuery])
+
+  const staffFilteredForExport = useMemo(() => {
+    const q = staffExportQuery.trim().toLowerCase()
+    if (q === '') return mitarbeiter
+    return mitarbeiter.filter((s) => s.name.toLowerCase().includes(q))
+  }, [mitarbeiter, staffExportQuery])
+
+  const runPatientExportDownloads = useCallback(async () => {
+    const p = patients.find((x) => x.id === patientExportSelectedId)
+    if (!p) {
+      window.alert('Bitte einen Patienten auswählen.')
+      return
+    }
+    let from = patientExportFrom
+    let to = patientExportTo
+    if (!from || !to) {
+      window.alert('Bitte Von- und Bis-Datum wählen.')
+      return
+    }
+    if (from > to) {
+      const t = from
+      from = to
+      to = t
+    }
+    const rows = collectPatientAppointmentsInRange(slotCells, p, from, to)
+    if (rows.length === 0) {
+      window.alert(
+        'Im gewählten Zeitraum wurden keine Termine für diesen Patienten gefunden.',
+      )
+      return
+    }
+    const safeName = p.name.replace(/[^\wäöüÄÖÜß-]+/gi, '_').slice(0, 40)
+    const stamp = dateKey(calendarDate(new Date()))
+    const base = `termine-${safeName}-${stamp}`
+    await downloadPatientAppointmentsPdf(p, rows, base)
+    await downloadPatientAppointmentsIcsZipFolder(p, rows, base)
+    setPatientExportOpen(false)
+  }, [
+    patients,
+    patientExportSelectedId,
+    patientExportFrom,
+    patientExportTo,
+    slotCells,
+  ])
+
+  const runStaffExportPdf = useCallback(async () => {
+    const s = mitarbeiter.find((x) => x.id === staffExportSelectedId)
+    if (!s) {
+      window.alert('Bitte einen Mitarbeiter auswählen.')
+      return
+    }
+    let from = staffExportFrom
+    let to = staffExportTo
+    if (!from || !to) {
+      window.alert('Bitte Von- und Bis-Datum wählen.')
+      return
+    }
+    if (from > to) {
+      const t = from
+      from = to
+      to = t
+    }
+    const rows = collectStaffAppointmentsInRange(slotCells, s, from, to)
+    if (rows.length === 0) {
+      window.alert(
+        'Im gewählten Zeitraum wurden keine Termine für diesen Mitarbeiter gefunden.',
+      )
+      return
+    }
+    const safeName = s.name.replace(/[^\wäöüÄÖÜß-]+/gi, '_').slice(0, 40)
+    const stamp = dateKey(calendarDate(new Date()))
+    const base = `mitarbeiter-termine-${safeName}-${stamp}`
+    await downloadStaffAppointmentsPdf(s, rows, base)
+    setStaffExportOpen(false)
+  }, [
+    mitarbeiter,
+    staffExportSelectedId,
+    staffExportFrom,
+    staffExportTo,
+    slotCells,
+  ])
+
+  const runRoomExportPdf = useCallback(async () => {
+    if (!roomExportRoom) {
+      window.alert('Bitte einen Raum auswählen.')
+      return
+    }
+    let from = roomExportFrom
+    let to = roomExportTo
+    if (!from || !to) {
+      window.alert('Bitte Von- und Bis-Datum wählen.')
+      return
+    }
+    if (from > to) {
+      const t = from
+      from = to
+      to = t
+    }
+    const safeRoom = roomExportRoom.replace(/[^\wäöüÄÖÜß-]+/gi, '_').slice(0, 32)
+    const stamp = dateKey(calendarDate(new Date()))
+    const base = `raum-${safeRoom}-${stamp}`
+    await downloadRoomWeekLandscapePdf(slotCells, roomExportRoom, from, to, base)
+    setRoomExportOpen(false)
+  }, [roomExportRoom, roomExportFrom, roomExportTo, slotCells])
+
   const openStaffModalCreate = () => {
     setStaffDraftName('')
     setStaffDraftAvail(emptyStaffAvailability(slotCount()))
@@ -2628,16 +4059,64 @@ export default function App() {
     setStaffModal(null)
   }
 
-  const toggleStaffDraftSlot = (w: number, sl: number) => {
+  const beginStaffAvailPaint = useCallback((w: number, sl: number) => {
+    const k = staffAvailKey(w, sl)
+    setStaffDraftAvail((a) => {
+      const cur = a[k] === true
+      const targetOn = !cur
+      staffAvailPaintRef.current = { active: true, targetOn }
+      return { ...a, [k]: targetOn }
+    })
+  }, [])
+
+  const extendStaffAvailPaint = useCallback((w: number, sl: number) => {
+    const p = staffAvailPaintRef.current
+    if (!p?.active) return
+    const k = staffAvailKey(w, sl)
+    setStaffDraftAvail((a) => ({ ...a, [k]: p.targetOn }))
+  }, [])
+
+  const endStaffAvailPaint = useCallback(() => {
+    staffAvailPaintRef.current = null
+  }, [])
+
+  const toggleStaffDraftSlotKeyboard = useCallback((w: number, sl: number) => {
     const k = staffAvailKey(w, sl)
     setStaffDraftAvail((a) => ({ ...a, [k]: !a[k] }))
-  }
+  }, [])
+
+  useEffect(() => {
+    if (!staffModal) {
+      staffAvailPaintRef.current = null
+      return
+    }
+    const end = () => endStaffAvailPaint()
+    window.addEventListener('pointerup', end)
+    window.addEventListener('pointercancel', end)
+    return () => {
+      window.removeEventListener('pointerup', end)
+      window.removeEventListener('pointercancel', end)
+      staffAvailPaintRef.current = null
+    }
+  }, [staffModal, endStaffAvailPaint])
 
   const toggleStaffDraftArt = (artId: string) => {
     setStaffDraftArtIds((ids) =>
       ids.includes(artId) ? ids.filter((x) => x !== artId) : [...ids, artId],
     )
   }
+
+  const selectAllStaffDraftArts = () => {
+    setStaffDraftArtIds(arten.map((a) => a.id))
+  }
+
+  const clearAllStaffDraftArts = () => {
+    setStaffDraftArtIds([])
+  }
+
+  const allStaffDraftArtsSelected =
+    arten.length > 0 && arten.every((a) => staffDraftArtIds.includes(a.id))
+  const noStaffDraftArtsSelected = staffDraftArtIds.length === 0
 
   const addBelegungsart = (): boolean => {
     const label = newArtLabel.trim()
@@ -2823,13 +4302,14 @@ export default function App() {
   const openMusterModalCreate = useCallback(() => {
     setMusterDraftLabel('')
     setMusterDraftCells({})
-    setMusterModal({ mode: 'create' })
+    setMusterModal({ mode: 'create', templateWeekCount: 3 })
   }, [])
 
   const openMusterModalEdit = useCallback((m: BelegungsmusterItem) => {
     setMusterDraftLabel(m.label)
     setMusterDraftCells(musterTemplateToVirtual(m.templateCells))
-    setMusterModal({ mode: 'edit', id: m.id })
+    const tw = m.templateWeekCount === 1 ? 1 : 3
+    setMusterModal({ mode: 'edit', id: m.id, templateWeekCount: tw })
   }, [])
 
   const saveMusterModal = useCallback(() => {
@@ -2840,17 +4320,30 @@ export default function App() {
     }
     if (!musterModal) return
     const tpl = virtualToMusterTemplate(musterDraftCells)
+    const tw = musterModal.templateWeekCount
     if (musterModal.mode === 'create') {
       setMuster((prev) => [
         ...prev,
-        { id: `muster-${Date.now()}`, label, templateCells: tpl },
+        {
+          id: `muster-${Date.now()}`,
+          label,
+          templateCells: tpl,
+          ...(tw === 1 ? { templateWeekCount: 1 as const } : {}),
+        },
       ])
     } else {
       const id = musterModal.id
       setMuster((prev) =>
-        prev.map((x) =>
-          x.id === id ? { ...x, label, templateCells: tpl } : x,
-        ),
+        prev.map((x) => {
+          if (x.id !== id) return x
+          const { templateWeekCount: _drop, ...rest } = x
+          return {
+            ...rest,
+            label,
+            templateCells: tpl,
+            ...(tw === 1 ? { templateWeekCount: 1 as const } : {}),
+          }
+        }),
       )
     }
     closeMusterModal()
@@ -2869,6 +4362,11 @@ export default function App() {
       closeMusterModal()
     }
     setMuster((list) => list.filter((x) => x.id !== m.id))
+    setMusterUsageCountById((c) => {
+      const next = { ...c }
+      delete next[m.id]
+      return next
+    })
     setSlotCells((prev) => {
       const next = { ...prev }
       for (const k of Object.keys(next)) {
@@ -3011,7 +4509,7 @@ export default function App() {
       <section className="panel panel-below-calendar" aria-label="Belegungsarten">
         <h2 className="panel-title">Belegungsarten</h2>
         <ul className="panel-list panel-list-compact arten-panel-list">
-          {arten.map((a) => (
+          {artenSortedForPanel.map((a) => (
             <li key={a.id} className="arten-panel-row">
               <div className="arten-entry">
                 {editingArtId === a.id ? (
@@ -3123,7 +4621,7 @@ export default function App() {
       <section className="panel panel-below-calendar" aria-label="Belegungsmuster">
         <h2 className="panel-title">Belegungsmuster</h2>
         <ul className="panel-list panel-list-compact arten-panel-list">
-          {muster.map((m) => (
+          {musterSortedForPanel.map((m) => (
             <li key={m.id} className="arten-panel-row">
               <div className="arten-entry">
                 <div className="arten-entry-body arten-entry-inline">
@@ -3291,7 +4789,9 @@ export default function App() {
             )}
           </div>
           <p className="staff-modal-hint">
-            Drei Wochen untereinander (je Mo–So nebeneinander).{' '}
+            {musterModal.templateWeekCount === 1
+              ? 'Eine Woche (Mo–So nebeneinander). '
+              : 'Drei Wochen untereinander (je Mo–So nebeneinander). '}
             <strong>Klick auf eine Zelle</strong> öffnet die Auswahl der Belegungsart;
             Belegungsarten lassen sich weiter per Drag & Drop platzieren. Blöcke wie
             im Kalender verschieben und am Rand kürzen oder verlängern. Anzeige nur der
@@ -3299,6 +4799,7 @@ export default function App() {
           </p>
           <div className="muster-modal-grid-scroll">
             <MusterWeekEditorGrid
+              weekCount={musterModal.templateWeekCount}
               draftCells={musterDraftCells}
               dragOverKey={musterEditorDragOverKey}
               setDragOverKey={setMusterEditorDragOverKey}
@@ -3604,6 +5105,29 @@ export default function App() {
               </button>
             </div>
           </section>
+          <div
+            className="export-buttons-stack"
+            role="group"
+            aria-label="Daten exportieren"
+          >
+            <button
+              type="button"
+              className="btn-today"
+              onClick={openPatientExportModal}
+            >
+              Export Patient
+            </button>
+            <button
+              type="button"
+              className="btn-today"
+              onClick={openStaffExportModal}
+            >
+              Export Mitarbeiter
+            </button>
+            <button type="button" className="btn-today" onClick={openRoomExportModal}>
+              Export Raum
+            </button>
+          </div>
         </aside>
 
         <div className="main-column">
@@ -4063,6 +5587,393 @@ export default function App() {
         </div>
       </div>
 
+      {patientExportOpen ? (
+        <div
+          className="staff-modal-overlay patient-export-overlay"
+          onClick={closePatientExportModal}
+          role="presentation"
+        >
+          <div
+            className="staff-modal patient-export-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="patient-export-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="patient-export-title" className="staff-modal-title">
+              {patientExportStep === 1
+                ? 'Patient für Export wählen'
+                : 'Zeitraum wählen'}
+            </h2>
+            {patientExportStep === 1 ? (
+              <>
+                <p className="staff-modal-hint">
+                  Suche nach Name und/oder Patienten-ID. Wählen Sie einen
+                  Patienten und gehen Sie weiter.
+                </p>
+                <div className="patient-export-search-wrap">
+                  <input
+                    type="search"
+                    className="staff-modal-name-input"
+                    value={patientExportQuery}
+                    onChange={(e) => setPatientExportQuery(e.target.value)}
+                    placeholder="Name oder Patienten-ID …"
+                    aria-label="Patienten für Export suchen"
+                  />
+                </div>
+                <ul className="patient-export-list" role="listbox">
+                  {patientsFilteredForExport.length === 0 ? (
+                    <li className="muted patient-export-empty">Keine Treffer.</li>
+                  ) : (
+                    patientsFilteredForExport.map((p) => (
+                      <li key={p.id}>
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={patientExportSelectedId === p.id}
+                          className={`patient-export-pick ${patientExportSelectedId === p.id ? 'is-selected' : ''}`}
+                          onClick={() => setPatientExportSelectedId(p.id)}
+                        >
+                          <span className="patient-export-pick-name">
+                            {p.name}
+                          </span>
+                          <span className="patient-export-pick-id">
+                            {p.patientCode}
+                          </span>
+                        </button>
+                      </li>
+                    ))
+                  )}
+                </ul>
+                <div className="staff-modal-footer">
+                  <button
+                    type="button"
+                    className="btn-edit-save"
+                    onClick={() => {
+                      if (!patientExportSelectedId) {
+                        window.alert('Bitte einen Patienten auswählen.')
+                        return
+                      }
+                      setPatientExportStep(2)
+                    }}
+                  >
+                    Weiter
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    onClick={closePatientExportModal}
+                  >
+                    Abbrechen
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="staff-modal-hint">
+                  Als PDF erscheint die Übersicht auf der Vorlage. Zusätzlich
+                  laden Sie ein ZIP-Archiv: darin ein Ordner mit je einer
+                  ICS-Datei pro Termin (nach Entpacken in den Kalender
+                  importieren).
+                </p>
+                <div className="patient-export-date-grid">
+                  <label className="patient-export-date-label">
+                    Von
+                    <input
+                      type="date"
+                      value={patientExportFrom}
+                      onChange={(e) => setPatientExportFrom(e.target.value)}
+                      aria-label="Export Zeitraum von"
+                    />
+                  </label>
+                  <label className="patient-export-date-label">
+                    Bis
+                    <input
+                      type="date"
+                      value={patientExportTo}
+                      onChange={(e) => setPatientExportTo(e.target.value)}
+                      aria-label="Export Zeitraum bis"
+                    />
+                  </label>
+                </div>
+                <div className="staff-modal-footer patient-export-footer-step2">
+                  <button
+                    type="button"
+                    className="btn-edit-save"
+                    onClick={runPatientExportDownloads}
+                  >
+                    PDF &amp; Termine (.ics als ZIP) exportieren
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    onClick={() => setPatientExportStep(1)}
+                  >
+                    Zurück
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    onClick={closePatientExportModal}
+                  >
+                    Abbrechen
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
+
+      {staffExportOpen ? (
+        <div
+          className="staff-modal-overlay patient-export-overlay"
+          onClick={closeStaffExportModal}
+          role="presentation"
+        >
+          <div
+            className="staff-modal patient-export-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="staff-export-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="staff-export-title" className="staff-modal-title">
+              {staffExportStep === 1
+                ? 'Mitarbeiter für Export wählen'
+                : 'Zeitraum wählen'}
+            </h2>
+            {staffExportStep === 1 ? (
+              <>
+                <p className="staff-modal-hint">
+                  Wählen Sie einen Mitarbeiter. Anschließend legen Sie den Zeitraum
+                  fest (Standard: aktuelle Kalenderwoche).
+                </p>
+                <div className="patient-export-search-wrap">
+                  <input
+                    type="search"
+                    className="staff-modal-name-input"
+                    value={staffExportQuery}
+                    onChange={(e) => setStaffExportQuery(e.target.value)}
+                    placeholder="Name …"
+                    aria-label="Mitarbeiter für Export suchen"
+                  />
+                </div>
+                <ul className="patient-export-list" role="listbox">
+                  {staffFilteredForExport.length === 0 ? (
+                    <li className="muted patient-export-empty">Keine Treffer.</li>
+                  ) : (
+                    staffFilteredForExport.map((s) => (
+                      <li key={s.id}>
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={staffExportSelectedId === s.id}
+                          className={`patient-export-pick ${staffExportSelectedId === s.id ? 'is-selected' : ''}`}
+                          onClick={() => setStaffExportSelectedId(s.id)}
+                        >
+                          <span className="patient-export-pick-name">{s.name}</span>
+                        </button>
+                      </li>
+                    ))
+                  )}
+                </ul>
+                <div className="staff-modal-footer">
+                  <button
+                    type="button"
+                    className="btn-edit-save"
+                    onClick={() => {
+                      if (!staffExportSelectedId) {
+                        window.alert('Bitte einen Mitarbeiter auswählen.')
+                        return
+                      }
+                      setStaffExportStep(2)
+                    }}
+                  >
+                    Weiter
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    onClick={closeStaffExportModal}
+                  >
+                    Abbrechen
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="staff-modal-hint">
+                  Es wird eine PDF-Übersicht erzeugt: Datum, Uhrzeit, Raum und
+                  Spalte „Termin“ (Patient, Belegungsart, Mitarbeiter jeweils
+                  untereinander) für alle Termine im gewählten Zeitraum.
+                </p>
+                <div className="patient-export-date-grid">
+                  <label className="patient-export-date-label">
+                    Von
+                    <input
+                      type="date"
+                      value={staffExportFrom}
+                      onChange={(e) => setStaffExportFrom(e.target.value)}
+                      aria-label="Mitarbeiter-Export Zeitraum von"
+                    />
+                  </label>
+                  <label className="patient-export-date-label">
+                    Bis
+                    <input
+                      type="date"
+                      value={staffExportTo}
+                      onChange={(e) => setStaffExportTo(e.target.value)}
+                      aria-label="Mitarbeiter-Export Zeitraum bis"
+                    />
+                  </label>
+                </div>
+                <div className="staff-modal-footer patient-export-footer-step2">
+                  <button
+                    type="button"
+                    className="btn-edit-save"
+                    onClick={runStaffExportPdf}
+                  >
+                    PDF exportieren
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    onClick={() => setStaffExportStep(1)}
+                  >
+                    Zurück
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    onClick={closeStaffExportModal}
+                  >
+                    Abbrechen
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
+
+      {roomExportOpen ? (
+        <div
+          className="staff-modal-overlay patient-export-overlay"
+          onClick={closeRoomExportModal}
+          role="presentation"
+        >
+          <div
+            className="staff-modal patient-export-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="room-export-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="room-export-title" className="staff-modal-title">
+              {roomExportStep === 1 ? 'Raum für Export wählen' : 'Zeitraum wählen'}
+            </h2>
+            {roomExportStep === 1 ? (
+              <>
+                <p className="staff-modal-hint">
+                  Wählen Sie einen Raum. Anschließend legen Sie den Zeitraum fest
+                  (Standard: aktuelle Kalenderwoche). Die PDF-Ansicht ist A4
+                  Querformat mit den sieben Wochentagen und Zeiten 08:00–20:00
+                  Uhr.
+                </p>
+                <ul className="patient-export-list" role="listbox">
+                  {ROOMS.map((r) => (
+                    <li key={r}>
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={roomExportRoom === r}
+                        className={`patient-export-pick ${roomExportRoom === r ? 'is-selected' : ''}`}
+                        onClick={() => setRoomExportRoom(r)}
+                      >
+                        <span className="patient-export-pick-name">{r}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <div className="staff-modal-footer">
+                  <button
+                    type="button"
+                    className="btn-edit-save"
+                    onClick={() => {
+                      if (!roomExportRoom) {
+                        window.alert('Bitte einen Raum auswählen.')
+                        return
+                      }
+                      setRoomExportStep(2)
+                    }}
+                  >
+                    Weiter
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    onClick={closeRoomExportModal}
+                  >
+                    Abbrechen
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="staff-modal-hint">
+                  Es wird eine PDF-Übersicht im Querformat erzeugt. Bei mehreren
+                  Kalenderwochen im Zeitraum erhält jede Woche eine eigene Seite.
+                </p>
+                <div className="patient-export-date-grid">
+                  <label className="patient-export-date-label">
+                    Von
+                    <input
+                      type="date"
+                      value={roomExportFrom}
+                      onChange={(e) => setRoomExportFrom(e.target.value)}
+                      aria-label="Raum-Export Zeitraum von"
+                    />
+                  </label>
+                  <label className="patient-export-date-label">
+                    Bis
+                    <input
+                      type="date"
+                      value={roomExportTo}
+                      onChange={(e) => setRoomExportTo(e.target.value)}
+                      aria-label="Raum-Export Zeitraum bis"
+                    />
+                  </label>
+                </div>
+                <div className="staff-modal-footer patient-export-footer-step2">
+                  <button
+                    type="button"
+                    className="btn-edit-save"
+                    onClick={runRoomExportPdf}
+                  >
+                    PDF exportieren
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    onClick={() => setRoomExportStep(1)}
+                  >
+                    Zurück
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    onClick={closeRoomExportModal}
+                  >
+                    Abbrechen
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
+
       {musterModalOverlay}
 
       {newArtModalOpen ? (
@@ -4207,6 +6118,13 @@ export default function App() {
                   <div className="staff-modal-footer termin-staff-footer">
                     <button
                       type="button"
+                      className="btn-edit-cancel"
+                      onClick={exportTerminToIcs}
+                    >
+                      Als .ics exportieren
+                    </button>
+                    <button
+                      type="button"
                       className="btn-termin-clear"
                       onClick={clearTerminBlockFromModal}
                     >
@@ -4266,6 +6184,13 @@ export default function App() {
                         Zuordnung entfernen
                       </button>
                     ) : null}
+                    <button
+                      type="button"
+                      className="btn-edit-cancel"
+                      onClick={exportTerminToIcs}
+                    >
+                      Als .ics exportieren
+                    </button>
                     <button
                       type="button"
                       className="btn-termin-clear"
@@ -4335,8 +6260,9 @@ export default function App() {
               <div className="staff-modal-col">
                 <h3 className="staff-modal-subtitle">Verfügbarkeit (Woche)</h3>
                 <p className="staff-modal-hint">
-                  Spalten: Wochentage · Zeilen: Uhrzeiten (08:00–20:00) — Klick
-                  markiert Arbeitszeit.
+                  Spalten: Wochentage · Zeilen: Uhrzeiten (08:00–20:00). Klick
+                  markiert oder demarkiert; mit gedrückter Maustaste über weitere
+                  Zellen ziehen, um denselben Zustand zu übernehmen.
                 </p>
                 <div className="staff-avail-scroll">
                   <table className="staff-avail-table">
@@ -4373,7 +6299,21 @@ export default function App() {
                                   className={`staff-avail-slot ${on ? 'is-on' : ''}`}
                                   aria-pressed={on}
                                   aria-label={`${dayLabel} ${slotIndexToLabel(sl)}`}
-                                  onClick={() => toggleStaffDraftSlot(w, sl)}
+                                  onPointerDown={(e) => {
+                                    if (e.button !== 0) return
+                                    e.preventDefault()
+                                    beginStaffAvailPaint(w, sl)
+                                  }}
+                                  onPointerEnter={(e) => {
+                                    if ((e.buttons & 1) === 0) return
+                                    extendStaffAvailPaint(w, sl)
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === ' ' || e.key === 'Enter') {
+                                      e.preventDefault()
+                                      toggleStaffDraftSlotKeyboard(w, sl)
+                                    }
+                                  }}
                                 />
                               </td>
                             )
@@ -4390,8 +6330,27 @@ export default function App() {
                 </h3>
                 <p className="staff-modal-hint">
                   Nur diese Arten können zugewiesen werden, wenn dieser
-                  Mitarbeiter im Termin-Slot steht.
+                  Mitarbeiter im Termin-Slot steht. Unten können alle Arten auf
+                  einmal aus- oder abgewählt werden.
                 </p>
+                <div className="staff-art-bulk">
+                  <button
+                    type="button"
+                    className="btn-edit-save"
+                    disabled={arten.length === 0 || allStaffDraftArtsSelected}
+                    onClick={selectAllStaffDraftArts}
+                  >
+                    Alle auswählen
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-edit-cancel"
+                    disabled={noStaffDraftArtsSelected}
+                    onClick={clearAllStaffDraftArts}
+                  >
+                    Alle abwählen
+                  </button>
+                </div>
                 <ul className="staff-art-checklist">
                   {arten.map((a) => (
                     <li key={a.id}>
