@@ -685,8 +685,7 @@ function slotEndTimeLabelExclusive(endSlotInclusive: number): string {
 }
 
 /**
- * Vorlage A4 (595×842 pt). Maske: Fließtext ab ca. drittem Absatz („At the core…“) bis unten;
- * Kopf inkl. erster Absätze bleibt sichtbar (vgl. Referenz-Screenshot).
+ * Vorlage A4 (595×842 pt). Maske: Bereich für Einleitung + Tabelle; Kopfzeile der Vorlage bleibt sichtbar.
  */
 const PDF_TEMPLATE_BODY_MASK = { x: 45, y: 42, width: 505, height: 493 } as const
 
@@ -698,51 +697,128 @@ const PATIENT_EXPORT_INTRO_EN = `Please find attached your personal training and
 
 We kindly ask you to adhere to the scheduled appointments and to arrive on time in order to ensure a smooth process. Should any appointment need to be rescheduled, we will inform you as early as possible and kindly ask for your understanding.`
 
-/** Fallback, wenn erste Seite ohne Einleitung (nur Tabellenkopf) gezeichnet wird */
-const PDF_TABLE = {
-  rowH: 13,
+const PDF_BODY_X = PDF_TEMPLATE_BODY_MASK.x
+const PDF_BODY_W = PDF_TEMPLATE_BODY_MASK.width
+/** Oberkante des weißen Inhaltsbereichs (unterhalb der sichtbaren Kopfzeile). */
+const PDF_BODY_TOP_Y =
+  PDF_TEMPLATE_BODY_MASK.y + PDF_TEMPLATE_BODY_MASK.height
+/** Vier gleich breite Spalten über die Textbreite */
+const PDF_COL_W = PDF_BODY_W / 4
+function pdfColLeft(i: 0 | 1 | 2 | 3): number {
+  return PDF_BODY_X + i * PDF_COL_W
+}
+/** Abstand zur Kopfzeile: genau zwei Zeilen bis zur ersten Überschrift */
+const PDF_EXPORT_LINE = 11
+/** Fortsetzungsseiten ohne Einleitungstext */
+const PDF_TABLE_CONT = {
   headerY: 448,
   firstRowY: 432,
-  colDate: 52,
-  colTime: 102,
-  colRoom: 158,
-  colTermin: 228,
 } as const
 /** Zeilenhöhe, wenn Name / Belegungsart / Mitarbeiter untereinander stehen */
 const PDF_TERM_STACK_ROW_H = 28
 const PDF_TERM_STACK_FS = 7
-const PDF_TERM_STACK_MAX_W =
-  PDF_TEMPLATE_BODY_MASK.x + PDF_TEMPLATE_BODY_MASK.width - PDF_TABLE.colTermin - 8
+const PDF_TERM_STACK_MAX_W = PDF_COL_W - 8
 /** Patienten-PDF: weniger Zeilen pro Seite wegen Einleitung + höherer Terminzeilen */
 const PDF_ROWS_PATIENT_TERM_STACK_PAGE = 10
 const PDF_ROWS_STAFF_TERM_STACK_PAGE = 12
 
 
-function wrapPdfPlainParagraphs(
+/** Pro Absatz eine Liste von Zeilen (für Blocksatz: letzte Zeile links, übrige gestreckt). */
+function wrapPdfParagraphsToLines(
   text: string,
   font: PDFFont,
   fontSize: number,
   maxWidth: number,
-): string[] {
-  const out: string[] = []
+): string[][] {
+  const out: string[][] = []
   const paragraphs = text.split(/\n\s*\n/)
   for (const raw of paragraphs) {
     const para = raw.replace(/\s+/g, ' ').trim()
     if (!para) continue
     const words = para.split(/\s+/)
+    const lines: string[] = []
     let line = ''
     for (const w of words) {
       const test = line ? `${line} ${w}` : w
       if (font.widthOfTextAtSize(test, fontSize) <= maxWidth) {
         line = test
       } else {
-        if (line) out.push(line)
+        if (line) lines.push(line)
         line = w
       }
     }
-    if (line) out.push(line)
+    if (line) lines.push(line)
+    out.push(lines)
   }
   return out
+}
+
+function drawPdfLineJustified(
+  page: PDFPage,
+  text: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+  font: PDFFont,
+  fontSize: number,
+  color: ReturnType<typeof rgb>,
+): void {
+  const words = text.trim().split(/\s+/).filter(Boolean)
+  if (words.length === 0) return
+  if (words.length === 1) {
+    page.drawText(words[0], { x, y, size: fontSize, font, color })
+    return
+  }
+  let sumW = 0
+  for (const w of words) {
+    sumW += font.widthOfTextAtSize(w, fontSize)
+  }
+  const gaps = words.length - 1
+  const extra = maxWidth - sumW
+  if (extra <= 0) {
+    page.drawText(
+      truncatePdfLineToWidth(text, font, fontSize, maxWidth),
+      { x, y, size: fontSize, font, color },
+    )
+    return
+  }
+  const gapW = extra / gaps
+  let cx = x
+  for (let i = 0; i < words.length; i++) {
+    page.drawText(words[i], { x: cx, y, size: fontSize, font, color })
+    cx += font.widthOfTextAtSize(words[i], fontSize)
+    if (i < words.length - 1) cx += gapW
+  }
+}
+
+/** Zeichnet einen Absatz; letzte Zeile links, übrige Blocksatz. Gibt y unter der letzten Zeile zurück. */
+function drawPdfParagraphJustified(
+  page: PDFPage,
+  lines: string[],
+  x: number,
+  yStart: number,
+  lineHeight: number,
+  maxWidth: number,
+  font: PDFFont,
+  fontSize: number,
+  color: ReturnType<typeof rgb>,
+): number {
+  let y = yStart
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li]
+    const isLastLine = li === lines.length - 1
+    const useJustify =
+      lines.length === 1
+        ? line.split(/\s+/).filter(Boolean).length > 1
+        : !isLastLine
+    if (useJustify) {
+      drawPdfLineJustified(page, line, x, y, maxWidth, font, fontSize, color)
+    } else {
+      page.drawText(line, { x, y, size: fontSize, font, color })
+    }
+    y -= lineHeight
+  }
+  return y
 }
 
 function truncatePdfLineToWidth(
@@ -815,7 +891,7 @@ async function downloadPatientAppointmentsPdf(
   rows: PatientAppointmentExportRow[],
   fileBase: string,
 ) {
-  const templateUrl = `${import.meta.env.BASE_URL}vorlage-termine.pdf`
+  const templateUrl = `${import.meta.env.BASE_URL}BBI.pdf`
   let templateBytes: ArrayBuffer
   try {
     const res = await fetch(templateUrl)
@@ -823,7 +899,7 @@ async function downloadPatientAppointmentsPdf(
     templateBytes = await res.arrayBuffer()
   } catch {
     window.alert(
-      'Die PDF-Vorlage konnte nicht geladen werden (vorlage-termine.pdf im Ordner public).',
+      'Die PDF-Vorlage konnte nicht geladen werden (BBI.pdf im Ordner public).',
     )
     return
   }
@@ -861,68 +937,110 @@ async function downloadPatientAppointmentsPdf(
     let firstDataRowY: number
 
     if (ci === 0) {
-      termY = 500
-      subY = 482
-      const introW = PDF_TEMPLATE_BODY_MASK.width
+      const introW = PDF_BODY_W
       let introSize = 8
       let introLineH = 10
-      let linesDe = wrapPdfPlainParagraphs(PATIENT_EXPORT_INTRO_DE, font, introSize, introW)
-      let linesEn = wrapPdfPlainParagraphs(PATIENT_EXPORT_INTRO_EN, font, introSize, introW)
-      let introLines = [...linesDe, '', '', ...linesEn]
+      let paragraphsDe = wrapPdfParagraphsToLines(
+        PATIENT_EXPORT_INTRO_DE,
+        font,
+        introSize,
+        introW,
+      )
+      let paragraphsEn = wrapPdfParagraphsToLines(
+        PATIENT_EXPORT_INTRO_EN,
+        font,
+        introSize,
+        introW,
+      )
+      const countParaLines = (pars: string[][]) =>
+        pars.reduce((s, p) => s + p.length, 0)
+      const nIntroLines =
+        countParaLines(paragraphsDe) + 2 + countParaLines(paragraphsEn)
+      termY = PDF_BODY_TOP_Y - 2 * PDF_EXPORT_LINE
+      subY = termY - 14
       let introStartY = subY - 14
-      let yAfterIntro = introStartY - introLines.length * introLineH
+      let yAfterIntro = introStartY - nIntroLines * introLineH
       if (yAfterIntro < 300) {
         introSize = 7
         introLineH = 9
-        linesDe = wrapPdfPlainParagraphs(PATIENT_EXPORT_INTRO_DE, font, introSize, introW)
-        linesEn = wrapPdfPlainParagraphs(PATIENT_EXPORT_INTRO_EN, font, introSize, introW)
-        introLines = [...linesDe, '', '', ...linesEn]
+        paragraphsDe = wrapPdfParagraphsToLines(
+          PATIENT_EXPORT_INTRO_DE,
+          font,
+          introSize,
+          introW,
+        )
+        paragraphsEn = wrapPdfParagraphsToLines(
+          PATIENT_EXPORT_INTRO_EN,
+          font,
+          introSize,
+          introW,
+        )
+        const n2 =
+          countParaLines(paragraphsDe) + 2 + countParaLines(paragraphsEn)
+        termY = PDF_BODY_TOP_Y - 2 * PDF_EXPORT_LINE
+        subY = termY - 14
         introStartY = subY - 12
-        yAfterIntro = introStartY - introLines.length * introLineH
+        yAfterIntro = introStartY - n2 * introLineH
       }
-      page.drawText('Terminübersicht', {
-        x: PDF_TABLE.colDate,
+      page.drawText('Terminübersicht/Appointment overview', {
+        x: PDF_BODY_X,
         y: termY,
         size: 11,
         font: fontBold,
         color: rgb(0.15, 0.15, 0.15),
       })
       page.drawText(sub, {
-        x: PDF_TABLE.colDate,
+        x: PDF_BODY_X,
         y: subY,
         size: 9,
         font,
         color: rgb(0.25, 0.25, 0.25),
       })
+      const introColor = rgb(0.22, 0.22, 0.22)
       let y = introStartY
-      for (const line of introLines) {
-        if (line) {
-          page.drawText(line, {
-            x: PDF_TEMPLATE_BODY_MASK.x,
-            y,
-            size: introSize,
-            font,
-            color: rgb(0.22, 0.22, 0.22),
-          })
-        }
-        y -= introLineH
+      for (const para of paragraphsDe) {
+        y = drawPdfParagraphJustified(
+          page,
+          para,
+          PDF_BODY_X,
+          y,
+          introLineH,
+          introW,
+          font,
+          introSize,
+          introColor,
+        )
+      }
+      y -= 2 * introLineH
+      for (const para of paragraphsEn) {
+        y = drawPdfParagraphJustified(
+          page,
+          para,
+          PDF_BODY_X,
+          y,
+          introLineH,
+          introW,
+          font,
+          introSize,
+          introColor,
+        )
       }
       headerRowY = y - 10
       firstDataRowY = headerRowY - 14
     } else {
-      termY = PDF_TABLE.headerY + 52
-      subY = PDF_TABLE.headerY + 34
-      headerRowY = PDF_TABLE.headerY
-      firstDataRowY = PDF_TABLE.firstRowY
-      page.drawText('Terminübersicht', {
-        x: PDF_TABLE.colDate,
+      termY = PDF_TABLE_CONT.headerY + 52
+      subY = PDF_TABLE_CONT.headerY + 34
+      headerRowY = PDF_TABLE_CONT.headerY
+      firstDataRowY = PDF_TABLE_CONT.firstRowY
+      page.drawText('Terminübersicht/Appointment overview', {
+        x: PDF_BODY_X,
         y: termY,
         size: 11,
         font: fontBold,
         color: rgb(0.15, 0.15, 0.15),
       })
       page.drawText(`${sub} · Fortsetzung`, {
-        x: PDF_TABLE.colDate,
+        x: PDF_BODY_X,
         y: subY,
         size: 9,
         font,
@@ -930,29 +1048,30 @@ async function downloadPatientAppointmentsPdf(
       })
     }
 
-    page.drawText('Datum', {
-      x: PDF_TABLE.colDate,
+    const cellW = PDF_COL_W - 2
+    page.drawText('Datum/Date', {
+      x: pdfColLeft(0),
       y: headerRowY,
       size: 8,
       font: fontBold,
       color: rgb(0, 0, 0),
     })
-    page.drawText('Uhrzeit', {
-      x: PDF_TABLE.colTime,
+    page.drawText('Uhrzeit/Time', {
+      x: pdfColLeft(1),
       y: headerRowY,
       size: 8,
       font: fontBold,
       color: rgb(0, 0, 0),
     })
-    page.drawText('Raum', {
-      x: PDF_TABLE.colRoom,
+    page.drawText('Raum/Room', {
+      x: pdfColLeft(2),
       y: headerRowY,
       size: 8,
       font: fontBold,
       color: rgb(0, 0, 0),
     })
-    page.drawText('Termin', {
-      x: PDF_TABLE.colTermin,
+    page.drawText('Termin/Appointment', {
+      x: pdfColLeft(3),
       y: headerRowY,
       size: 8,
       font: fontBold,
@@ -972,22 +1091,22 @@ async function downloadPatientAppointmentsPdf(
       const nameLine = `${patient.name}${patient.patientCode.trim() ? ` (${patient.patientCode})` : ''}`
       const artLine = (r.artLabel || '—').trim() || '—'
       const staffLine = (r.staffLabel || '—').trim() || '—'
-      page.drawText(dStr, {
-        x: PDF_TABLE.colDate,
+      page.drawText(truncatePdfLineToWidth(dStr, font, 8, cellW), {
+        x: pdfColLeft(0),
         y: rowY,
         size: 8,
         font,
         color: rgb(0, 0, 0),
       })
-      page.drawText(tStr, {
-        x: PDF_TABLE.colTime,
+      page.drawText(truncatePdfLineToWidth(tStr, font, 8, cellW), {
+        x: pdfColLeft(1),
         y: rowY,
         size: 8,
         font,
         color: rgb(0, 0, 0),
       })
-      page.drawText(r.room, {
-        x: PDF_TABLE.colRoom,
+      page.drawText(truncatePdfLineToWidth(r.room, font, 8, cellW), {
+        x: pdfColLeft(2),
         y: rowY,
         size: 8,
         font,
@@ -995,7 +1114,7 @@ async function downloadPatientAppointmentsPdf(
       })
       drawPdfTerminThreeLines(
         page,
-        PDF_TABLE.colTermin,
+        pdfColLeft(3),
         rowY,
         nameLine,
         artLine,
@@ -1027,7 +1146,7 @@ async function downloadStaffAppointmentsPdf(
   rows: StaffAppointmentExportRow[],
   fileBase: string,
 ) {
-  const templateUrl = `${import.meta.env.BASE_URL}vorlage-termine.pdf`
+  const templateUrl = `${import.meta.env.BASE_URL}BBI.pdf`
   let templateBytes: ArrayBuffer
   try {
     const res = await fetch(templateUrl)
@@ -1035,7 +1154,7 @@ async function downloadStaffAppointmentsPdf(
     templateBytes = await res.arrayBuffer()
   } catch {
     window.alert(
-      'Die PDF-Vorlage konnte nicht geladen werden (vorlage-termine.pdf im Ordner public).',
+      'Die PDF-Vorlage konnte nicht geladen werden (BBI.pdf im Ordner public).',
     )
     return
   }
@@ -1067,49 +1186,50 @@ async function downloadStaffAppointmentsPdf(
       borderWidth: 0,
     })
 
-    const termY = PDF_TABLE.headerY + 52
-    const subY = PDF_TABLE.headerY + 34
-    const headerRowY = PDF_TABLE.headerY
-    const firstDataRowY = PDF_TABLE.firstRowY
+    const termY = PDF_TABLE_CONT.headerY + 52
+    const subY = PDF_TABLE_CONT.headerY + 34
+    const headerRowY = PDF_TABLE_CONT.headerY
+    const firstDataRowY = PDF_TABLE_CONT.firstRowY
 
     page.drawText('Terminübersicht Mitarbeiter', {
-      x: PDF_TABLE.colDate,
+      x: PDF_BODY_X,
       y: termY,
       size: 11,
       font: fontBold,
       color: rgb(0.15, 0.15, 0.15),
     })
     page.drawText(ci === 0 ? subAll : `${subAll} · Fortsetzung`, {
-      x: PDF_TABLE.colDate,
+      x: PDF_BODY_X,
       y: subY,
       size: 9,
       font,
       color: rgb(0.25, 0.25, 0.25),
     })
 
-    page.drawText('Datum', {
-      x: PDF_TABLE.colDate,
+    const staffCellW = PDF_COL_W - 2
+    page.drawText('Datum/Date', {
+      x: pdfColLeft(0),
       y: headerRowY,
       size: 8,
       font: fontBold,
       color: rgb(0, 0, 0),
     })
-    page.drawText('Uhrzeit', {
-      x: PDF_TABLE.colTime,
+    page.drawText('Uhrzeit/Time', {
+      x: pdfColLeft(1),
       y: headerRowY,
       size: 8,
       font: fontBold,
       color: rgb(0, 0, 0),
     })
-    page.drawText('Raum', {
-      x: PDF_TABLE.colRoom,
+    page.drawText('Raum/Room', {
+      x: pdfColLeft(2),
       y: headerRowY,
       size: 8,
       font: fontBold,
       color: rgb(0, 0, 0),
     })
-    page.drawText('Termin', {
-      x: PDF_TABLE.colTermin,
+    page.drawText('Termin/Appointment', {
+      x: pdfColLeft(3),
       y: headerRowY,
       size: 8,
       font: fontBold,
@@ -1129,22 +1249,22 @@ async function downloadStaffAppointmentsPdf(
       const nameLine = (r.patientLabel || '—').trim() || '—'
       const artLine = (r.artLabel || '—').trim() || '—'
       const staffLine = staff.name.trim() || '—'
-      page.drawText(dStr, {
-        x: PDF_TABLE.colDate,
+      page.drawText(truncatePdfLineToWidth(dStr, font, 8, staffCellW), {
+        x: pdfColLeft(0),
         y: rowY,
         size: 8,
         font,
         color: rgb(0, 0, 0),
       })
-      page.drawText(tStr, {
-        x: PDF_TABLE.colTime,
+      page.drawText(truncatePdfLineToWidth(tStr, font, 8, staffCellW), {
+        x: pdfColLeft(1),
         y: rowY,
         size: 8,
         font,
         color: rgb(0, 0, 0),
       })
-      page.drawText(r.room, {
-        x: PDF_TABLE.colRoom,
+      page.drawText(truncatePdfLineToWidth(r.room, font, 8, staffCellW), {
+        x: pdfColLeft(2),
         y: rowY,
         size: 8,
         font,
@@ -1152,7 +1272,7 @@ async function downloadStaffAppointmentsPdf(
       })
       drawPdfTerminThreeLines(
         page,
-        PDF_TABLE.colTermin,
+        pdfColLeft(3),
         rowY,
         nameLine,
         artLine,
