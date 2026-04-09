@@ -214,6 +214,149 @@ function findStaffForCell(
   return undefined
 }
 
+/** MA hat diese Belegungsart im Profil freigeschaltet (explizite Liste). */
+function staffHasArtAllowed(s: MitarbeiterItem, artId: string): boolean {
+  return Array.isArray(s.allowedArtIds) && s.allowedArtIds.includes(artId)
+}
+
+/**
+ * Alle Slots [startSlot, startSlot+span) müssen von **demselben** Mitarbeiter
+ * belegbar sein: Freigabe für die Art + in jedem Slot im Wochenplan als verfügbar.
+ */
+function staffWhoCanPerformArtOnWholeSpan(
+  staffList: MitarbeiterItem[],
+  artId: string,
+  wd: number,
+  startSlot: number,
+  span: number,
+): MitarbeiterItem[] {
+  return staffList.filter((s) => {
+    if (!staffHasArtAllowed(s, artId)) return false
+    for (let i = 0; i < span; i++) {
+      if (!isStaffSlotAvailable(s, wd, startSlot + i)) return false
+    }
+    return true
+  })
+}
+
+/** Mindestens ein MA mit Freigabe für die Art an genau diesem Slot (für Vorschau „nur 30 Min.“). */
+function someStaffCanTreatArtAtSingleSlot(
+  staffList: MitarbeiterItem[],
+  artId: string,
+  wd: number,
+  slotIndex: number,
+): boolean {
+  return staffList.some(
+    (s) =>
+      staffHasArtAllowed(s, artId) && isStaffSlotAvailable(s, wd, slotIndex),
+  )
+}
+
+/**
+ * Art-Drop vom Panel: gleiche Prüfung wie Vorschau — keine Pausenzeit 12:00–13:30,
+ * mindestens ein Mitarbeiter mit Freigabe für die Art und Verfügbarkeit auf **jedem**
+ * Slot der Spanne (ein MA für die ganze Behandlung); bereits zugewiesene Mitarbeiter
+ * müssen zu dieser Menge passen; unauflösbare MA-Zuordnung blockiert.
+ */
+function artFromPanelBlockedReason(
+  cells: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  startSlot: number,
+  a: BelegungsartItem,
+  staffList: MitarbeiterItem[],
+): string | null {
+  const wd = weekdayMon0FromDate(parseDateKey(dk))
+  const max = slotCount()
+  const span = Math.min(Math.max(1, a.slots), max - startSlot)
+  if (slotRangeOverlapsMusterPause(startSlot, span)) {
+    return 'Zwischen 12:00 und 13:30 ist Pause — hier kann keine Belegungsart liegen.'
+  }
+
+  const startK = makeSlotKey(dk, room, startSlot)
+  const startCur = cells[startK]
+  const pname = startCur?.patient?.trim() || null
+
+  if (pname) {
+    for (let i = 0; i < span; i++) {
+      const cur = cells[makeSlotKey(dk, room, startSlot + i)]
+      if (cur?.patient && cur.patient !== pname) {
+        return 'Im gewählten Zeitraum ist bereits ein anderer Patient eingetragen.'
+      }
+    }
+  } else {
+    for (let i = 0; i < span; i++) {
+      const cur = cells[makeSlotKey(dk, room, startSlot + i)]
+      if (cur?.patient?.trim()) {
+        return 'Im gewählten Zeitraum ist bereits ein Patient eingetragen.'
+      }
+    }
+  }
+
+  for (let i = 0; i < span; i++) {
+    const cur = cells[makeSlotKey(dk, room, startSlot + i)]
+    const hasStaffRef = !!(cur?.staffId?.trim() || cur?.staff?.trim())
+    if (hasStaffRef && !findStaffForCell(cur, staffList)) {
+      return 'Im Termin ist ein Mitarbeiter eingetragen, der in den Stammdaten nicht zugeordnet werden kann.'
+    }
+  }
+
+  const staffIdsOnSpan: string[] = []
+  for (let i = 0; i < span; i++) {
+    const cur = cells[makeSlotKey(dk, room, startSlot + i)]
+    const st = findStaffForCell(cur, staffList)
+    if (st) staffIdsOnSpan.push(st.id)
+  }
+  const uniqueStaff = new Set(staffIdsOnSpan)
+  if (uniqueStaff.size > 1) {
+    return 'Im gewählten Zeitraum sind mehrere Mitarbeiter eingetragen — die Belegungsart kann hier nicht einheitlich platziert werden.'
+  }
+
+  for (let i = 0; i < span; i++) {
+    const cur = cells[makeSlotKey(dk, room, startSlot + i)]
+    const st = findStaffForCell(cur, staffList)
+    if (st) {
+      if (!isStaffSlotAvailable(st, wd, startSlot + i)) {
+        return 'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.'
+      }
+      if (!staffHasArtAllowed(st, a.id)) {
+        return 'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.'
+      }
+    }
+  }
+
+  const canTreat = staffWhoCanPerformArtOnWholeSpan(
+    staffList,
+    a.id,
+    wd,
+    startSlot,
+    span,
+  )
+  if (canTreat.length === 0) {
+    return 'Kein Mitarbeiter mit Freigabe für diese Belegungsart ist in diesem Zeitraum durchgehend verfügbar.'
+  }
+
+  if (uniqueStaff.size === 1) {
+    const sid = [...uniqueStaff][0]!
+    if (!canTreat.some((c) => c.id === sid)) {
+      return 'Der eingetragene Mitarbeiter ist für diese Belegungsart oder den gewählten Zeitraum nicht geeignet.'
+    }
+  }
+
+  return null
+}
+
+function cellIsValidArtPanelDropPreview(
+  cells: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  startSlot: number,
+  a: BelegungsartItem,
+  staffList: MitarbeiterItem[],
+): boolean {
+  return artFromPanelBlockedReason(cells, dk, room, startSlot, a, staffList) === null
+}
+
 /** Frei + Mitarbeiter/Art-Regeln für neu belegte Slots beim Verlängern. */
 function extensionSlotError(
   prev: Record<string, CellData>,
@@ -338,10 +481,10 @@ function migrateMitarbeiter(
       }
     }
   }
-  const allowedArtIds =
-    Array.isArray(raw.allowedArtIds) && raw.allowedArtIds.length > 0
-      ? [...raw.allowedArtIds]
-      : [...allArtIds]
+  /* Nur wenn das Feld in den Stammdaten fehlt (ältere Daten): alle Arten. Explizit [] bleibt []. */
+  const allowedArtIds = Array.isArray(raw.allowedArtIds)
+    ? [...raw.allowedArtIds]
+    : [...allArtIds]
   return {
     id: raw.id,
     name: raw.name,
@@ -364,6 +507,63 @@ const STORAGE_UI = 'physio-planung-ui-v1'
 const ARTEN_CATALOG_VERSION = 3
 
 const OP_BELEGUNGSART_ID = 'art-op'
+
+/** Mittagspause im Muster-Editor — keine echte Belegungsart, wird nicht in den Hauptkalender übernommen. */
+const MUSTER_PAUSE_ART_ID = '__muster_pause__'
+/** 08:00 = Slot 0 → Slot 8 = 12:00 */
+const PAUSE_START_SLOT = ((12 - DAY_START_HOUR) * 60) / SLOT_MINUTES
+/** 12:00–13:30 = drei 30-Min-Slots */
+const PAUSE_SLOT_COUNT = 3
+
+function pauseCellData(): CellData {
+  return {
+    art: 'Pause',
+    artId: MUSTER_PAUSE_ART_ID,
+    artColor: '#94a3b8',
+  }
+}
+
+function isMusterPauseCell(d: CellData | undefined): boolean {
+  return d?.artId === MUSTER_PAUSE_ART_ID
+}
+
+/** Liegt [startSlot, startSlot+span) in der festen Pausenzeit? */
+function slotRangeOverlapsMusterPause(startSlot: number, span: number): boolean {
+  const end = startSlot + span - 1
+  const p0 = PAUSE_START_SLOT
+  const p1 = PAUSE_START_SLOT + PAUSE_SLOT_COUNT - 1
+  return startSlot <= p1 && end >= p0
+}
+
+/** Hauptkalender: 12:00–13:30 — für automatische Muster-Buchungen gesperrt, manuell weiterhin nutzbar. */
+function slotIndexInCalendarLunchPause(slot: number): boolean {
+  return (
+    slot >= PAUSE_START_SLOT &&
+    slot < PAUSE_START_SLOT + PAUSE_SLOT_COUNT
+  )
+}
+
+/**
+ * Jeden Tag 12:00–13:30 in allen Räumen mit Pause belegen (überschreibt ggf. frühere Art nur in diesem Fenster).
+ */
+function injectMusterPauseSlots(
+  virt: Record<string, CellData>,
+  templateWeekCount: number,
+): Record<string, CellData> {
+  const out = { ...virt }
+  const dayCount = templateWeekCount * 7
+  const max = slotCount()
+  const p = pauseCellData()
+  for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
+    const dk = templateDkForDayIndex(dayIndex)
+    for (const room of ROOMS) {
+      for (let sl = PAUSE_START_SLOT; sl < PAUSE_START_SLOT + PAUSE_SLOT_COUNT && sl < max; sl++) {
+        out[makeSlotKey(dk, room, sl)] = { ...p }
+      }
+    }
+  }
+  return out
+}
 
 const DEFAULT_PATIENTS: PatientItem[] = [
   { id: 'p1', name: 'Max Mustermann', patientCode: 'P-24001' },
@@ -1746,6 +1946,12 @@ function musterBlockIsOpOnly(
   return id === OP_BELEGUNGSART_ID
 }
 
+function musterBlockIsPauseOnly(cells: CellData[]): boolean {
+  const probe = cells[0]
+  if (!probe) return false
+  return probe.artId === MUSTER_PAUSE_ART_ID
+}
+
 /** Alle Katalog-Belegungsarten mit Slot-Anzahl im Muster; fehlende = 0. OP nicht enthalten; je id nur einmal. */
 function musterTemplateArtSlotCountsFullCatalog(
   templateCells: Record<string, MusterTemplateCell>,
@@ -1758,7 +1964,7 @@ function musterTemplateArtSlotCountsFullCatalog(
       cell.artId ??
       artenList.find((a) => a.label === cell.art)?.id ??
       null
-    if (!id || id === OP_BELEGUNGSART_ID) continue
+    if (!id || id === OP_BELEGUNGSART_ID || id === MUSTER_PAUSE_ART_ID) continue
     map.set(id, (map.get(id) ?? 0) + 1)
   }
   const seen = new Set<string>()
@@ -1810,14 +2016,49 @@ function tryApplyMusterWeekToSlots(
           cells.push({ ...virt[vk]! })
           targetKeys.push(makeSlotKey(tDk, room, s))
         }
-        if (musterBlockIsOpOnly(cells, artenList)) continue
+        if (
+          musterBlockIsOpOnly(cells, artenList) ||
+          musterBlockIsPauseOnly(cells)
+        ) {
+          continue
+        }
         ops.push({ targetKeys, cells })
       }
     }
   }
 
   const next = { ...prev }
+  const reserved = new Set<string>()
+  const remappedOps: { targetKeys: string[]; cells: CellData[] }[] = []
+
   for (const op of ops) {
+    const firstK = op.targetKeys[0]!
+    const parts = firstK.split('|')
+    const tDk = parts[0]!
+    const room = parts[parts.length - 2] as Room
+    const startSlot = Number(parts[parts.length - 1])
+    const span = op.cells.length
+    const placedKeys = findAutoMusterSpanForTryApply(
+      next,
+      reserved,
+      tDk,
+      room,
+      startSlot,
+      span,
+    )
+    if (placedKeys === null) {
+      return {
+        error:
+          'Kein freier Bereich außerhalb der Mittagspause (12:00–13:30) für ein automatisches Muster-Platzieren.',
+      }
+    }
+    remappedOps.push({ targetKeys: placedKeys, cells: op.cells })
+    for (const tk of placedKeys) {
+      reserved.add(tk)
+    }
+  }
+
+  for (const op of remappedOps) {
     for (const tk of op.targetKeys) {
       if (isCellBooked(next[tk])) {
         return {
@@ -1829,7 +2070,7 @@ function tryApplyMusterWeekToSlots(
       }
     }
   }
-  for (const op of ops) {
+  for (const op of remappedOps) {
     for (let i = 0; i < op.targetKeys.length; i++) {
       const src = op.cells[i]!
       const placed: CellData = { ...src }
@@ -1844,17 +2085,57 @@ function tryApplyMusterWeekToSlots(
   return { next }
 }
 
+/** Automatisches Muster: Spanne ohne Überschneidung mit Pause; bei Konflikt nächstbeste Lage (nächster Termin oft nach 13:30). */
+function findAutoMusterSpanForTryApply(
+  base: Record<string, CellData>,
+  reserved: Set<string>,
+  tDk: string,
+  room: Room,
+  idealStart: number,
+  span: number,
+): string[] | null {
+  const max = slotCount()
+  const isFree = (s: number) => {
+    if (s < 0 || s + span > max) return false
+    if (slotRangeOverlapsMusterPause(s, span)) return false
+    for (let i = 0; i < span; i++) {
+      const k = makeSlotKey(tDk, room, s + i)
+      if (isCellBooked(base[k])) return false
+      if (reserved.has(k)) return false
+    }
+    return true
+  }
+  if (isFree(idealStart)) {
+    return Array.from({ length: span }, (_, i) =>
+      makeSlotKey(tDk, room, idealStart + i),
+    )
+  }
+  const candidates: number[] = []
+  for (let s = 0; s + span <= max; s++) {
+    if (isFree(s)) candidates.push(s)
+  }
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => Math.abs(a - idealStart) - Math.abs(b - idealStart))
+  const s = candidates[0]!
+  return Array.from({ length: span }, (_, i) =>
+    makeSlotKey(tDk, room, s + i),
+  )
+}
+
 function rangeFullyFree(
   cells: Record<string, CellData>,
   tDk: string,
   room: Room,
   start: number,
   span: number,
+  respectLunchPause = false,
 ): boolean {
   const max = slotCount()
   if (start < 0 || start + span > max) return false
   for (let i = 0; i < span; i++) {
-    if (isCellBooked(cells[makeSlotKey(tDk, room, start + i)])) return false
+    const slot = start + i
+    if (respectLunchPause && slotIndexInCalendarLunchPause(slot)) return false
+    if (isCellBooked(cells[makeSlotKey(tDk, room, slot)])) return false
   }
   return true
 }
@@ -1866,14 +2147,25 @@ function findSlotBesideConflict(
   room: Room,
   span: number,
   idealStart: number,
+  respectLunchPause: boolean,
 ): number | null {
   const max = slotCount()
-  if (rangeFullyFree(cells, tDk, room, idealStart, span)) return idealStart
+  if (rangeFullyFree(cells, tDk, room, idealStart, span, respectLunchPause)) {
+    return idealStart
+  }
 
   let firstOcc = -1
   for (let i = 0; i < span && idealStart + i < max; i++) {
-    if (isCellBooked(cells[makeSlotKey(tDk, room, idealStart + i)])) {
-      firstOcc = idealStart + i
+    const slot = idealStart + i
+    if (
+      respectLunchPause &&
+      slotIndexInCalendarLunchPause(slot)
+    ) {
+      firstOcc = slot
+      break
+    }
+    if (isCellBooked(cells[makeSlotKey(tDk, room, slot)])) {
+      firstOcc = slot
       break
     }
   }
@@ -1882,10 +2174,14 @@ function findSlotBesideConflict(
 
   const candidates: number[] = []
   for (let s = be + 1; s + span <= max; s++) {
-    if (rangeFullyFree(cells, tDk, room, s, span)) candidates.push(s)
+    if (rangeFullyFree(cells, tDk, room, s, span, respectLunchPause)) {
+      candidates.push(s)
+    }
   }
   for (let s = bs - span; s >= 0; s--) {
-    if (rangeFullyFree(cells, tDk, room, s, span)) candidates.push(s)
+    if (rangeFullyFree(cells, tDk, room, s, span, respectLunchPause)) {
+      candidates.push(s)
+    }
   }
   if (candidates.length === 0) return null
   candidates.sort((a, b) => Math.abs(a - idealStart) - Math.abs(b - idealStart))
@@ -1898,17 +2194,29 @@ function findFreeSpanWaveSameRoom(
   room: Room,
   span: number,
   idealStart: number,
+  respectLunchPause: boolean,
 ): number | null {
   const max = slotCount()
   if (span > max) return null
-  if (rangeFullyFree(cells, tDk, room, idealStart, span)) return idealStart
+  if (rangeFullyFree(cells, tDk, room, idealStart, span, respectLunchPause)) {
+    return idealStart
+  }
   const maxDist = Math.max(idealStart + 1, max - span - idealStart) + max
   for (let d = 1; d <= maxDist; d++) {
     const left = idealStart - d
-    if (left >= 0 && rangeFullyFree(cells, tDk, room, left, span)) return left
+    if (
+      left >= 0 &&
+      rangeFullyFree(cells, tDk, room, left, span, respectLunchPause)
+    ) {
+      return left
+    }
     const right = idealStart + d
-    if (right + span <= max && rangeFullyFree(cells, tDk, room, right, span))
+    if (
+      right + span <= max &&
+      rangeFullyFree(cells, tDk, room, right, span, respectLunchPause)
+    ) {
       return right
+    }
   }
   return null
 }
@@ -1918,13 +2226,16 @@ function findFreeSpanAnyRoom(
   tDk: string,
   span: number,
   preferRoom: Room,
+  respectLunchPause: boolean,
 ): { room: Room; start: number } | null {
   const max = slotCount()
   if (span > max) return null
   const order: Room[] = [preferRoom, ...ROOMS.filter((r) => r !== preferRoom)]
   for (const r of order) {
     for (let s = 0; s + span <= max; s++) {
-      if (rangeFullyFree(cells, tDk, r, s, span)) return { room: r, start: s }
+      if (rangeFullyFree(cells, tDk, r, s, span, respectLunchPause)) {
+        return { room: r, start: s }
+      }
     }
   }
   return null
@@ -1937,25 +2248,38 @@ function pickCollisionPlacement(
   room: Room,
   span: number,
   idealStart: number,
+  respectLunchPause: boolean,
 ): { room: Room; start: number } {
   const max = slotCount()
   const clampStart = (s: number) =>
     Math.max(0, Math.min(s, Math.max(0, max - span)))
 
-  if (rangeFullyFree(cells, tDk, room, idealStart, span)) {
+  if (rangeFullyFree(cells, tDk, room, idealStart, span, respectLunchPause)) {
     return { room, start: idealStart }
   }
 
   let probe = idealStart
-  while (probe < max && !isCellBooked(cells[makeSlotKey(tDk, room, probe)])) {
+  while (probe < max) {
+    if (respectLunchPause && slotIndexInCalendarLunchPause(probe)) break
+    if (isCellBooked(cells[makeSlotKey(tDk, room, probe)])) break
     probe++
   }
   if (probe >= max) {
     return { room, start: clampStart(idealStart) }
   }
   const { start: bs, end: be } = findBlockBounds(cells, tDk, room, probe)
-  if (be + 1 + span <= max) return { room, start: be + 1 }
-  if (bs - span >= 0) return { room, start: bs - span }
+  if (
+    be + 1 + span <= max &&
+    rangeFullyFree(cells, tDk, room, be + 1, span, respectLunchPause)
+  ) {
+    return { room, start: be + 1 }
+  }
+  if (
+    bs - span >= 0 &&
+    rangeFullyFree(cells, tDk, room, bs - span, span, respectLunchPause)
+  ) {
+    return { room, start: bs - span }
+  }
   return { room, start: clampStart(be + 1) }
 }
 
@@ -1987,7 +2311,14 @@ function mergePatientIntoMusterCell(
   terminKollision: boolean,
   musterStamp: MusterApplyStamp | null,
 ): CellData {
-  const out: CellData = { ...tpl, patient: patientName, patientCode }
+  const out: CellData = { ...tpl }
+  if (patientName?.trim()) {
+    out.patient = patientName
+    out.patientCode = patientCode
+  } else {
+    delete out.patient
+    delete out.patientCode
+  }
   if (terminKollision) out.terminKollision = true
   else delete out.terminKollision
   if (musterStamp) {
@@ -2041,7 +2372,12 @@ function applyMusterWithPatientWeek(
           seen.add(vk)
           cells.push({ ...virt[vk]! })
         }
-        if (musterBlockIsOpOnly(cells, artenList)) continue
+        if (
+          musterBlockIsOpOnly(cells, artenList) ||
+          musterBlockIsPauseOnly(cells)
+        ) {
+          continue
+        }
         ops.push({ tDk, wd, templateRoom: room, idealStart: start, cells })
       }
     }
@@ -2066,27 +2402,48 @@ function applyMusterWithPatientWeek(
     let chosenStart: number
     let collision: boolean
 
-    if (rangeFullyFree(next, tDk, tr, idealStart, span)) {
+    if (rangeFullyFree(next, tDk, tr, idealStart, span, true)) {
       chosenStart = idealStart
       collision = false
     } else {
-      const beside = findSlotBesideConflict(next, tDk, tr, span, idealStart)
+      const beside = findSlotBesideConflict(
+        next,
+        tDk,
+        tr,
+        span,
+        idealStart,
+        true,
+      )
       if (beside !== null) {
         chosenStart = beside
         collision = false
       } else {
-        const wave = findFreeSpanWaveSameRoom(next, tDk, tr, span, idealStart)
+        const wave = findFreeSpanWaveSameRoom(
+          next,
+          tDk,
+          tr,
+          span,
+          idealStart,
+          true,
+        )
         if (wave !== null) {
           chosenStart = wave
           collision = false
         } else {
-          const anyR = findFreeSpanAnyRoom(next, tDk, span, tr)
+          const anyR = findFreeSpanAnyRoom(next, tDk, span, tr, true)
           if (anyR) {
             chosenRoom = anyR.room
             chosenStart = anyR.start
             collision = false
           } else {
-            const col = pickCollisionPlacement(next, tDk, tr, span, idealStart)
+            const col = pickCollisionPlacement(
+              next,
+              tDk,
+              tr,
+              span,
+              idealStart,
+              true,
+            )
             chosenRoom = col.room
             chosenStart = col.start
             collision = true
@@ -2105,7 +2462,14 @@ function applyMusterWithPatientWeek(
         staffList,
       )
     ) {
-      const col = pickCollisionPlacement(next, tDk, tr, span, idealStart)
+      const col = pickCollisionPlacement(
+        next,
+        tDk,
+        tr,
+        span,
+        idealStart,
+        true,
+      )
       chosenRoom = col.room
       chosenStart = col.start
       collision = true
@@ -2139,6 +2503,12 @@ function applyArtDropNoPatient(
 ): Record<string, CellData> | null {
   const max = slotCount()
   const span = Math.min(Math.max(1, a.slots), max - startSlot)
+  if (slotRangeOverlapsMusterPause(startSlot, span)) {
+    window.alert(
+      'Zwischen 12:00 und 13:30 ist Pause — hier kann keine Belegungsart liegen.',
+    )
+    return null
+  }
   const next = { ...prev }
 
   for (let i = 0; i < span; i++) {
@@ -2195,15 +2565,31 @@ function cellMapApplyMove(
   toStartSlot: number,
   arten: BelegungsartItem[],
   mitarbeiter: MitarbeiterItem[],
+  options?: { blockLunchPauseAsMoveTarget?: boolean },
 ): Record<string, CellData> | null {
   const max = slotCount()
   const { start, end } = findBlockBounds(prev, fromDk, fromRoom, fromSlot)
   const startK = makeSlotKey(fromDk, fromRoom, start)
   if (!isCellBooked(prev[startK])) return prev
 
+  if (musterBlockIsPauseOnly([prev[startK]!])) {
+    window.alert('Die Pause lässt sich nicht verschieben.')
+    return null
+  }
+
   const len = end - start + 1
   if (toStartSlot < 0 || toStartSlot + len > max) {
     window.alert('Termin passt an diese Position nicht (Tagesende).')
+    return null
+  }
+
+  if (
+    options?.blockLunchPauseAsMoveTarget &&
+    slotRangeOverlapsMusterPause(toStartSlot, len)
+  ) {
+    window.alert(
+      'In der Pausenzeit (12:00–13:30) kann keine Belegungsart liegen.',
+    )
     return null
   }
 
@@ -2280,6 +2666,11 @@ function cellMapApplyResize(
   )
   const startK = makeSlotKey(payload.fromDk, payload.fromRoom, start)
   if (!isCellBooked(prev[startK])) return prev
+
+  if (isMusterPauseCell(prev[startK])) {
+    window.alert('Die Pause lässt sich nicht in der Dauer ändern.')
+    return null
+  }
 
   if (dropDk !== payload.fromDk || dropRoom !== payload.fromRoom) {
     window.alert(
@@ -2553,6 +2944,7 @@ type KollisionPanelItem = {
   kind:
     | 'termin-kollision'
     | 'termin-unvollständig'
+    | 'termin-ohne-patient'
     | 'termin-ohne-mitarbeiter'
 }
 
@@ -2676,7 +3068,8 @@ function kollisionPanelKindOrder(
 ): number {
   if (k === 'termin-kollision') return 0
   if (k === 'termin-unvollständig') return 1
-  return 2
+  if (k === 'termin-ohne-patient') return 2
+  return 3
 }
 
 /** Terminkollisionen (Muster) sowie Patiententermine ohne Mitarbeiter (inkl. „Mitarbeiter zuteilen“). */
@@ -2723,6 +3116,22 @@ function listKollisionPanelItems(
     const when = formatKollisionDatumZeile(p.dk, p.room, start)
     const summary = `${tag} · ${when} — ${cellDisplayLine(anchor)}`
     out.push({ anchorKey, kind, summary })
+  }
+
+  for (const [key, data] of Object.entries(cells)) {
+    if (!isCellBooked(data)) continue
+    const p = parseSlotCellKey(key)
+    if (!p) continue
+    const { start } = findBlockBounds(cells, p.dk, p.room, p.slot)
+    const anchorKey = makeSlotKey(p.dk, p.room, start)
+    if (seen.has(anchorKey)) continue
+    const anchor = cells[anchorKey]
+    if (anchor?.patient?.trim()) continue
+    if (anchor?.terminKollision) continue
+    seen.add(anchorKey)
+    const when = formatKollisionDatumZeile(p.dk, p.room, start)
+    const summary = `Ohne Patient · ${when} — ${cellDisplayLine(anchor)}`
+    out.push({ anchorKey, kind: 'termin-ohne-patient', summary })
   }
 
   out.sort((a, b) => {
@@ -2905,13 +3314,16 @@ function MusterWeekEditorGrid({
                               '--block-edge': accent ?? 'var(--booked-edge)',
                             } as CSSProperties)
                           : undefined
+                        const pauseBlock = isMusterPauseCell(anchorData)
                         const showResizeTop =
                           booked &&
+                          !pauseBlock &&
                           blockSegFirst !== null &&
                           (blockSegFirst === 'start' ||
                             blockSegFirst === 'single')
                         const showResizeBottom =
                           booked &&
+                          !pauseBlock &&
                           blockSegLast !== null &&
                           (blockSegLast === 'end' ||
                             blockSegLast === 'single')
@@ -3003,7 +3415,7 @@ function MusterWeekEditorGrid({
                                           }
                                         : undefined
                                     }
-                                    draggable={subBooked}
+                                    draggable={subBooked && !isMusterPauseCell(data)}
                                     onClick={() => {
                                       if (
                                         Date.now() - suppressClickAfterDrag.current <
@@ -3011,10 +3423,12 @@ function MusterWeekEditorGrid({
                                       ) {
                                         return
                                       }
+                                      if (isMusterPauseCell(data)) return
                                       onCellPickRequest(dayDk, room, sl)
                                     }}
                                     onDragStart={(e) => {
-                                      if (!subBooked) return
+                                      if (!subBooked || isMusterPauseCell(data))
+                                        return
                                       e.stopPropagation()
                                       startCellMoveDrag(e, dayDk, room, sl)
                                     }}
@@ -3041,9 +3455,11 @@ function MusterWeekEditorGrid({
                                       onEditorDrop(e, dayDk, room, sl)
                                     }
                                     aria-label={
-                                      subBooked
-                                        ? `${room} ${slotIndexToLabel(sl)} ${artOnlyLabel}, Klick zur Belegungsart`
-                                        : `${room} ${slotIndexToLabel(sl)} frei, Klick zur Belegungsart`
+                                      isMusterPauseCell(data)
+                                        ? `${room} ${slotIndexToLabel(sl)} Pause, nicht bearbeitbar`
+                                        : subBooked
+                                          ? `${room} ${slotIndexToLabel(sl)} ${artOnlyLabel}, Klick zur Belegungsart`
+                                          : `${room} ${slotIndexToLabel(sl)} frei, Klick zur Belegungsart`
                                     }
                                   />
                                 )
@@ -3199,6 +3615,11 @@ export default function App() {
     | { kind: 'staff'; dk: string; room: Room; anchorSlot: number }
   >(null)
   const [dragOverKey, setDragOverKey] = useState<string | null>(null)
+  /** Belegungsart vom Panel ziehen: Vorschau-Färbung gültiger Zielzellen */
+  const [artDragHighlight, setArtDragHighlight] = useState<{
+    artId: string
+    color: string
+  } | null>(null)
   const [newPatientName, setNewPatientName] = useState('')
   const [newPatientCode, setNewPatientCode] = useState('')
   const [editingPatientId, setEditingPatientId] = useState<string | null>(null)
@@ -3418,67 +3839,82 @@ export default function App() {
           const p = patientById(payload.id)
           if (!p) return prev
           const k = makeSlotKey(dk, room, startSlot)
-          if (isCellBooked(prev[k])) {
-            window.alert(
-              'Bitte ein freies Feld wählen. Patienten können nur in leere Zellen gezogen werden.',
-            )
-            return prev
+          const { start, end } = findBlockBounds(prev, dk, room, startSlot)
+          const anchorK = makeSlotKey(dk, room, start)
+          const anchorCell = prev[anchorK]
+
+          if (!isCellBooked(prev[k])) {
+            const cur = { ...(prev[k] ?? {}) }
+            return {
+              ...prev,
+              [k]: { ...cur, patient: p.name, patientCode: p.patientCode },
+            }
           }
-          const cur = { ...(prev[k] ?? {}) }
-          return {
-            ...prev,
-            [k]: { ...cur, patient: p.name, patientCode: p.patientCode },
+
+          if (!anchorCell?.patient?.trim()) {
+            for (let sl = start; sl <= end; sl++) {
+              const kk = makeSlotKey(dk, room, sl)
+              const c = prev[kk]
+              if (c?.patient?.trim() && c.patient !== p.name) {
+                window.alert(
+                  'Im gewählten Zeitraum ist bereits ein anderer Patient eingetragen.',
+                )
+                return prev
+              }
+            }
+            const next = { ...prev }
+            for (let sl = start; sl <= end; sl++) {
+              const kk = makeSlotKey(dk, room, sl)
+              const cur = { ...(next[kk] ?? {}) }
+              next[kk] = {
+                ...cur,
+                patient: p.name,
+                patientCode: p.patientCode,
+              }
+            }
+            return next
           }
+
+          window.alert(
+            'Bitte ein freies Feld oder einen Termin ohne Patient wählen.',
+          )
+          return prev
         }
 
         if (payload.kind === 'art') {
           const a = artById(payload.id)
           if (!a) return prev
-          const span = Math.min(Math.max(1, a.slots), max - startSlot)
           const startK = makeSlotKey(dk, room, startSlot)
           const startCur = prev[startK]
-          if (!startCur?.patient) {
-            window.alert(
-              'Bitte zuerst einen Patienten in dieses Feld ziehen. Danach die Belegungsart – die Zelle erhält dann die Farbe der Art.',
-            )
+          const pname = startCur?.patient?.trim()
+            ? startCur.patient
+            : undefined
+          const pcode = startCur?.patient?.trim()
+            ? startCur.patientCode
+            : undefined
+
+          const blocked = artFromPanelBlockedReason(
+            prev,
+            dk,
+            room,
+            startSlot,
+            a,
+            mitarbeiter,
+          )
+          if (blocked) {
+            window.alert(blocked)
             return prev
           }
-          const pname = startCur.patient
-          const pcode = startCur.patientCode
-
-          for (let i = 0; i < span; i++) {
-            const k = makeSlotKey(dk, room, startSlot + i)
-            const cur = prev[k]
-            if (cur?.patient && cur.patient !== pname) {
-              window.alert(
-                'Im gewählten Zeitraum ist bereits ein anderer Patient eingetragen.',
-              )
-              return prev
-            }
-            const st = findStaffForCell(cur, mitarbeiter)
-            if (st) {
-              if (!isStaffSlotAvailable(st, wd, startSlot + i)) {
-                window.alert(
-                  'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.',
-                )
-                return prev
-              }
-              if (!st.allowedArtIds.includes(a.id)) {
-                window.alert(
-                  'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
-                )
-                return prev
-              }
-            }
-          }
+          const span = Math.min(Math.max(1, a.slots), max - startSlot)
           const next = { ...prev }
           for (let i = 0; i < span; i++) {
             const k = makeSlotKey(dk, room, startSlot + i)
             const cur = { ...(next[k] ?? {}) }
             next[k] = {
               ...cur,
-              patient: pname,
-              patientCode: pcode,
+              ...(pname
+                ? { patient: pname, patientCode: pcode }
+                : {}),
               art: a.label,
               artId: a.id,
               artColor: a.color,
@@ -3515,25 +3951,24 @@ export default function App() {
               musterStamp,
             )
           }
-          const res = tryApplyMusterWeekToSlots(
-            prev,
-            weekStart,
-            m.templateCells,
-            arten,
-            effectiveMusterTemplateWeekCount(m),
-            musterStamp,
-          )
-          if ('error' in res) {
-            window.alert(res.error)
-            return prev
-          }
           queueMicrotask(() =>
             setMusterUsageCountById((c) => ({
               ...c,
               [m.id]: (c[m.id] ?? 0) + 1,
             })),
           )
-          return res.next
+          return applyMusterWithPatientWeek(
+            prev,
+            weekStart,
+            m.templateCells,
+            '',
+            undefined,
+            arten,
+            mitarbeiter,
+            { dk, room, slotIndex: blockStart },
+            effectiveMusterTemplateWeekCount(m),
+            musterStamp,
+          )
         }
 
         if (payload.kind === 'staff') {
@@ -3570,6 +4005,7 @@ export default function App() {
     (e: React.DragEvent, dk: string, room: Room, slotIndex: number) => {
       e.preventDefault()
       setDragOverKey(null)
+      setArtDragHighlight(null)
       const payload = parseDragPayload(e.dataTransfer)
       if (!payload) return
       if (payload.kind === 'moveBlock') {
@@ -3596,6 +4032,7 @@ export default function App() {
     (e: React.DragEvent, dk: string, room: Room) => {
       e.preventDefault()
       setDragOverKey(null)
+      setArtDragHighlight(null)
       const payload = parseDragPayload(e.dataTransfer)
       if (!payload) return
       if (payload.kind === 'moveBlock') {
@@ -3839,6 +4276,58 @@ export default function App() {
       : `KW ${getWeekNumber(weekStart)} · ${formatWeekRange(weekStart)}`
 
   const slots = slotCount()
+
+  const draggedArtForPreview = useMemo(
+    () =>
+      artDragHighlight
+        ? arten.find((x) => x.id === artDragHighlight.artId)
+        : undefined,
+    [artDragHighlight, arten],
+  )
+
+  const artDropPreview = useMemo(() => {
+    if (!artDragHighlight || viewMode !== 'day') return null
+    const a = arten.find((x) => x.id === artDragHighlight.artId)
+    if (!a) return null
+    const fullKeys = new Set<string>()
+    const partialKeys = new Set<string>()
+    const dk = activeDayKey
+    const wd = weekdayMon0FromDate(parseDateKey(dk))
+    const artSpanSlots = Math.max(1, a.slots)
+    for (const room of ROOMS) {
+      for (let sl = 0; sl < slots; sl++) {
+        const k = makeSlotKey(dk, room, sl)
+        if (
+          cellIsValidArtPanelDropPreview(
+            slotCells,
+            dk,
+            room,
+            sl,
+            a,
+            mitarbeiter,
+          )
+        ) {
+          fullKeys.add(k)
+        } else if (
+          artSpanSlots > 1 &&
+          !slotIndexInCalendarLunchPause(sl) &&
+          someStaffCanTreatArtAtSingleSlot(mitarbeiter, a.id, wd, sl)
+        ) {
+          partialKeys.add(k)
+        }
+      }
+    }
+    return { color: artDragHighlight.color, fullKeys, partialKeys }
+  }, [
+    artDragHighlight,
+    viewMode,
+    slotCells,
+    arten,
+    mitarbeiter,
+    activeDayKey,
+    slots,
+  ])
+
   const now = new Date()
   const isToday = dateKey(anchorDate) === dateKey(now)
   const currentSlot =
@@ -3874,10 +4363,20 @@ export default function App() {
   const endPanelOrCellDrag = useCallback(() => {
     dragSourceRef.current = null
     setMusterEditorDragOverKey(null)
+    setArtDragHighlight(null)
   }, [])
 
   const onDragStart = (e: React.DragEvent, payload: PanelDragPayload) => {
     dragSourceRef.current = 'panel'
+    if (payload.kind === 'art') {
+      const a = arten.find((x) => x.id === payload.id)
+      setArtDragHighlight({
+        artId: payload.id,
+        color: a?.color ?? '#64748b',
+      })
+    } else {
+      setArtDragHighlight(null)
+    }
     const s = JSON.stringify(payload)
     e.dataTransfer.setData(MIME_PHYSIO, s)
     e.dataTransfer.setData('text/plain', s)
@@ -4421,14 +4920,16 @@ export default function App() {
 
   const openMusterModalCreate = useCallback(() => {
     setMusterDraftLabel('')
-    setMusterDraftCells({})
+    setMusterDraftCells(injectMusterPauseSlots({}, 3))
     setMusterModal({ mode: 'create', templateWeekCount: 3 })
   }, [])
 
   const openMusterModalEdit = useCallback((m: BelegungsmusterItem) => {
     setMusterDraftLabel(m.label)
-    setMusterDraftCells(musterTemplateToVirtual(m.templateCells))
     const tw = m.templateWeekCount === 1 ? 1 : 3
+    setMusterDraftCells(
+      injectMusterPauseSlots(musterTemplateToVirtual(m.templateCells), tw),
+    )
     setMusterModal({ mode: 'edit', id: m.id, templateWeekCount: tw })
   }, [])
 
@@ -4520,6 +5021,7 @@ export default function App() {
             sl,
             arten,
             mitarbeiter,
+            { blockLunchPauseAsMoveTarget: true },
           ) ?? prev,
         )
         return
@@ -4554,6 +5056,8 @@ export default function App() {
       const k = makeSlotKey(dk, room, sl)
       if (!isCellBooked(prev[k])) return prev
       const { start, end } = findBlockBounds(prev, dk, room, sl)
+      const fk = makeSlotKey(dk, room, start)
+      if (isMusterPauseCell(prev[fk])) return prev
       const next = { ...prev }
       for (let s = start; s <= end; s++) {
         delete next[makeSlotKey(dk, room, s)]
@@ -4600,8 +5104,9 @@ export default function App() {
         <ul className="panel-list panel-list-compact kollision-panel-list">
           {kollisionPanelItems.length === 0 ? (
             <li className="kollision-panel-empty muted">
-              Keine Terminkollisionen und keine Patiententermine ohne Mitarbeiter
-              (ohne Belegungsart oder mit Hinweis „Mitarbeiter zuteilen“).
+              Keine Terminkollisionen, keine Termine ohne Patient und keine
+              Patiententermine ohne Mitarbeiter (ohne Belegungsart oder mit Hinweis
+              „Mitarbeiter zuteilen“).
             </li>
           ) : (
             kollisionPanelItems.map((item) => (
@@ -4611,7 +5116,9 @@ export default function App() {
                   className={
                     item.kind === 'termin-kollision'
                       ? 'kollision-entry kollision-entry--kollision'
-                      : 'kollision-entry kollision-entry--unvollständig'
+                      : item.kind === 'termin-ohne-patient'
+                        ? 'kollision-entry kollision-entry--ohne-patient'
+                        : 'kollision-entry kollision-entry--unvollständig'
                   }
                   title={item.summary}
                   aria-label={`Tagesansicht öffnen: ${item.summary}`}
@@ -4885,7 +5392,7 @@ export default function App() {
             {musterModalArtCounts.length > 0 ? (
               <ul
                 className="muster-art-summary muster-art-summary--modal-beside muster-art-summary--modal-3-rows"
-                aria-label="Belegungsarten im Muster: Anzahl 30-Minuten-Slots je Art (ohne OP)"
+                aria-label="Belegungsarten im Muster: Anzahl 30-Minuten-Slots je Art (ohne OP und Pause)"
               >
                 {musterModalArtCounts.map((row) => (
                   <li
@@ -4915,7 +5422,8 @@ export default function App() {
             <strong>Klick auf eine Zelle</strong> öffnet die Auswahl der Belegungsart;
             Belegungsarten lassen sich weiter per Drag & Drop platzieren. Blöcke wie
             im Kalender verschieben und am Rand kürzen oder verlängern. Anzeige nur der
-            Art-Bezeichnung.
+            Art-Bezeichnung. Täglich 12:00–13:30 ist fest als „Pause“ reserviert (keine
+            Belegungsart, wird nicht in den Hauptkalender übernommen).
           </p>
           <div className="muster-modal-grid-scroll">
             <MusterWeekEditorGrid
@@ -5349,6 +5857,7 @@ export default function App() {
                   </div>
                 ))}
                 {Array.from({ length: slots }, (_, slotIndex) => {
+                  const lunchPauseRow = slotIndexInCalendarLunchPause(slotIndex)
                   const rowMergeNext = ROOMS.some((room) => {
                     const d =
                       slotCells[makeSlotKey(activeDayKey, room, slotIndex)]
@@ -5372,7 +5881,7 @@ export default function App() {
                     }}
                   >
                     <div
-                      className={`time-label ${slotIndex === currentSlot ? 'now-line' : ''} ${rowMergeNext ? 'time-label--merge-next' : ''}`}
+                      className={`time-label ${slotIndex === currentSlot ? 'now-line' : ''} ${rowMergeNext ? 'time-label--merge-next' : ''} ${lunchPauseRow ? 'time-label--lunch-pause' : ''}`}
                       style={{ gridColumn: 1, gridRow: slotIndex + 2 }}
                     >
                       {slotIndexToLabel(slotIndex)}
@@ -5488,6 +5997,10 @@ export default function App() {
                       const terminKollisionClass = anchorData?.terminKollision
                         ? 'slot-cell-shell--termin-kollision'
                         : ''
+                      const lunchShell =
+                        slotIndicesForShell.some((ssi) =>
+                          slotIndexInCalendarLunchPause(ssi),
+                        )
                       return (
                         <div
                           key={anchorKey}
@@ -5497,6 +6010,7 @@ export default function App() {
                             shellDragActive ? 'drag-over' : '',
                             mergeNextClass ? 'slot-shell--merge-next' : '',
                             terminKollisionClass,
+                            lunchShell ? 'slot-cell-shell--lunch-pause' : '',
                           ]
                             .filter(Boolean)
                             .join(' ')}
@@ -5534,11 +6048,25 @@ export default function App() {
                                 sl,
                                 slots,
                               )
+                              const artPreviewFull =
+                                artDropPreview?.fullKeys.has(k) ?? false
+                              const artPreviewPartial =
+                                !artPreviewFull &&
+                                (artDropPreview?.partialKeys.has(k) ?? false)
+                              const artPreviewHere =
+                                artPreviewFull || artPreviewPartial
+                              const artTintStyle =
+                                artPreviewHere && artDropPreview
+                                  ? ({
+                                      '--art-drop-tint': artDropPreview.color,
+                                      '--art-drop-inset': `inset 0 0 0 999px color-mix(in srgb, ${artDropPreview.color} ${artPreviewFull ? 22 : 10}%, transparent)`,
+                                    } as CSSProperties)
+                                  : undefined
                               return (
                                 <button
                                   key={k}
                                   type="button"
-                                  className={`slot-cell slot-cell-main ${subBooked ? 'booked' : ''} ${subBooked && subSeg ? `slot-block--${subSeg}` : ''} ${sl === currentSlot ? 'now-line' : ''} ${data?.terminKollision ? 'slot-cell--termin-kollision' : ''}`}
+                                  className={`slot-cell slot-cell-main ${subBooked ? 'booked' : ''} ${subBooked && subSeg ? `slot-block--${subSeg}` : ''} ${sl === currentSlot ? 'now-line' : ''} ${data?.terminKollision ? 'slot-cell--termin-kollision' : ''} ${slotIndexInCalendarLunchPause(sl) ? 'slot-cell--lunch-pause' : ''} ${artPreviewHere ? 'slot-cell--art-drop-preview' : ''}`}
                                   style={
                                     subBooked
                                       ? {
@@ -5550,14 +6078,17 @@ export default function App() {
                                             : {
                                                 background: 'var(--booked)',
                                               }),
+                                          ...artTintStyle,
                                         }
-                                      : undefined
+                                      : artTintStyle
                                   }
                                   draggable={subBooked}
                                   title={
                                     data?.terminKollision
                                       ? 'Terminkollision'
-                                      : undefined
+                                      : artPreviewPartial && draggedArtForPreview
+                                        ? `Nur dieses ${SLOT_MINUTES}-Minuten-Fenster: keine volle Dauer (${draggedArtForPreview.slots * SLOT_MINUTES} Min.) mit einem Mitarbeiter möglich.`
+                                        : undefined
                                   }
                                   onClick={() => {
                                     if (
