@@ -1971,6 +1971,7 @@ function musterTemplateArtSlotCountsFullCatalog(
   const out: { id: string; label: string; count: number; color: string }[] = []
   for (const a of artenList) {
     if (a.id === OP_BELEGUNGSART_ID) continue
+    if (a.id === MUSTER_PAUSE_ART_ID) continue
     if (seen.has(a.id)) continue
     seen.add(a.id)
     out.push({
@@ -3173,6 +3174,8 @@ type MusterWeekEditorGridProps = {
   ) => void
   suppressClickAfterDrag: MutableRefObject<number>
   dragSourceRef: MutableRefObject<'panel' | 'cell' | 'resize' | null>
+  availabilityHighlightKeys: Set<string> | null
+  availabilityHighlightColor: string | undefined
 }
 
 function MusterWeekEditorGrid({
@@ -3187,6 +3190,8 @@ function MusterWeekEditorGrid({
   startResizeDrag,
   suppressClickAfterDrag,
   dragSourceRef,
+  availabilityHighlightKeys,
+  availabilityHighlightColor,
 }: MusterWeekEditorGridProps) {
   const slotsN = slotCount()
   return (
@@ -3396,11 +3401,15 @@ function MusterWeekEditorGrid({
                                   sl,
                                   slotsN,
                                 )
+                                const staffAvailShade =
+                                  Boolean(availabilityHighlightKeys?.has(k)) &&
+                                  !isMusterPauseCell(data) &&
+                                  !slotIndexInCalendarLunchPause(sl)
                                 return (
                                   <button
                                     key={k}
                                     type="button"
-                                    className={`slot-cell slot-cell-main ${subBooked ? 'booked' : ''} ${subBooked && subSeg ? `slot-block--${subSeg}` : ''}`}
+                                    className={`slot-cell slot-cell-main ${subBooked ? 'booked' : ''} ${subBooked && subSeg ? `slot-block--${subSeg}` : ''} ${staffAvailShade ? 'slot-cell--muster-staff-avail' : ''}`}
                                     style={
                                       subBooked
                                         ? {
@@ -3412,8 +3421,19 @@ function MusterWeekEditorGrid({
                                               : {
                                                   background: 'var(--booked)',
                                                 }),
+                                            ...(staffAvailShade && availabilityHighlightColor
+                                              ? ({
+                                                  '--art-drop-tint':
+                                                    availabilityHighlightColor,
+                                                } as CSSProperties)
+                                              : {}),
                                           }
-                                        : undefined
+                                        : staffAvailShade && availabilityHighlightColor
+                                          ? ({
+                                              '--art-drop-tint':
+                                                availabilityHighlightColor,
+                                            } as CSSProperties)
+                                          : undefined
                                     }
                                     draggable={subBooked && !isMusterPauseCell(data)}
                                     onClick={() => {
@@ -3592,6 +3612,10 @@ export default function App() {
     {},
   )
   const [musterEditorDragOverKey, setMusterEditorDragOverKey] = useState<
+    string | null
+  >(null)
+  /** Muster-Editor: genau eine Belegungsart — Zellen schattieren, in denen alle freigeschalteten MA verfügbar sind */
+  const [musterHighlightArtId, setMusterHighlightArtId] = useState<
     string | null
   >(null)
   const [musterArtPicker, setMusterArtPicker] = useState<
@@ -4187,7 +4211,7 @@ export default function App() {
           const k = makeSlotKey(dk, room, sl)
           const cur = prev[k]
           const artId = findArtIdForCell(cur, arten)
-          if (artId && !s.allowedArtIds.includes(artId)) {
+          if (artId && !staffHasArtAllowed(s, artId)) {
             window.alert(
               'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
             )
@@ -4357,8 +4381,37 @@ export default function App() {
       timeRange,
       currentStaff: sample.staff,
       currentStaffId: sample.staffId,
+      blockArtId: findArtIdForCell(sample, arten),
     }
-  }, [terminPickerModal, slotCells])
+  }, [terminPickerModal, slotCells, arten])
+
+  /** Hauptkalender · Mitarbeiter-Zuordnung: nur MA mit Freigabe für die Art und Verfügbarkeit auf jedem Slot des Blocks */
+  const staffPickListForTerminModal = useMemo(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'staff') return null
+    const { dk, room, anchorSlot } = terminPickerModal
+    const { start, end } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const startK = makeSlotKey(dk, room, start)
+    const sample = slotCells[startK]
+    if (!sample || !isCellBooked(sample)) return null
+    const wd = weekdayMon0FromDate(parseDateKey(dk))
+    const artId = findArtIdForCell(sample, arten)
+    const span = end - start + 1
+    if (artId) {
+      return staffWhoCanPerformArtOnWholeSpan(
+        mitarbeiter,
+        artId,
+        wd,
+        start,
+        span,
+      )
+    }
+    return mitarbeiter.filter((s) => {
+      for (let sl = start; sl <= end; sl++) {
+        if (!isStaffSlotAvailable(s, wd, sl)) return false
+      }
+      return true
+    })
+  }, [terminPickerModal, slotCells, mitarbeiter, arten])
 
   const endPanelOrCellDrag = useCallback(() => {
     dragSourceRef.current = null
@@ -4877,6 +4930,7 @@ export default function App() {
     setMusterModal(null)
     setMusterEditorDragOverKey(null)
     setMusterArtPicker(null)
+    setMusterHighlightArtId(null)
   }, [])
 
   const closeMusterArtPicker = useCallback(() => {
@@ -4921,12 +4975,14 @@ export default function App() {
   const openMusterModalCreate = useCallback(() => {
     setMusterDraftLabel('')
     setMusterDraftCells(injectMusterPauseSlots({}, 3))
+    setMusterHighlightArtId(null)
     setMusterModal({ mode: 'create', templateWeekCount: 3 })
   }, [])
 
   const openMusterModalEdit = useCallback((m: BelegungsmusterItem) => {
     setMusterDraftLabel(m.label)
     const tw = m.templateWeekCount === 1 ? 1 : 3
+    setMusterHighlightArtId(null)
     setMusterDraftCells(
       injectMusterPauseSlots(musterTemplateToVirtual(m.templateCells), tw),
     )
@@ -5359,6 +5415,37 @@ export default function App() {
     )
   }, [musterModal, musterDraftCells, arten])
 
+  const musterEditorAvailabilityKeys = useMemo(() => {
+    if (!musterModal || !musterHighlightArtId) return null
+    const artId = musterHighlightArtId
+    if (artId === OP_BELEGUNGSART_ID || artId === MUSTER_PAUSE_ART_ID) {
+      return new Set<string>()
+    }
+    const eligible = mitarbeiter.filter((s) => staffHasArtAllowed(s, artId))
+    if (eligible.length === 0) return new Set<string>()
+    const keys = new Set<string>()
+    const slotsN = slotCount()
+    const dayCount = musterModal.templateWeekCount * 7
+    for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
+      const dayDk = templateDkForDayIndex(dayIndex)
+      const wd = weekdayMon0FromDate(parseDateKey(dayDk))
+      for (const room of ROOMS) {
+        for (let sl = 0; sl < slotsN; sl++) {
+          if (slotIndexInCalendarLunchPause(sl)) continue
+          if (eligible.every((s) => isStaffSlotAvailable(s, wd, sl))) {
+            keys.add(makeSlotKey(dayDk, room, sl))
+          }
+        }
+      }
+    }
+    return keys
+  }, [musterModal, musterHighlightArtId, mitarbeiter])
+
+  const musterHighlightColor = useMemo(() => {
+    if (!musterHighlightArtId) return undefined
+    return arten.find((a) => a.id === musterHighlightArtId)?.color
+  }, [musterHighlightArtId, arten])
+
   const musterModalOverlay =
     musterModal === null ? null : (
       <div
@@ -5394,20 +5481,40 @@ export default function App() {
                 className="muster-art-summary muster-art-summary--modal-beside muster-art-summary--modal-3-rows"
                 aria-label="Belegungsarten im Muster: Anzahl 30-Minuten-Slots je Art (ohne OP und Pause)"
               >
-                {musterModalArtCounts.map((row) => (
-                  <li
-                    key={`modal-${row.id}`}
-                    className="muster-art-summary-item"
-                  >
-                    <span
-                      className="muster-art-summary-dot"
-                      style={{ background: row.color }}
-                      aria-hidden
-                    />
-                    <span className="muster-art-summary-label">{row.label}</span>
-                    <span className="muster-art-summary-count">{row.count}×</span>
-                  </li>
-                ))}
+                {musterModalArtCounts.map((row) => {
+                  const showAvailSwitch =
+                    row.id !== OP_BELEGUNGSART_ID &&
+                    row.id !== MUSTER_PAUSE_ART_ID
+                  return (
+                    <li
+                      key={`modal-${row.id}`}
+                      className="muster-art-summary-item muster-art-summary-item--with-switch"
+                    >
+                      <span
+                        className="muster-art-summary-dot"
+                        style={{ background: row.color }}
+                        aria-hidden
+                      />
+                      <span className="muster-art-summary-label">{row.label}</span>
+                      {showAvailSwitch ? (
+                        <button
+                          type="button"
+                          role="switch"
+                          className="muster-art-avail-switch"
+                          aria-checked={musterHighlightArtId === row.id}
+                          aria-label={`Verfügbarkeit für ${row.label} im Raster`}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setMusterHighlightArtId((prev) =>
+                              prev === row.id ? null : row.id,
+                            )
+                          }}
+                        />
+                      ) : null}
+                      <span className="muster-art-summary-count">{row.count}×</span>
+                    </li>
+                  )
+                })}
               </ul>
             ) : (
               <p className="muster-art-summary-empty muster-art-summary-empty--modal-beside">
@@ -5422,8 +5529,10 @@ export default function App() {
             <strong>Klick auf eine Zelle</strong> öffnet die Auswahl der Belegungsart;
             Belegungsarten lassen sich weiter per Drag & Drop platzieren. Blöcke wie
             im Kalender verschieben und am Rand kürzen oder verlängern. Anzeige nur der
-            Art-Bezeichnung. Täglich 12:00–13:30 ist fest als „Pause“ reserviert (keine
-            Belegungsart, wird nicht in den Hauptkalender übernommen).
+            Art-Bezeichnung. Pro Belegungsart kann der Schalter die Zellen schattieren,
+            in denen alle Mitarbeiter mit Freigabe für diese Art an dem Slot verfügbar
+            sind (nur eine Art gleichzeitig). Täglich 12:00–13:30 ist fest als „Pause“
+            reserviert (keine Belegungsart, wird nicht in den Hauptkalender übernommen).
           </p>
           <div className="muster-modal-grid-scroll">
             <MusterWeekEditorGrid
@@ -5438,6 +5547,8 @@ export default function App() {
               startResizeDrag={startResizeDrag}
               suppressClickAfterDrag={musterEditorSuppressClick}
               dragSourceRef={dragSourceRef}
+              availabilityHighlightKeys={musterEditorAvailabilityKeys}
+              availabilityHighlightColor={musterHighlightColor}
             />
           </div>
           <div className="staff-modal-footer">
@@ -6808,11 +6919,26 @@ export default function App() {
                       Aktuell: {terminModalDetail.currentStaff}
                     </p>
                   ) : null}
+                  <p className="staff-modal-hint">
+                    Es erscheinen nur Mitarbeiter, die im gesamten Termin
+                    verfügbar sind
+                    {terminModalDetail.blockArtId
+                      ? ' und für die gewählte Belegungsart freigeschaltet sind.'
+                      : '.'}
+                  </p>
                   <ul className="termin-staff-pick-list">
                     {mitarbeiter.length === 0 ? (
                       <li className="muted">Keine Mitarbeiter angelegt.</li>
+                    ) : staffPickListForTerminModal === null ? (
+                      <li className="muted">Termin nicht gefunden.</li>
+                    ) : staffPickListForTerminModal.length === 0 ? (
+                      <li className="muted">
+                        {terminModalDetail.blockArtId
+                          ? 'Kein Mitarbeiter erfüllt Verfügbarkeit und Freigabe für diese Belegungsart im gesamten Zeitraum.'
+                          : 'Kein Mitarbeiter ist im gesamten Zeitraum verfügbar.'}
+                      </li>
                     ) : (
-                      mitarbeiter.map((st) => (
+                      staffPickListForTerminModal.map((st) => (
                         <li key={st.id}>
                           <button
                             type="button"
