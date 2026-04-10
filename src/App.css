@@ -337,7 +337,9 @@
 
 .staff-week-cell--booked {
   background: color-mix(in srgb, var(--accent) 14%, var(--surface));
-  font-weight: 600;
+  align-items: flex-start;
+  justify-content: flex-start;
+  text-align: left;
 }
 
 .staff-week-cell--absent {
@@ -362,8 +364,40 @@
   display: block;
   max-width: 100%;
   overflow: hidden;
+}
+
+.staff-week-cell-inner:not(.staff-week-cell-termin-stack) {
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.staff-week-cell-inner.staff-week-cell-termin-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.06rem;
+  width: 100%;
+  text-align: left;
+  white-space: normal;
+  max-height: 100%;
+  justify-content: flex-start;
+}
+
+.staff-week-cell-inner.staff-week-cell-termin-stack .slot-cell-termin-line {
+  font-size: 0.56rem;
+  line-height: 1.15;
+}
+
+.staff-week-cell-termin-bundle {
+  display: flex;
+  flex-direction: column;
+  gap: 0.06rem;
+}
+
+.staff-week-cell-termin-bundle + .staff-week-cell-termin-bundle {
+  margin-top: 0.2rem;
+  padding-top: 0.2rem;
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
 }
 
 .staff-absence-scope-fieldset {
@@ -452,6 +486,9 @@
   margin: 0;
   text-align: left;
   cursor: pointer;
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
   font-family: inherit;
   font-size: 0.68rem;
   line-height: 1.35;
@@ -1056,6 +1093,47 @@
   color: var(--text-faint);
   font-weight: 400;
   opacity: 0.85;
+}
+
+.slot-cell-termin-notiz {
+  font-weight: 500;
+  font-style: italic;
+  color: var(--text-muted);
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  word-break: break-word;
+}
+
+.termin-notiz-editor {
+  margin-top: 0.65rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.termin-notiz-textarea {
+  width: 100%;
+  min-height: 4rem;
+  resize: vertical;
+  box-sizing: border-box;
+  font: inherit;
+  line-height: 1.35;
+}
+
+.termin-notiz-save {
+  margin-top: 0.45rem;
+}
+
+.staff-termin-notiz-label {
+  margin-top: 0.35rem;
+  margin-bottom: 0.25rem;
+}
+
+.staff-termin-notiz-save {
+  margin-top: 0.25rem;
+  margin-bottom: 0.35rem;
 }
 
 .app-header {
@@ -2111,6 +2189,17 @@
   border-top: 1px solid var(--border-subtle);
 }
 
+.staff-termin-detail-blocks {
+  overflow-y: auto;
+  max-height: min(52vh, 28rem);
+}
+
+.staff-termin-detail-block + .staff-termin-detail-block {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
 .muster-modal-dialog {
   position: relative;
   max-width: min(96vw, 120rem);
@@ -2156,32 +2245,36 @@
 }
 
 .muster-art-summary--modal-beside {
-  flex: 1 1 14rem;
+  flex: 2 1 min(100%, 48rem);
   min-width: 0;
   max-width: 100%;
   justify-content: flex-end;
   margin: 0;
-  padding: 0.55rem 0.85rem;
+  padding: 0.65rem 0.9rem;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--surface-2);
   box-sizing: border-box;
-  font-size: 1.36rem;
-  line-height: 1.4;
+  font-size: 0.78rem;
+  line-height: 1.35;
   gap: 0.45rem 1rem;
   color: var(--text-h);
   overflow: auto;
 }
 
 .muster-art-summary--modal-beside .muster-art-summary-item {
-  gap: 0.35rem;
+  gap: 0;
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
+  display: grid;
+  grid-template-columns: 0.85rem minmax(0, 1fr) 2.25rem minmax(2.25rem, auto);
+  align-items: center;
+  column-gap: 0.4rem;
 }
 
 .muster-art-summary-item--with-switch {
-  gap: 0.35rem;
+  gap: 0;
 }
 
 .muster-art-avail-switch {
@@ -2229,24 +2322,36 @@
 
 .muster-art-summary--modal-beside .muster-art-summary-label {
   min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .muster-art-summary--modal-beside .muster-art-summary-dot {
-  width: 0.9rem;
-  height: 0.9rem;
+  width: 0.75rem;
+  height: 0.75rem;
+  justify-self: start;
 }
 
-.muster-art-summary.muster-art-summary--modal-3-rows {
-  display: grid;
-  grid-template-rows: repeat(3, auto);
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(0, 1fr);
-  width: 100%;
-  justify-content: start;
-  align-content: start;
-  justify-items: stretch;
-  row-gap: 0.45rem;
-  column-gap: 1rem;
+.muster-art-summary--modal-beside .muster-art-summary-count {
+  justify-self: end;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.muster-art-avail-switch-placeholder {
+  width: 2.25rem;
+  height: 1.15rem;
+  flex-shrink: 0;
+  justify-self: center;
+}
+
+.muster-art-summary--modal-beside .muster-art-avail-switch {
+  justify-self: center;
 }
 
 .muster-art-summary-empty--modal-beside {
@@ -2615,6 +2720,30 @@
   font-size: 0.68rem;
   color: var(--text-faint);
   font-style: italic;
+}
+
+/* Muster-Modal: gleich breite Spalten, pro Eintrag Raster Punkt | Text | Schalter | Zähler */
+.muster-art-summary.muster-art-summary--modal-beside.muster-art-summary--modal-3-rows {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.5rem 0.85rem;
+  width: 100%;
+  flex-wrap: unset;
+  align-items: start;
+  align-content: start;
+  justify-items: stretch;
+}
+
+@media (max-width: 52rem) {
+  .muster-art-summary.muster-art-summary--modal-beside.muster-art-summary--modal-3-rows {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 32rem) {
+  .muster-art-summary.muster-art-summary--modal-beside.muster-art-summary--modal-3-rows {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .arten-inline-drag {
