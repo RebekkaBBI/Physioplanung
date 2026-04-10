@@ -1923,6 +1923,67 @@
   flex-direction: column;
 }
 
+.staff-modal--two-week-avail .staff-avail-scroll {
+  max-height: min(40vh, 340px);
+}
+
+.staff-two-week-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  margin: 0 0 0.15rem;
+}
+
+.staff-two-week-toggle-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.staff-two-week-hint {
+  margin: 0 0 0.65rem;
+  font-size: 0.72rem;
+}
+
+.staff-avail-week-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 0;
+  flex: 1;
+}
+
+.staff-avail-week-stack--side-by-side {
+  flex-direction: row;
+  align-items: stretch;
+  gap: 0.75rem 1rem;
+}
+
+.staff-avail-week-stack--side-by-side .staff-avail-week-block {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+@media (max-width: 52rem) {
+  .staff-avail-week-stack--side-by-side {
+    flex-direction: column;
+  }
+}
+
+.staff-avail-week-block {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.staff-avail-week-title {
+  margin: 0 0 0.35rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
 .staff-modal-subtitle {
   margin: 0 0 0.25rem;
   font-size: 0.85rem;

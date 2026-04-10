@@ -89,6 +89,13 @@ type MitarbeiterItem = {
   name: string
   /** Mo=0 … So=6, Slot 0 = 08:00 — Schlüssel `${w}|${slot}` */
   availability: Record<string, boolean>
+  /**
+   * true: gerade ISO-Kalenderwoche → `availability`, ungerade KW → `availabilityOddWeek`.
+   * Ermöglicht abwechselnde Wochenpläne.
+   */
+  alternatingWeeklyAvailability?: boolean
+  /** Wochenplan für ungerade ISO-Kalenderwochen (gleiche Schlüssel wie `availability`) */
+  availabilityOddWeek?: Record<string, boolean>
   /** Freigegebene Belegungsarten (IDs) */
   allowedArtIds: string[]
   /** Urlaub / Abwesenheit — nicht verfügbar (ganztägig oder stundenweise) */
@@ -237,12 +244,40 @@ function staffAvailKey(weekdayMon0: number, slotIndex: number): string {
   return `${weekdayMon0}|${slotIndex}`
 }
 
+/** ISO-8601-Kalenderwoche (1–53), Woche beginnt montags */
+function getWeekNumber(d: Date): number {
+  const target = new Date(d.valueOf())
+  const dayNr = (d.getDay() + 6) % 7
+  target.setDate(target.getDate() - dayNr + 3)
+  const firstThursday = target.valueOf()
+  target.setMonth(0, 1)
+  if (target.getDay() !== 4) {
+    target.setMonth(0, 1 + ((4 - target.getDay() + 7) % 7))
+  }
+  return 1 + Math.ceil((firstThursday - target.valueOf()) / 604800000)
+}
+
+/** Effektives Wochen-Raster für ein konkretes Datum (eine vs. wechselnde KW) */
+function staffAvailabilityMapForDate(
+  s: MitarbeiterItem,
+  dk: string,
+): Record<string, boolean> {
+  if (!s.alternatingWeeklyAvailability || !s.availabilityOddWeek) {
+    return s.availability
+  }
+  const wn = getWeekNumber(parseDateKey(dk))
+  const evenWeek = wn % 2 === 0
+  return evenWeek ? s.availability : s.availabilityOddWeek
+}
+
 function isStaffSlotAvailable(
   s: MitarbeiterItem,
   weekdayMon0: number,
   slotIndex: number,
+  dk?: string,
 ): boolean {
-  return s.availability[staffAvailKey(weekdayMon0, slotIndex)] === true
+  const map = dk ? staffAvailabilityMapForDate(s, dk) : s.availability
+  return map[staffAvailKey(weekdayMon0, slotIndex)] === true
 }
 
 function isDateInInclusiveRange(dk: string, fromDk: string, toDk: string): boolean {
@@ -283,7 +318,7 @@ function isStaffSlotAvailableForDate(
   slotIndex: number,
 ): boolean {
   if (isStaffAbsentAtSlot(s, dk, slotIndex)) return false
-  return isStaffSlotAvailable(s, weekdayMon0, slotIndex)
+  return isStaffSlotAvailable(s, weekdayMon0, slotIndex, dk)
 }
 
 function newStaffAbsenceId(): string {
@@ -519,7 +554,7 @@ function artFromPanelBlockedReason(
       if (isStaffAbsentAtSlot(st, dk, startSlot + i)) {
         return 'Der Mitarbeiter ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.'
       }
-      if (!isStaffSlotAvailable(st, wd, startSlot + i)) {
+      if (!isStaffSlotAvailable(st, wd, startSlot + i, dk)) {
         return 'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.'
       }
       if (!staffHasArtAllowed(st, a.id)) {
@@ -588,7 +623,7 @@ function extensionSlotError(
       if (isStaffAbsentAtSlot(st, dk, slot)) {
         return 'Ein Teamteilnehmer ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.'
       }
-      if (!isStaffSlotAvailable(st, wd, slot)) {
+      if (!isStaffSlotAvailable(st, wd, slot, dk)) {
         return 'Ein Teamteilnehmer ist zu dieser Zeit in seinem Wochenplan nicht verfügbar.'
       }
       if (artId && !st.allowedArtIds.includes(artId)) {
@@ -602,7 +637,7 @@ function extensionSlotError(
     if (isStaffAbsentAtSlot(st, dk, slot)) {
       return 'Der Mitarbeiter ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.'
     }
-    if (!isStaffSlotAvailable(st, wd, slot)) {
+    if (!isStaffSlotAvailable(st, wd, slot, dk)) {
       return 'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.'
     }
     const artId = findArtIdForCell(template, artenList)
@@ -723,10 +758,31 @@ function migrateMitarbeiter(
   if (!allowedArtIds.includes(TEAM_MEETING_ART_ID)) {
     allowedArtIds.push(TEAM_MEETING_ART_ID)
   }
+  const alternating = raw.alternatingWeeklyAvailability === true
+  let availabilityOddWeek: Record<string, boolean> | undefined
+  if (alternating) {
+    availabilityOddWeek = emptyStaffAvailability(slotsN)
+    if (
+      raw.availabilityOddWeek &&
+      typeof raw.availabilityOddWeek === 'object' &&
+      Object.keys(raw.availabilityOddWeek).length > 0
+    ) {
+      for (let w = 0; w < 7; w++) {
+        for (let sl = 0; sl < slotsN; sl++) {
+          const k = staffAvailKey(w, sl)
+          if (raw.availabilityOddWeek[k] === true) availabilityOddWeek[k] = true
+        }
+      }
+    } else {
+      availabilityOddWeek = { ...availability }
+    }
+  }
   return {
     id: raw.id,
     name: raw.name,
     availability,
+    alternatingWeeklyAvailability: alternating ? true : undefined,
+    availabilityOddWeek,
     allowedArtIds,
     absences: normalizeStaffAbsences(raw.absences),
   }
@@ -2904,7 +2960,7 @@ function cellMapApplyMove(
           )
           return null
         }
-        if (!isStaffSlotAvailable(st, wdTo, toStartSlot + i)) {
+        if (!isStaffSlotAvailable(st, wdTo, toStartSlot + i, toDk)) {
           alertOnce(
             'Ein Teamteilnehmer ist zu dieser Zeit in seinem Wochenplan nicht verfügbar.',
           )
@@ -2926,7 +2982,7 @@ function cellMapApplyMove(
           )
           return null
         }
-        if (!isStaffSlotAvailable(st, wdTo, toStartSlot + i)) {
+        if (!isStaffSlotAvailable(st, wdTo, toStartSlot + i, toDk)) {
           alertOnce(
             'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.',
           )
@@ -4164,6 +4220,10 @@ export default function App() {
   const [staffDraftAvail, setStaffDraftAvail] = useState<Record<string, boolean>>(
     () => emptyStaffAvailability(slotCount()),
   )
+  const [staffDraftAvailOdd, setStaffDraftAvailOdd] = useState<
+    Record<string, boolean>
+  >(() => emptyStaffAvailability(slotCount()))
+  const [staffDraftAlternating, setStaffDraftAlternating] = useState(false)
   const [staffDraftArtIds, setStaffDraftArtIds] = useState<string[]>([])
   const [terminPickerModal, setTerminPickerModal] = useState<
     | null
@@ -4221,6 +4281,7 @@ export default function App() {
   const staffAvailPaintRef = useRef<{
     active: boolean
     targetOn: boolean
+    weekParity: 'even' | 'odd'
   } | null>(null)
   /* Automatisches Speichern: Kalender, Stammdaten, Ansicht — bei jeder Änderung */
   useEffect(() => {
@@ -4803,7 +4864,7 @@ export default function App() {
             )
             return prev
           }
-          if (!isStaffSlotAvailable(s, wd, startSlot)) {
+          if (!isStaffSlotAvailable(s, wd, startSlot, dk)) {
             alertOnce(
               'Dieser Mitarbeiter ist zu dieser Zeit in seinem Wochenplan nicht als verfügbar markiert.',
             )
@@ -5032,7 +5093,7 @@ export default function App() {
             )
             return prev
           }
-          if (!isStaffSlotAvailable(s, wd, sl)) {
+          if (!isStaffSlotAvailable(s, wd, sl, dk)) {
             alertOnce(
               'Dieser Mitarbeiter ist zu dieser Zeit in seinem Wochenplan nicht als verfügbar markiert.',
             )
@@ -5770,6 +5831,8 @@ export default function App() {
   const openStaffModalCreate = () => {
     setStaffDraftName('')
     setStaffDraftAvail(emptyStaffAvailability(slotCount()))
+    setStaffDraftAvailOdd(emptyStaffAvailability(slotCount()))
+    setStaffDraftAlternating(false)
     setStaffDraftArtIds([])
     setStaffModal({ mode: 'create' })
   }
@@ -5779,6 +5842,12 @@ export default function App() {
     if (!s) return
     setStaffDraftName(s.name)
     setStaffDraftAvail({ ...s.availability })
+    setStaffDraftAlternating(s.alternatingWeeklyAvailability === true)
+    setStaffDraftAvailOdd(
+      s.alternatingWeeklyAvailability && s.availabilityOddWeek
+        ? { ...s.availabilityOddWeek }
+        : emptyStaffAvailability(slotCount()),
+    )
     setStaffDraftArtIds([...s.allowedArtIds])
     setStaffModal({ mode: 'edit', id })
   }
@@ -5800,14 +5869,31 @@ export default function App() {
         availability[k] = staffDraftAvail[k] === true
       }
     }
+    let availabilityOddWeek: Record<string, boolean> | undefined
+    if (staffDraftAlternating) {
+      availabilityOddWeek = {}
+      for (let w = 0; w < 7; w++) {
+        for (let sl = 0; sl < slotsN; sl++) {
+          const k = staffAvailKey(w, sl)
+          availabilityOddWeek[k] = staffDraftAvailOdd[k] === true
+        }
+      }
+    }
     const validArtIds = staffDraftArtIds.filter((id) =>
       arten.some((a) => a.id === id),
     )
+    const existing =
+      staffModal.mode === 'edit'
+        ? mitarbeiter.find((x) => x.id === staffModal.id)
+        : undefined
     const item: MitarbeiterItem = {
       id: staffModal.mode === 'create' ? `st-${Date.now()}` : staffModal.id,
       name,
       availability,
+      alternatingWeeklyAvailability: staffDraftAlternating ? true : undefined,
+      availabilityOddWeek,
       allowedArtIds: validArtIds,
+      absences: existing?.absences,
     }
     if (staffModal.mode === 'create') {
       setMitarbeiter((list) => [...list, item])
@@ -5819,31 +5905,62 @@ export default function App() {
     setStaffModal(null)
   }
 
-  const beginStaffAvailPaint = useCallback((w: number, sl: number) => {
-    const k = staffAvailKey(w, sl)
-    setStaffDraftAvail((a) => {
-      const cur = a[k] === true
-      const targetOn = !cur
-      staffAvailPaintRef.current = { active: true, targetOn }
-      return { ...a, [k]: targetOn }
-    })
-  }, [])
+  const beginStaffAvailPaint = useCallback(
+    (weekParity: 'even' | 'odd', w: number, sl: number) => {
+      const k = staffAvailKey(w, sl)
+      if (weekParity === 'odd') {
+        setStaffDraftAvailOdd((a) => {
+          const cur = a[k] === true
+          const targetOn = !cur
+          staffAvailPaintRef.current = {
+            active: true,
+            targetOn,
+            weekParity: 'odd',
+          }
+          return { ...a, [k]: targetOn }
+        })
+      } else {
+        setStaffDraftAvail((a) => {
+          const cur = a[k] === true
+          const targetOn = !cur
+          staffAvailPaintRef.current = {
+            active: true,
+            targetOn,
+            weekParity: 'even',
+          }
+          return { ...a, [k]: targetOn }
+        })
+      }
+    },
+    [],
+  )
 
   const extendStaffAvailPaint = useCallback((w: number, sl: number) => {
     const p = staffAvailPaintRef.current
     if (!p?.active) return
     const k = staffAvailKey(w, sl)
-    setStaffDraftAvail((a) => ({ ...a, [k]: p.targetOn }))
+    if (p.weekParity === 'odd') {
+      setStaffDraftAvailOdd((a) => ({ ...a, [k]: p.targetOn }))
+    } else {
+      setStaffDraftAvail((a) => ({ ...a, [k]: p.targetOn }))
+    }
   }, [])
 
   const endStaffAvailPaint = useCallback(() => {
     staffAvailPaintRef.current = null
   }, [])
 
-  const toggleStaffDraftSlotKeyboard = useCallback((w: number, sl: number) => {
-    const k = staffAvailKey(w, sl)
-    setStaffDraftAvail((a) => ({ ...a, [k]: !a[k] }))
-  }, [])
+  const toggleStaffDraftSlotKeyboard = useCallback(
+    (weekParity: 'even' | 'odd', w: number, sl: number) => {
+      const k = staffAvailKey(w, sl)
+      if (weekParity === 'odd') {
+        setStaffDraftAvailOdd((a) => ({ ...a, [k]: !a[k] }))
+      } else {
+        setStaffDraftAvail((a) => ({ ...a, [k]: !a[k] }))
+      }
+    },
+    [],
+  )
 
   useEffect(() => {
     if (!staffModal) {
@@ -8884,7 +9001,7 @@ export default function App() {
           role="presentation"
         >
           <div
-            className="staff-modal"
+            className={`staff-modal${staffDraftAlternating ? ' staff-modal--two-week-avail' : ''}`}
             role="dialog"
             aria-modal="true"
             aria-labelledby="staff-modal-title"
@@ -8905,72 +9022,189 @@ export default function App() {
                 autoComplete="name"
               />
             </label>
+            <div className="staff-two-week-toggle-row">
+              <span className="staff-two-week-toggle-label" id="staff-two-week-desc">
+                Zwei Wochen wechselnd (ISO-KW)
+              </span>
+              <button
+                type="button"
+                role="switch"
+                className="muster-art-avail-switch staff-two-week-switch"
+                aria-checked={staffDraftAlternating}
+                aria-describedby="staff-two-week-desc"
+                onClick={() => {
+                  if (!staffDraftAlternating) {
+                    setStaffDraftAvailOdd({ ...staffDraftAvail })
+                    setStaffDraftAlternating(true)
+                  } else {
+                    setStaffDraftAlternating(false)
+                  }
+                }}
+              />
+            </div>
+            <p className="staff-modal-hint staff-two-week-hint">
+              {staffDraftAlternating
+                ? 'Erstes Raster: gerade Kalenderwochen (KW 2, 4, 6 …). Zweites Raster: ungerade KW (1, 3, 5 …).'
+                : 'Ein Raster für alle Wochen. Schalter aktivieren für abwechselnde Wochenpläne.'}
+            </p>
             <div className="staff-modal-columns">
-              <div className="staff-modal-col">
-                <h3 className="staff-modal-subtitle">Verfügbarkeit (Woche)</h3>
+              <div className="staff-modal-col staff-modal-col--avail">
+                <h3 className="staff-modal-subtitle">Verfügbarkeit</h3>
                 <p className="staff-modal-hint">
-                  Spalten: Wochentage · Zeilen: Uhrzeiten (08:00–20:00). Klick
-                  markiert oder demarkiert; mit gedrückter Maustaste über weitere
-                  Zellen ziehen, um denselben Zustand zu übernehmen.
+                  Spalten: Wochentage · Zeilen: Uhrzeiten. Klick markiert oder
+                  demarkiert; mit gedrückter Maustaste ziehen, um denselben
+                  Zustand zu übernehmen.
                 </p>
-                <div className="staff-avail-scroll">
-                  <table className="staff-avail-table">
-                    <thead>
-                      <tr>
-                        <th className="staff-avail-corner" scope="col" />
-                        {WEEKDAY_SHORT_DE.map((dayLabel) => (
-                          <th
-                            key={dayLabel}
-                            className="staff-avail-day-header"
-                            scope="col"
-                          >
-                            {dayLabel}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {Array.from({ length: slotCount() }, (_, sl) => (
-                        <tr key={sl}>
-                          <th
-                            className="staff-avail-time-rowhead"
-                            scope="row"
-                          >
-                            {slotIndexToLabel(sl)}
-                          </th>
-                          {WEEKDAY_SHORT_DE.map((dayLabel, w) => {
-                            const k = staffAvailKey(w, sl)
-                            const on = staffDraftAvail[k] === true
-                            return (
-                              <td key={w} className="staff-avail-cell">
-                                <button
-                                  type="button"
-                                  className={`staff-avail-slot ${on ? 'is-on' : ''}`}
-                                  aria-pressed={on}
-                                  aria-label={`${dayLabel} ${slotIndexToLabel(sl)}`}
-                                  onPointerDown={(e) => {
-                                    if (e.button !== 0) return
-                                    e.preventDefault()
-                                    beginStaffAvailPaint(w, sl)
-                                  }}
-                                  onPointerEnter={(e) => {
-                                    if ((e.buttons & 1) === 0) return
-                                    extendStaffAvailPaint(w, sl)
-                                  }}
-                                  onKeyDown={(e) => {
-                                    if (e.key === ' ' || e.key === 'Enter') {
-                                      e.preventDefault()
-                                      toggleStaffDraftSlotKeyboard(w, sl)
-                                    }
-                                  }}
-                                />
-                              </td>
-                            )
-                          })}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                <div
+                  className={
+                    staffDraftAlternating
+                      ? 'staff-avail-week-stack staff-avail-week-stack--side-by-side'
+                      : 'staff-avail-week-stack'
+                  }
+                >
+                  <div className="staff-avail-week-block">
+                    <h4 className="staff-avail-week-title">
+                      {staffDraftAlternating
+                        ? 'Gerade Kalenderwoche (ISO)'
+                        : 'Jede Woche'}
+                    </h4>
+                    <div className="staff-avail-scroll">
+                      <table className="staff-avail-table">
+                        <thead>
+                          <tr>
+                            <th className="staff-avail-corner" scope="col" />
+                            {WEEKDAY_SHORT_DE.map((dayLabel) => (
+                              <th
+                                key={dayLabel}
+                                className="staff-avail-day-header"
+                                scope="col"
+                              >
+                                {dayLabel}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {Array.from({ length: slotCount() }, (_, sl) => (
+                            <tr key={sl}>
+                              <th
+                                className="staff-avail-time-rowhead"
+                                scope="row"
+                              >
+                                {slotIndexToLabel(sl)}
+                              </th>
+                              {WEEKDAY_SHORT_DE.map((dayLabel, w) => {
+                                const k = staffAvailKey(w, sl)
+                                const on = staffDraftAvail[k] === true
+                                return (
+                                  <td key={w} className="staff-avail-cell">
+                                    <button
+                                      type="button"
+                                      className={`staff-avail-slot ${on ? 'is-on' : ''}`}
+                                      aria-pressed={on}
+                                      aria-label={`${staffDraftAlternating ? 'Gerade KW: ' : ''}${dayLabel} ${slotIndexToLabel(sl)}`}
+                                      onPointerDown={(e) => {
+                                        if (e.button !== 0) return
+                                        e.preventDefault()
+                                        beginStaffAvailPaint('even', w, sl)
+                                      }}
+                                      onPointerEnter={(e) => {
+                                        if ((e.buttons & 1) === 0) return
+                                        extendStaffAvailPaint(w, sl)
+                                      }}
+                                      onKeyDown={(e) => {
+                                        if (e.key === ' ' || e.key === 'Enter') {
+                                          e.preventDefault()
+                                          toggleStaffDraftSlotKeyboard(
+                                            'even',
+                                            w,
+                                            sl,
+                                          )
+                                        }
+                                      }}
+                                    />
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                  {staffDraftAlternating ? (
+                    <div className="staff-avail-week-block">
+                      <h4 className="staff-avail-week-title">
+                        Ungerade Kalenderwoche (ISO)
+                      </h4>
+                      <div className="staff-avail-scroll">
+                        <table className="staff-avail-table">
+                          <thead>
+                            <tr>
+                              <th className="staff-avail-corner" scope="col" />
+                              {WEEKDAY_SHORT_DE.map((dayLabel) => (
+                                <th
+                                  key={`odd-${dayLabel}`}
+                                  className="staff-avail-day-header"
+                                  scope="col"
+                                >
+                                  {dayLabel}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {Array.from({ length: slotCount() }, (_, sl) => (
+                              <tr key={`odd-${sl}`}>
+                                <th
+                                  className="staff-avail-time-rowhead"
+                                  scope="row"
+                                >
+                                  {slotIndexToLabel(sl)}
+                                </th>
+                                {WEEKDAY_SHORT_DE.map((dayLabel, w) => {
+                                  const k = staffAvailKey(w, sl)
+                                  const on = staffDraftAvailOdd[k] === true
+                                  return (
+                                    <td key={w} className="staff-avail-cell">
+                                      <button
+                                        type="button"
+                                        className={`staff-avail-slot ${on ? 'is-on' : ''}`}
+                                        aria-pressed={on}
+                                        aria-label={`Ungerade KW: ${dayLabel} ${slotIndexToLabel(sl)}`}
+                                        onPointerDown={(e) => {
+                                          if (e.button !== 0) return
+                                          e.preventDefault()
+                                          beginStaffAvailPaint('odd', w, sl)
+                                        }}
+                                        onPointerEnter={(e) => {
+                                          if ((e.buttons & 1) === 0) return
+                                          extendStaffAvailPaint(w, sl)
+                                        }}
+                                        onKeyDown={(e) => {
+                                          if (
+                                            e.key === ' ' ||
+                                            e.key === 'Enter'
+                                          ) {
+                                            e.preventDefault()
+                                            toggleStaffDraftSlotKeyboard(
+                                              'odd',
+                                              w,
+                                              sl,
+                                            )
+                                          }
+                                        }}
+                                      />
+                                    </td>
+                                  )
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               </div>
               <div className="staff-modal-col">
@@ -9044,18 +9278,6 @@ export default function App() {
       ) : null}
     </div>
   )
-}
-
-function getWeekNumber(d: Date): number {
-  const target = new Date(d.valueOf())
-  const dayNr = (d.getDay() + 6) % 7
-  target.setDate(target.getDate() - dayNr + 3)
-  const firstThursday = target.valueOf()
-  target.setMonth(0, 1)
-  if (target.getDay() !== 4) {
-    target.setMonth(0, 1 + ((4 - target.getDay() + 7) % 7))
-  }
-  return 1 + Math.ceil((firstThursday - target.valueOf()) / 604800000)
 }
 
 function summarizeSlots(indices: number[]): string[] {
