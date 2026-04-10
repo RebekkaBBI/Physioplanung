@@ -52,6 +52,8 @@ type BelegungsartItem = {
   color: string
   /** Anzahl 30-Min-Slots bei Drop */
   slots: number
+  /** Teammeeting: kein Patient; Teilnehmer als teamStaffIds; erscheint in deren Kalendern */
+  teamMeeting?: boolean
 }
 /** Pro Slot im Muster-Editor; Schlüssel `woche|wd|Raum|slot` (woche 0–2, wd 0=Mo … 6=So). Ältere Daten `wd|Raum|slot` = Woche 0. */
 type MusterTemplateCell = {
@@ -68,6 +70,20 @@ type BelegungsmusterItem = {
   templateWeekCount?: 1 | 3
 }
 
+type StaffAbsenceKind = 'urlaub' | 'abwesend'
+
+type StaffAbsencePeriod = {
+  id: string
+  fromDk: string
+  toDk: string
+  kind: StaffAbsenceKind
+  /** true oder fehlend: ganztägig (alle Slots) an jedem Tag im Bereich */
+  allDay?: boolean
+  /** Nur wenn allDay === false: inklusive Slot-Indizes (pro Kalendertag im Bereich gleich) */
+  startSlot?: number
+  endSlot?: number
+}
+
 type MitarbeiterItem = {
   id: string
   name: string
@@ -75,6 +91,8 @@ type MitarbeiterItem = {
   availability: Record<string, boolean>
   /** Freigegebene Belegungsarten (IDs) */
   allowedArtIds: string[]
+  /** Urlaub / Abwesenheit — nicht verfügbar (ganztägig oder stundenweise) */
+  absences?: StaffAbsencePeriod[]
 }
 
 type DragPayload =
@@ -112,8 +130,42 @@ type CellData = {
   musterColor?: string
   staff?: string
   staffId?: string
+  /** Teammeeting: mehrere Teilnehmer-IDs (erscheinen jeweils im MA-Kalender) */
+  teamStaffIds?: string[]
   /** Belegungsmuster auf Patient: keine freie Lage, erzwungene Buchung */
   terminKollision?: boolean
+}
+
+/**
+ * Keine doppelten Dialoge: (1) mehrere Aufrufe im selben Task werden zu einem Microtask
+ * zusammengefasst; (2) gleicher Text innerhalb kurzer Zeit wird unterdrückt (z. B. doppelte
+ * State-Updater). React StrictMode am Root ist dafür deaktiviert — sonst werden Updater in
+ * der Entwicklung zweimal ausgeführt und `alert` im Updater erscheint doppelt.
+ */
+let lastAlertDedupe: { message: string; at: number } = { message: '', at: 0 }
+const ALERT_DEDUPE_MS = 750
+let pendingAlertMessage: string | null = null
+let alertFlushScheduled = false
+
+function alertOnce(message: string) {
+  pendingAlertMessage = message
+  if (alertFlushScheduled) return
+  alertFlushScheduled = true
+  queueMicrotask(() => {
+    alertFlushScheduled = false
+    const m = pendingAlertMessage
+    pendingAlertMessage = null
+    if (m === null) return
+    const now = Date.now()
+    if (
+      m === lastAlertDedupe.message &&
+      now - lastAlertDedupe.at < ALERT_DEDUPE_MS
+    ) {
+      return
+    }
+    lastAlertDedupe = { message: m, at: now }
+    window.alert(m)
+  })
 }
 
 function dateKey(d: Date): string {
@@ -138,6 +190,12 @@ function startOfWeekMonday(d: Date): Date {
 function addDays(d: Date, n: number): Date {
   const x = calendarDate(d)
   x.setDate(x.getDate() + n)
+  return x
+}
+
+function addCalendarMonths(d: Date, delta: number): Date {
+  const x = calendarDate(d)
+  x.setMonth(x.getMonth() + delta)
   return x
 }
 
@@ -185,6 +243,98 @@ function isStaffSlotAvailable(
   return s.availability[staffAvailKey(weekdayMon0, slotIndex)] === true
 }
 
+function isDateInInclusiveRange(dk: string, fromDk: string, toDk: string): boolean {
+  return dk >= fromDk && dk <= toDk
+}
+
+/** Abwesenheit für genau diesen Kalendertag und Slot (gilt für alle Räume) */
+function isStaffAbsentAtSlot(
+  s: MitarbeiterItem,
+  dk: string,
+  slotIndex: number,
+): boolean {
+  const abs = s.absences
+  if (!abs || abs.length === 0) return false
+  const max = slotCount()
+  for (const p of abs) {
+    if (!isDateInInclusiveRange(dk, p.fromDk, p.toDk)) continue
+    const allDay = p.allDay !== false
+    if (allDay) return true
+    const start =
+      typeof p.startSlot === 'number' && Number.isFinite(p.startSlot)
+        ? Math.max(0, Math.min(max - 1, Math.floor(p.startSlot)))
+        : 0
+    const end =
+      typeof p.endSlot === 'number' && Number.isFinite(p.endSlot)
+        ? Math.max(0, Math.min(max - 1, Math.floor(p.endSlot)))
+        : max - 1
+    if (start <= end && slotIndex >= start && slotIndex <= end) return true
+  }
+  return false
+}
+
+/** Wochenplan + ggf. Abwesenheit an konkretem Kalendertag und Slot */
+function isStaffSlotAvailableForDate(
+  s: MitarbeiterItem,
+  dk: string,
+  weekdayMon0: number,
+  slotIndex: number,
+): boolean {
+  if (isStaffAbsentAtSlot(s, dk, slotIndex)) return false
+  return isStaffSlotAvailable(s, weekdayMon0, slotIndex)
+}
+
+function newStaffAbsenceId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `ab-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+}
+
+function normalizeStaffAbsences(raw: unknown): StaffAbsencePeriod[] {
+  if (!Array.isArray(raw)) return []
+  const out: StaffAbsencePeriod[] = []
+  const max = slotCount()
+  for (const x of raw) {
+    if (!x || typeof x !== 'object') continue
+    const o = x as Record<string, unknown>
+    const id = typeof o.id === 'string' ? o.id : ''
+    const fromDk = typeof o.fromDk === 'string' ? o.fromDk : ''
+    const toDk = typeof o.toDk === 'string' ? o.toDk : ''
+    const kind = o.kind === 'urlaub' || o.kind === 'abwesend' ? o.kind : null
+    if (
+      !id ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(fromDk) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(toDk) ||
+      fromDk > toDk ||
+      !kind
+    ) {
+      continue
+    }
+    const allDay = o.allDay === false ? false : true
+    if (allDay) {
+      out.push({ id, fromDk, toDk, kind, allDay: true })
+      continue
+    }
+    const startSlot =
+      typeof o.startSlot === 'number' && Number.isFinite(o.startSlot)
+        ? Math.max(0, Math.min(max - 1, Math.floor(o.startSlot)))
+        : null
+    const endSlot =
+      typeof o.endSlot === 'number' && Number.isFinite(o.endSlot)
+        ? Math.max(0, Math.min(max - 1, Math.floor(o.endSlot)))
+        : null
+    if (startSlot === null || endSlot === null || startSlot > endSlot) continue
+    out.push({
+      id,
+      fromDk,
+      toDk,
+      kind,
+      allDay: false,
+      startSlot,
+      endSlot,
+    })
+  }
+  return out
+}
+
 function findArtIdForCell(
   cur: CellData | undefined,
   artenList: BelegungsartItem[],
@@ -214,6 +364,51 @@ function findStaffForCell(
   return undefined
 }
 
+function isTeamMeetingArt(a: BelegungsartItem | undefined): boolean {
+  return !!a?.teamMeeting
+}
+
+/** Teammeeting vom Panel: nur Pause + freier Bereich (Teilnehmer wählt das Modal). */
+function teamMeetingFromPanelBlockedReason(
+  cells: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  startSlot: number,
+  a: BelegungsartItem,
+): string | null {
+  if (!isTeamMeetingArt(a)) return 'Interner Fehler: keine Teammeeting-Art.'
+  const max = slotCount()
+  const span = Math.min(Math.max(1, a.slots), max - startSlot)
+  if (slotRangeOverlapsMusterPause(startSlot, span)) {
+    return 'Zwischen 12:00 und 13:30 ist Pause — hier kann keine Belegungsart liegen.'
+  }
+  for (let i = 0; i < span; i++) {
+    const cur = cells[makeSlotKey(dk, room, startSlot + i)]
+    if (cur?.patient?.trim()) {
+      return 'Im gewählten Zeitraum ist bereits ein Patient eingetragen.'
+    }
+    if (isCellBooked(cur)) {
+      return 'Der Bereich ist bereits belegt.'
+    }
+  }
+  return null
+}
+
+function someStaffEligibleForTeamMeetingSlot(
+  staffList: MitarbeiterItem[],
+  artId: string,
+  dk: string,
+  wd: number,
+  slotIndex: number,
+): boolean {
+  return staffList.some(
+    (s) =>
+      staffHasArtAllowed(s, artId) &&
+      isStaffSlotAvailableForDate(s, dk, wd, slotIndex) &&
+      !isStaffAbsentAtSlot(s, dk, slotIndex),
+  )
+}
+
 /** MA hat diese Belegungsart im Profil freigeschaltet (explizite Liste). */
 function staffHasArtAllowed(s: MitarbeiterItem, artId: string): boolean {
   return Array.isArray(s.allowedArtIds) && s.allowedArtIds.includes(artId)
@@ -226,6 +421,7 @@ function staffHasArtAllowed(s: MitarbeiterItem, artId: string): boolean {
 function staffWhoCanPerformArtOnWholeSpan(
   staffList: MitarbeiterItem[],
   artId: string,
+  dk: string,
   wd: number,
   startSlot: number,
   span: number,
@@ -233,7 +429,7 @@ function staffWhoCanPerformArtOnWholeSpan(
   return staffList.filter((s) => {
     if (!staffHasArtAllowed(s, artId)) return false
     for (let i = 0; i < span; i++) {
-      if (!isStaffSlotAvailable(s, wd, startSlot + i)) return false
+      if (!isStaffSlotAvailableForDate(s, dk, wd, startSlot + i)) return false
     }
     return true
   })
@@ -243,12 +439,14 @@ function staffWhoCanPerformArtOnWholeSpan(
 function someStaffCanTreatArtAtSingleSlot(
   staffList: MitarbeiterItem[],
   artId: string,
+  dk: string,
   wd: number,
   slotIndex: number,
 ): boolean {
   return staffList.some(
     (s) =>
-      staffHasArtAllowed(s, artId) && isStaffSlotAvailable(s, wd, slotIndex),
+      staffHasArtAllowed(s, artId) &&
+      isStaffSlotAvailableForDate(s, dk, wd, slotIndex),
   )
 }
 
@@ -316,6 +514,9 @@ function artFromPanelBlockedReason(
     const cur = cells[makeSlotKey(dk, room, startSlot + i)]
     const st = findStaffForCell(cur, staffList)
     if (st) {
+      if (isStaffAbsentAtSlot(st, dk, startSlot + i)) {
+        return 'Der Mitarbeiter ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.'
+      }
       if (!isStaffSlotAvailable(st, wd, startSlot + i)) {
         return 'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.'
       }
@@ -328,6 +529,7 @@ function artFromPanelBlockedReason(
   const canTreat = staffWhoCanPerformArtOnWholeSpan(
     staffList,
     a.id,
+    dk,
     wd,
     startSlot,
     span,
@@ -354,6 +556,11 @@ function cellIsValidArtPanelDropPreview(
   a: BelegungsartItem,
   staffList: MitarbeiterItem[],
 ): boolean {
+  if (isTeamMeetingArt(a)) {
+    return (
+      teamMeetingFromPanelBlockedReason(cells, dk, room, startSlot, a) === null
+    )
+  }
   return artFromPanelBlockedReason(cells, dk, room, startSlot, a, staffList) === null
 }
 
@@ -370,8 +577,29 @@ function extensionSlotError(
 ): string | null {
   const key = makeSlotKey(dk, room, slot)
   if (isCellBooked(prev[key])) return 'Zielbereich ist belegt.'
+  const teamIds = template.teamStaffIds
+  if (teamIds?.length) {
+    const artId = findArtIdForCell(template, artenList)
+    for (const tid of teamIds) {
+      const st = staffList.find((s) => s.id === tid)
+      if (!st) continue
+      if (isStaffAbsentAtSlot(st, dk, slot)) {
+        return 'Ein Teamteilnehmer ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.'
+      }
+      if (!isStaffSlotAvailable(st, wd, slot)) {
+        return 'Ein Teamteilnehmer ist zu dieser Zeit in seinem Wochenplan nicht verfügbar.'
+      }
+      if (artId && !st.allowedArtIds.includes(artId)) {
+        return 'Die Belegungsart ist für einen Teamteilnehmer in seinem Profil nicht freigegeben.'
+      }
+    }
+    return null
+  }
   const st = findStaffForCell(template, staffList)
   if (st) {
+    if (isStaffAbsentAtSlot(st, dk, slot)) {
+      return 'Der Mitarbeiter ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.'
+    }
     if (!isStaffSlotAvailable(st, wd, slot)) {
       return 'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.'
     }
@@ -386,7 +614,7 @@ function extensionSlotError(
 /** Zusammenhängende Slots mit identischem Termin (Patient, Art, Mitarbeiter, Muster). */
 function blockSignature(c: CellData | undefined): string {
   if (!c || !isCellBooked(c)) return '__empty__'
-  return [
+  const parts = [
     c.patient ?? '',
     c.patientCode ?? '',
     c.artId ?? '',
@@ -395,7 +623,11 @@ function blockSignature(c: CellData | undefined): string {
     c.staff ?? '',
     c.muster ?? '',
     c.terminKollision ? '1' : '0',
-  ].join('\x1f')
+  ]
+  if (c.teamStaffIds?.length) {
+    parts.push([...c.teamStaffIds].sort().join(','))
+  }
+  return parts.join('\x1f')
 }
 
 function findBlockBounds(
@@ -485,17 +717,35 @@ function migrateMitarbeiter(
   const allowedArtIds = Array.isArray(raw.allowedArtIds)
     ? [...raw.allowedArtIds]
     : [...allArtIds]
+  if (!allowedArtIds.includes(TEAM_MEETING_ART_ID)) {
+    allowedArtIds.push(TEAM_MEETING_ART_ID)
+  }
   return {
     id: raw.id,
     name: raw.name,
     availability,
     allowedArtIds,
+    absences: normalizeStaffAbsences(raw.absences),
   }
+}
+
+function ensureTeamMeetingArtInCatalog(
+  list: BelegungsartItem[],
+): BelegungsartItem[] {
+  if (list.some((a) => a.id === TEAM_MEETING_ART_ID)) return list
+  const tm = DEFAULT_ARTEN.find((a) => a.id === TEAM_MEETING_ART_ID)
+  return tm ? [...list, tm] : list
 }
 
 function isCellBooked(data: CellData | undefined): boolean {
   if (!data) return false
-  return !!(data.patient || data.art || data.muster || data.staff)
+  return !!(
+    data.patient ||
+    data.art ||
+    data.muster ||
+    data.staff ||
+    (data.teamStaffIds && data.teamStaffIds.length > 0)
+  )
 }
 
 const STORAGE_KEY_V1 = 'physio-planung-bookings-v1'
@@ -504,9 +754,10 @@ const STORAGE_PANELS = 'physio-planung-panels-v1'
 /** Ansicht & Kalenderdatum (Auto-Save bei jeder Änderung) */
 const STORAGE_UI = 'physio-planung-ui-v1'
 /** Erhöhen, wenn sich die feste Belegungsarten-Liste ändert (Migration aus localStorage). */
-const ARTEN_CATALOG_VERSION = 3
+const ARTEN_CATALOG_VERSION = 4
 
 const OP_BELEGUNGSART_ID = 'art-op'
+const TEAM_MEETING_ART_ID = 'art-team-meeting'
 
 /** Mittagspause im Muster-Editor — keine echte Belegungsart, wird nicht in den Hauptkalender übernommen. */
 const MUSTER_PAUSE_ART_ID = '__muster_pause__'
@@ -592,6 +843,13 @@ const DEFAULT_ARTEN: BelegungsartItem[] = [
   { id: 'art-stretching-1', label: 'Stretching 1', color: '#ea580c', slots: 2 },
   { id: 'art-stretching-2', label: 'Stretching 2', color: '#059669', slots: 2 },
   { id: 'art-stretching-3', label: 'Stretching 3', color: '#c026d3', slots: 2 },
+  {
+    id: TEAM_MEETING_ART_ID,
+    label: 'Teammeeting',
+    color: '#475569',
+    slots: 2,
+    teamMeeting: true,
+  },
 ]
 
 /**
@@ -740,7 +998,9 @@ function loadPanels(): {
       (o.artenCatalogVersion ?? 0) >= ARTEN_CATALOG_VERSION &&
       Array.isArray(o.arten) &&
       o.arten.length > 0
-    const resolvedArten = catalogOk ? o.arten! : DEFAULT_ARTEN
+    const resolvedArten = ensureTeamMeetingArtInCatalog(
+      catalogOk ? o.arten! : DEFAULT_ARTEN,
+    )
     const artIdsForMigrate = resolvedArten.map((a) => a.id)
     return {
       patients: Array.isArray(o.patients)
@@ -1098,7 +1358,7 @@ async function downloadPatientAppointmentsPdf(
     if (!res.ok) throw new Error(String(res.status))
     templateBytes = await res.arrayBuffer()
   } catch {
-    window.alert(
+    alertOnce(
       'Die PDF-Vorlage konnte nicht geladen werden (BBI.pdf im Ordner public).',
     )
     return
@@ -1353,7 +1613,7 @@ async function downloadStaffAppointmentsPdf(
     if (!res.ok) throw new Error(String(res.status))
     templateBytes = await res.arrayBuffer()
   } catch {
-    window.alert(
+    alertOnce(
       'Die PDF-Vorlage konnte nicht geladen werden (BBI.pdf im Ordner public).',
     )
     return
@@ -1508,7 +1768,7 @@ async function downloadRoomWeekLandscapePdf(
 ) {
   const weeks = listWeekMondaysBetween(fromDk, toDk)
   if (weeks.length === 0) {
-    window.alert('Kein gültiger Zeitraum.')
+    alertOnce('Kein gültiger Zeitraum.')
     return
   }
 
@@ -1652,7 +1912,11 @@ async function downloadRoomWeekLandscapePdf(
         const parts = cellTerminLabelParts(anchor)
         const l1 = parts.patient ?? '—'
         const l2 = parts.art ?? '—'
-        const l3 = parts.staffName ?? 'Mitarbeiter zuteilen'
+        const l3 =
+          parts.staffName ??
+          (anchor.artId === TEAM_MEETING_ART_ID
+            ? 'Teilnehmer wählen'
+            : 'Mitarbeiter zuteilen')
         const maxW = dayColW - 6
         const innerH = h - 4
         const topInsetFor = (f: number) => 6 + f * 0.45
@@ -1741,13 +2005,25 @@ function cellDataToPatientExportPair(
   dk: string,
   room: Room,
   anchorSlot: number,
+  staffList?: MitarbeiterItem[],
 ): { patient: PatientItem; row: PatientAppointmentExportRow } | null {
   const { start, end } = findBlockBounds(cells, dk, room, anchorSlot)
   const anchor = cells[makeSlotKey(dk, room, start)]
   if (!anchor || !isCellBooked(anchor)) return null
+  let teamStaffLabel: string | undefined
+  if (anchor.teamStaffIds?.length && staffList?.length) {
+    const names = anchor.teamStaffIds
+      .map((id) => staffList.find((s) => s.id === id)?.name)
+      .filter(Boolean) as string[]
+    if (names.length) teamStaffLabel = names.join(', ')
+  }
   const patient: PatientItem = {
     id: 'ics-export',
-    name: anchor.patient?.trim() || 'Termin',
+    name:
+      anchor.patient?.trim() ||
+      (anchor.artId === TEAM_MEETING_ART_ID || teamStaffLabel
+        ? 'Teammeeting'
+        : 'Termin'),
     patientCode: anchor.patientCode?.trim() ?? '',
   }
   const row: PatientAppointmentExportRow = {
@@ -1755,7 +2031,7 @@ function cellDataToPatientExportPair(
     room,
     startSlot: start,
     endSlot: end,
-    staffLabel: anchor.staff?.trim() || '—',
+    staffLabel: (teamStaffLabel ?? anchor.staff?.trim()) || '—',
     artLabel: anchor.art?.trim() || undefined,
   }
   return { patient, row }
@@ -2287,6 +2563,7 @@ function pickCollisionPlacement(
 function staffAllowsMusterPlacement(
   templateCells: CellData[],
   start: number,
+  tDk: string,
   wd: number,
   artenList: BelegungsartItem[],
   staffList: MitarbeiterItem[],
@@ -2296,7 +2573,7 @@ function staffAllowsMusterPlacement(
     const st = findStaffForCell(tpl, staffList)
     if (!st) continue
     const slotIdx = start + i
-    if (!isStaffSlotAvailable(st, wd, slotIdx)) return false
+    if (!isStaffSlotAvailableForDate(st, tDk, wd, slotIdx)) return false
     const artId = findArtIdForCell(tpl, artenList)
     if (artId && !st.allowedArtIds.includes(artId)) return false
   }
@@ -2458,6 +2735,7 @@ function applyMusterWithPatientWeek(
       !staffAllowsMusterPlacement(
         op.cells,
         chosenStart,
+        tDk,
         wd,
         artenList,
         staffList,
@@ -2505,7 +2783,7 @@ function applyArtDropNoPatient(
   const max = slotCount()
   const span = Math.min(Math.max(1, a.slots), max - startSlot)
   if (slotRangeOverlapsMusterPause(startSlot, span)) {
-    window.alert(
+    alertOnce(
       'Zwischen 12:00 und 13:30 ist Pause — hier kann keine Belegungsart liegen.',
     )
     return null
@@ -2516,7 +2794,7 @@ function applyArtDropNoPatient(
     const k = makeSlotKey(dk, room, startSlot + i)
     const c = next[k]
     if (c?.patient?.trim() || c?.staff?.trim()) {
-      window.alert(
+      alertOnce(
         'Im Muster sind nur Belegungsarten ohne Patient/Mitarbeiter vorgesehen.',
       )
       return null
@@ -2542,7 +2820,7 @@ function applyArtDropNoPatient(
   for (let i = 0; i < span; i++) {
     const k = makeSlotKey(dk, room, startSlot + i)
     if (isCellBooked(next[k])) {
-      window.alert(
+      alertOnce(
         'Der Bereich kollidiert nach dem Freiräumen noch mit einem Termin.',
       )
       return null
@@ -2574,13 +2852,13 @@ function cellMapApplyMove(
   if (!isCellBooked(prev[startK])) return prev
 
   if (musterBlockIsPauseOnly([prev[startK]!])) {
-    window.alert('Die Pause lässt sich nicht verschieben.')
+    alertOnce('Die Pause lässt sich nicht verschieben.')
     return null
   }
 
   const len = end - start + 1
   if (toStartSlot < 0 || toStartSlot + len > max) {
-    window.alert('Termin passt an diese Position nicht (Tagesende).')
+    alertOnce('Termin passt an diese Position nicht (Tagesende).')
     return null
   }
 
@@ -2588,7 +2866,7 @@ function cellMapApplyMove(
     options?.blockLunchPauseAsMoveTarget &&
     slotRangeOverlapsMusterPause(toStartSlot, len)
   ) {
-    window.alert(
+    alertOnce(
       'In der Pausenzeit (12:00–13:30) kann keine Belegungsart liegen.',
     )
     return null
@@ -2607,24 +2885,57 @@ function cellMapApplyMove(
     if (sourceSet.has(tk)) continue
     const occ = prev[tk]
     if (isCellBooked(occ)) {
-      window.alert('Zielbereich ist belegt.')
+      alertOnce('Zielbereich ist belegt.')
       return null
     }
     const cell = snapshot[i]
-    const st = findStaffForCell(cell, mitarbeiter)
-    if (st) {
-      if (!isStaffSlotAvailable(st, wdTo, toStartSlot + i)) {
-        window.alert(
-          'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.',
-        )
-        return null
-      }
+    const teamIds = cell.teamStaffIds
+    if (teamIds?.length) {
       const artId = findArtIdForCell(cell, arten)
-      if (artId && !st.allowedArtIds.includes(artId)) {
-        window.alert(
-          'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
-        )
-        return null
+      for (const tid of teamIds) {
+        const st = mitarbeiter.find((x) => x.id === tid)
+        if (!st) continue
+        if (isStaffAbsentAtSlot(st, toDk, toStartSlot + i)) {
+          alertOnce(
+            'Ein Teamteilnehmer ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.',
+          )
+          return null
+        }
+        if (!isStaffSlotAvailable(st, wdTo, toStartSlot + i)) {
+          alertOnce(
+            'Ein Teamteilnehmer ist zu dieser Zeit in seinem Wochenplan nicht verfügbar.',
+          )
+          return null
+        }
+        if (artId && !st.allowedArtIds.includes(artId)) {
+          alertOnce(
+            'Die Belegungsart ist für einen Teamteilnehmer in seinem Profil nicht freigegeben.',
+          )
+          return null
+        }
+      }
+    } else {
+      const st = findStaffForCell(cell, mitarbeiter)
+      if (st) {
+        if (isStaffAbsentAtSlot(st, toDk, toStartSlot + i)) {
+          alertOnce(
+            'Der Mitarbeiter ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.',
+          )
+          return null
+        }
+        if (!isStaffSlotAvailable(st, wdTo, toStartSlot + i)) {
+          alertOnce(
+            'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.',
+          )
+          return null
+        }
+        const artId = findArtIdForCell(cell, arten)
+        if (artId && !st.allowedArtIds.includes(artId)) {
+          alertOnce(
+            'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
+          )
+          return null
+        }
       }
     }
   }
@@ -2669,12 +2980,12 @@ function cellMapApplyResize(
   if (!isCellBooked(prev[startK])) return prev
 
   if (isMusterPauseCell(prev[startK])) {
-    window.alert('Die Pause lässt sich nicht in der Dauer ändern.')
+    alertOnce('Die Pause lässt sich nicht in der Dauer ändern.')
     return null
   }
 
   if (dropDk !== payload.fromDk || dropRoom !== payload.fromRoom) {
-    window.alert(
+    alertOnce(
       'Die Dauer kann nur am selben Tag und im selben Raum geändert werden.',
     )
     return null
@@ -2685,7 +2996,7 @@ function cellMapApplyResize(
 
   if (payload.edge === 'bottom') {
     if (targetSlot < start) {
-      window.alert('Ungültige Position.')
+      alertOnce('Ungültige Position.')
       return null
     }
     if (targetSlot > end) {
@@ -2701,7 +3012,7 @@ function cellMapApplyResize(
           mitarbeiter,
         )
         if (err) {
-          window.alert(err)
+          alertOnce(err)
           return null
         }
       }
@@ -2725,7 +3036,7 @@ function cellMapApplyResize(
 
   if (payload.edge === 'top') {
     if (targetSlot > end) {
-      window.alert('Ungültige Position.')
+      alertOnce('Ungültige Position.')
       return null
     }
     if (targetSlot < start) {
@@ -2741,7 +3052,7 @@ function cellMapApplyResize(
           mitarbeiter,
         )
         if (err) {
-          window.alert(err)
+          alertOnce(err)
           return null
         }
       }
@@ -2909,7 +3220,10 @@ function parseDragPayload(dt: DataTransfer): DragPayload | null {
   }
 }
 
-function cellTerminLabelParts(data: CellData | undefined): {
+function cellTerminLabelParts(
+  data: CellData | undefined,
+  staffList?: MitarbeiterItem[],
+): {
   patient: string | null
   art: string | null
   staffName: string | null
@@ -2926,17 +3240,30 @@ function cellTerminLabelParts(data: CellData | undefined): {
   } else if (data.terminKollision) {
     art = 'Terminkollision'
   }
-  const staffName = data.staff?.trim() ? data.staff : null
+  let staffName: string | null = data.staff?.trim() ? data.staff : null
+  if (data.teamStaffIds?.length && staffList?.length) {
+    const names = data.teamStaffIds
+      .map((id) => staffList.find((s) => s.id === id)?.name)
+      .filter(Boolean) as string[]
+    if (names.length) staffName = names.join(', ')
+  }
+  if (!staffName && data.teamStaffIds?.length) {
+    staffName = `${data.teamStaffIds.length} Teilnehmer`
+  }
   return { patient, art, staffName }
 }
 
-function cellDisplayLine(data: CellData | undefined): string {
-  const { patient, art, staffName } = cellTerminLabelParts(data)
-  return [
-    patient ?? '—',
-    art ?? '—',
-    staffName ?? 'Mitarbeiter zuteilen',
-  ].join(' · ')
+function cellDisplayLine(
+  data: CellData | undefined,
+  staffList?: MitarbeiterItem[],
+): string {
+  const { patient, art, staffName } = cellTerminLabelParts(data, staffList)
+  const teamMeeting =
+    data?.artId === TEAM_MEETING_ART_ID || (data?.teamStaffIds?.length ?? 0) > 0
+  const third = teamMeeting
+    ? staffName ?? 'Teilnehmer wählen'
+    : staffName ?? 'Mitarbeiter zuteilen'
+  return [patient ?? '—', art ?? '—', third].join(' · ')
 }
 
 type KollisionPanelItem = {
@@ -3012,10 +3339,57 @@ function cellMatchesStaffRecord(
   staff: MitarbeiterItem,
 ): boolean {
   if (!data) return false
+  if (data.teamStaffIds?.length) {
+    return data.teamStaffIds.includes(staff.id)
+  }
   const sid = (data.staffId ?? '').trim()
   if (sid !== '') return sid === staff.id
   const sn = (data.staff ?? '').trim()
   return sn !== '' && sn === staff.name.trim()
+}
+
+/** Termine des MA an Tag+Slot über alle Räume (Hauptkalender-Daten) */
+function staffBookingsAtSlot(
+  cells: Record<string, CellData>,
+  dk: string,
+  slotIndex: number,
+  staff: MitarbeiterItem,
+): { room: Room; data: CellData }[] {
+  const out: { room: Room; data: CellData }[] = []
+  for (const room of ROOMS) {
+    const k = makeSlotKey(dk, room, slotIndex)
+    const d = cells[k]
+    if (!isCellBooked(d)) continue
+    if (!cellMatchesStaffRecord(d!, staff)) continue
+    out.push({ room, data: d! })
+  }
+  return out
+}
+
+function formatAbsencePeriodSummary(p: StaffAbsencePeriod): string {
+  const datePart =
+    p.fromDk === p.toDk ? p.fromDk : `${p.fromDk} → ${p.toDk}`
+  if (p.allDay !== false) return `${datePart} · ganztägig`
+  const a = p.startSlot ?? 0
+  const b = p.endSlot ?? slotCount() - 1
+  return `${datePart} · ${slotIndexToLabel(a)}–${slotIndexToLabel(b)}`
+}
+
+/** Gefilterte Kopie: nur Slots mit zugewiesenem MA (gleiche Datenbasis wie Hauptkalender). */
+function projectCellsForCalendarTab(
+  cells: Record<string, CellData>,
+  tab: 'main' | string,
+  staffList: MitarbeiterItem[],
+): Record<string, CellData> {
+  if (tab === 'main') return cells
+  const staff = staffList.find((s) => s.id === tab)
+  if (!staff) return cells
+  const next: Record<string, CellData> = {}
+  for (const [k, d] of Object.entries(cells)) {
+    if (!d || !isCellBooked(d)) continue
+    if (cellMatchesStaffRecord(d, staff)) next[k] = d
+  }
+  return next
 }
 
 function collectStaffAppointmentsInRange(
@@ -3043,7 +3417,9 @@ function collectStaffAppointmentsInRange(
       startSlot: start,
       endSlot: end,
       artLabel: anchor?.art?.trim() || undefined,
-      patientLabel: anchor?.patient?.trim() || '—',
+      patientLabel:
+        anchor?.patient?.trim() ||
+        (anchor?.artId === TEAM_MEETING_ART_ID ? 'Teammeeting' : '—'),
     })
   }
   out.sort((a, b) => {
@@ -3052,6 +3428,49 @@ function collectStaffAppointmentsInRange(
     return a.startSlot - b.startSlot
   })
   return out
+}
+
+/** Summe (Tag × Raum × Slot), an denen der MA im Wochenplan als verfügbar markiert ist. */
+function countStaffAvailableSlotsInRange(
+  s: MitarbeiterItem,
+  fromDk: string,
+  toDk: string,
+): number {
+  const slotsN = slotCount()
+  let n = 0
+  let d = parseDateKey(fromDk)
+  while (true) {
+    const dk = dateKey(d)
+    if (dk > toDk) break
+    const wd = weekdayMon0FromDate(d)
+    for (const _room of ROOMS) {
+      for (let sl = 0; sl < slotsN; sl++) {
+        if (isStaffSlotAvailableForDate(s, dk, wd, sl)) n++
+      }
+    }
+    if (dk === toDk) break
+    d = addDays(d, 1)
+  }
+  return n
+}
+
+/** Belegte Kalenderzellen (30-Min-Slots) mit diesem MA im Zeitraum [fromDk, toDk]. */
+function countStaffBookedSlotsInRange(
+  cells: Record<string, CellData>,
+  staff: MitarbeiterItem,
+  fromDk: string,
+  toDk: string,
+): number {
+  let n = 0
+  for (const [key, data] of Object.entries(cells)) {
+    if (!isCellBooked(data)) continue
+    if (!cellMatchesStaffRecord(data, staff)) continue
+    const pos = parseSlotCellKey(key)
+    if (!pos) continue
+    if (pos.dk < fromDk || pos.dk > toDk) continue
+    n++
+  }
+  return n
 }
 
 function formatKollisionDatumZeile(dk: string, room: Room, startSlot: number) {
@@ -3092,7 +3511,7 @@ function listKollisionPanelItems(
     seen.add(anchorKey)
     const anchor = cells[anchorKey]
     const when = formatKollisionDatumZeile(p.dk, p.room, start)
-    const summary = `Terminkollision · ${when} — ${cellDisplayLine(anchor)}`
+    const summary = `Terminkollision · ${when} — ${cellDisplayLine(anchor, staffList)}`
     out.push({ anchorKey, kind: 'termin-kollision', summary })
   }
 
@@ -3115,7 +3534,7 @@ function listKollisionPanelItems(
       : 'Mitarbeiter zuteilen'
     seen.add(anchorKey)
     const when = formatKollisionDatumZeile(p.dk, p.room, start)
-    const summary = `${tag} · ${when} — ${cellDisplayLine(anchor)}`
+    const summary = `${tag} · ${when} — ${cellDisplayLine(anchor, staffList)}`
     out.push({ anchorKey, kind, summary })
   }
 
@@ -3129,9 +3548,10 @@ function listKollisionPanelItems(
     const anchor = cells[anchorKey]
     if (anchor?.patient?.trim()) continue
     if (anchor?.terminKollision) continue
+    if (findArtIdForCell(anchor, artenList) === TEAM_MEETING_ART_ID) continue
     seen.add(anchorKey)
     const when = formatKollisionDatumZeile(p.dk, p.room, start)
-    const summary = `Ohne Patient · ${when} — ${cellDisplayLine(anchor)}`
+    const summary = `Ohne Patient · ${when} — ${cellDisplayLine(anchor, staffList)}`
     out.push({ anchorKey, kind: 'termin-ohne-patient', summary })
   }
 
@@ -3555,6 +3975,8 @@ export default function App() {
   const [slotCells, setSlotCellsBase] = useState<Record<string, CellData>>(
     loadSlotCells,
   )
+  const slotCellsRef = useRef(slotCells)
+  slotCellsRef.current = slotCells
   const slotUndoStackRef = useRef<Record<string, CellData>[]>([])
   const [canUndoSlots, setCanUndoSlots] = useState(false)
 
@@ -3625,6 +4047,21 @@ export default function App() {
   const [mitarbeiter, setMitarbeiter] = useState<MitarbeiterItem[]>(
     () => initialPanels?.mitarbeiter ?? DEFAULT_MITARBEITER,
   )
+  // Katalog-Migration auch nach Hot-Reload / bestehendem State erzwingen
+  useEffect(() => {
+    const has = arten.some((a) => a.id === TEAM_MEETING_ART_ID)
+    if (!has) {
+      const tm = DEFAULT_ARTEN.find((a) => a.id === TEAM_MEETING_ART_ID)
+      if (tm) setArten((prev) => (prev.some((a) => a.id === tm.id) ? prev : [...prev, tm]))
+    }
+    setMitarbeiter((prev) =>
+      prev.map((s) =>
+        s.allowedArtIds.includes(TEAM_MEETING_ART_ID)
+          ? s
+          : { ...s, allowedArtIds: [...s.allowedArtIds, TEAM_MEETING_ART_ID] },
+      ),
+    )
+  }, [arten])
   const [staffModal, setStaffModal] = useState<
     null | { mode: 'create' } | { mode: 'edit'; id: string }
   >(null)
@@ -3637,7 +4074,12 @@ export default function App() {
     | null
     | { kind: 'art'; dk: string; room: Room; anchorSlot: number }
     | { kind: 'staff'; dk: string; room: Room; anchorSlot: number }
+    | { kind: 'teamMeeting'; dk: string; room: Room; anchorSlot: number }
   >(null)
+  const [teamMeetingSelectedIds, setTeamMeetingSelectedIds] = useState<
+    string[]
+  >([])
+  const [teamMeetingRepeatWeeks, setTeamMeetingRepeatWeeks] = useState(1)
   const [dragOverKey, setDragOverKey] = useState<string | null>(null)
   /** Belegungsart vom Panel ziehen: Vorschau-Färbung gültiger Zielzellen */
   const [artDragHighlight, setArtDragHighlight] = useState<{
@@ -3675,6 +4117,8 @@ export default function App() {
   const pendingScrollToNow = useRef(false)
   const dragSourceRef = useRef<'panel' | 'cell' | 'resize' | null>(null)
   const suppressSlotClickAfterDrag = useRef(0)
+  /** Hauptkalender-Tab oder Mitarbeiter-ID — MA-Ansicht ist schreibgeschützte gefilterte Kopie */
+  const [calendarTabId, setCalendarTabId] = useState<'main' | string>('main')
   /** Mitarbeiter-Verfügbarkeit: Klick+Ziehen zum Markieren/Demarkieren */
   const staffAvailPaintRef = useRef<{
     active: boolean
@@ -3784,11 +4228,180 @@ export default function App() {
 
   const activeDayKey = dateKey(anchorDate)
 
-  const goToday = useCallback(() => {
-    setAnchorDate(calendarDate(new Date()))
-    setViewMode('day')
-    pendingScrollToNow.current = true
+  useEffect(() => {
+    if (calendarTabId === 'main') return
+    if (!mitarbeiter.some((s) => s.id === calendarTabId)) {
+      setCalendarTabId('main')
+    }
+  }, [mitarbeiter, calendarTabId])
+
+  const cellsForActiveCalendarView = useMemo(
+    () => projectCellsForCalendarTab(slotCells, calendarTabId, mitarbeiter),
+    [slotCells, calendarTabId, mitarbeiter],
+  )
+
+  const isStaffCalendarReadOnly = calendarTabId !== 'main'
+
+  const [staffAbsenceModalId, setStaffAbsenceModalId] = useState<string | null>(
+    null,
+  )
+  const [staffAbsenceFormFrom, setStaffAbsenceFormFrom] = useState('')
+  const [staffAbsenceFormTo, setStaffAbsenceFormTo] = useState('')
+  const [staffAbsenceFormKind, setStaffAbsenceFormKind] =
+    useState<StaffAbsenceKind>('urlaub')
+  const [staffAbsenceFormAllDay, setStaffAbsenceFormAllDay] = useState(true)
+  const [staffAbsenceFormStartSlot, setStaffAbsenceFormStartSlot] = useState(0)
+  const [staffAbsenceFormEndSlot, setStaffAbsenceFormEndSlot] = useState(() =>
+    Math.max(0, slotCount() - 1),
+  )
+
+  const calendarTabStaffMember = useMemo(() => {
+    if (calendarTabId === 'main') return null
+    return mitarbeiter.find((s) => s.id === calendarTabId) ?? null
+  }, [calendarTabId, mitarbeiter])
+
+  const openStaffAbsenceModal = useCallback(
+    (prefs?: {
+      fromDk?: string
+      toDk?: string
+      allDay?: boolean
+      startSlot?: number
+      endSlot?: number
+    }) => {
+      if (calendarTabId === 'main') return
+      const from = prefs?.fromDk ?? activeDayKey
+      setStaffAbsenceFormFrom(from)
+      setStaffAbsenceFormTo(prefs?.toDk ?? from)
+      setStaffAbsenceFormKind('urlaub')
+      const maxSl = Math.max(0, slotCount() - 1)
+      const allDay = prefs?.allDay !== false
+      setStaffAbsenceFormAllDay(allDay)
+      if (!allDay) {
+        const a =
+          typeof prefs?.startSlot === 'number'
+            ? Math.max(0, Math.min(maxSl, prefs.startSlot))
+            : 0
+        const b =
+          typeof prefs?.endSlot === 'number'
+            ? Math.max(0, Math.min(maxSl, prefs.endSlot))
+            : maxSl
+        setStaffAbsenceFormStartSlot(a)
+        setStaffAbsenceFormEndSlot(Math.max(a, b))
+      } else {
+        setStaffAbsenceFormStartSlot(0)
+        setStaffAbsenceFormEndSlot(maxSl)
+      }
+      setStaffAbsenceModalId(calendarTabId)
+    },
+    [calendarTabId, activeDayKey],
+  )
+
+  const closeStaffAbsenceModal = useCallback(() => {
+    setStaffAbsenceModalId(null)
   }, [])
+
+  const saveStaffAbsence = useCallback(() => {
+    if (!staffAbsenceModalId) return
+    const from = staffAbsenceFormFrom.trim()
+    const to = staffAbsenceFormTo.trim()
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      alertOnce('Bitte gültige Daten wählen.')
+      return
+    }
+    if (from > to) {
+      alertOnce('Das Enddatum muss am oder nach dem Startdatum liegen.')
+      return
+    }
+    const id = newStaffAbsenceId()
+    const maxSl = Math.max(0, slotCount() - 1)
+    let period: StaffAbsencePeriod
+    if (staffAbsenceFormAllDay) {
+      period = {
+        id,
+        fromDk: from,
+        toDk: to,
+        kind: staffAbsenceFormKind,
+        allDay: true,
+      }
+    } else {
+      let a = Math.max(0, Math.min(maxSl, staffAbsenceFormStartSlot))
+      let b = Math.max(0, Math.min(maxSl, staffAbsenceFormEndSlot))
+      if (a > b) [a, b] = [b, a]
+      period = {
+        id,
+        fromDk: from,
+        toDk: to,
+        kind: staffAbsenceFormKind,
+        allDay: false,
+        startSlot: a,
+        endSlot: b,
+      }
+    }
+    setMitarbeiter((prev) =>
+      prev.map((s) => {
+        if (s.id !== staffAbsenceModalId) return s
+        const nextAbs = [...(s.absences ?? []), period]
+        return { ...s, absences: nextAbs }
+      }),
+    )
+    setStaffAbsenceFormFrom(activeDayKey)
+    setStaffAbsenceFormTo(activeDayKey)
+    setStaffAbsenceFormAllDay(true)
+    setStaffAbsenceFormStartSlot(0)
+    setStaffAbsenceFormEndSlot(maxSl)
+  }, [
+    staffAbsenceModalId,
+    staffAbsenceFormFrom,
+    staffAbsenceFormTo,
+    staffAbsenceFormKind,
+    staffAbsenceFormAllDay,
+    staffAbsenceFormStartSlot,
+    staffAbsenceFormEndSlot,
+    activeDayKey,
+  ])
+
+  const removeStaffAbsence = useCallback(
+    (absenceId: string) => {
+      if (!staffAbsenceModalId) return
+      setMitarbeiter((prev) =>
+        prev.map((s) => {
+          if (s.id !== staffAbsenceModalId) return s
+          return {
+            ...s,
+            absences: (s.absences ?? []).filter((a) => a.id !== absenceId),
+          }
+        }),
+      )
+    },
+    [staffAbsenceModalId],
+  )
+
+  const staffAbsenceModalStaffView = useMemo(() => {
+    if (!staffAbsenceModalId) return null
+    return mitarbeiter.find((s) => s.id === staffAbsenceModalId) ?? null
+  }, [staffAbsenceModalId, mitarbeiter])
+
+  useEffect(() => {
+    if (!staffAbsenceModalId) return
+    if (!mitarbeiter.some((s) => s.id === staffAbsenceModalId)) {
+      setStaffAbsenceModalId(null)
+    }
+  }, [mitarbeiter, staffAbsenceModalId])
+
+  useEffect(() => {
+    if (calendarTabId !== 'main') setViewMode('week')
+  }, [calendarTabId])
+
+  const goToday = useCallback(() => {
+    const today = calendarDate(new Date())
+    setAnchorDate(today)
+    if (calendarTabId === 'main') {
+      setViewMode('day')
+      pendingScrollToNow.current = true
+    } else {
+      setViewMode('week')
+    }
+  }, [calendarTabId])
 
   const applyMoveBlock = useCallback(
     (
@@ -3856,6 +4469,31 @@ export default function App() {
       const staffById = (id: string) => mitarbeiter.find((s) => s.id === id)
       const wd = weekdayMon0FromDate(parseDateKey(dk))
 
+      if (payload.kind === 'art') {
+        const a = artById(payload.id)
+        if (!a) return
+        const blocked = isTeamMeetingArt(a)
+          ? teamMeetingFromPanelBlockedReason(
+              slotCellsRef.current,
+              dk,
+              room,
+              startSlot,
+              a,
+            )
+          : artFromPanelBlockedReason(
+              slotCellsRef.current,
+              dk,
+              room,
+              startSlot,
+              a,
+              mitarbeiter,
+            )
+        if (blocked) {
+          alertOnce(blocked)
+          return
+        }
+      }
+
       setSlotCells((prev) => {
         const max = slotCount()
 
@@ -3866,6 +4504,12 @@ export default function App() {
           const { start, end } = findBlockBounds(prev, dk, room, startSlot)
           const anchorK = makeSlotKey(dk, room, start)
           const anchorCell = prev[anchorK]
+          if (findArtIdForCell(anchorCell, arten) === TEAM_MEETING_ART_ID) {
+            alertOnce(
+              'Patienten können nicht auf ein Teammeeting gezogen werden.',
+            )
+            return prev
+          }
 
           if (!isCellBooked(prev[k])) {
             const cur = { ...(prev[k] ?? {}) }
@@ -3880,7 +4524,7 @@ export default function App() {
               const kk = makeSlotKey(dk, room, sl)
               const c = prev[kk]
               if (c?.patient?.trim() && c.patient !== p.name) {
-                window.alert(
+                alertOnce(
                   'Im gewählten Zeitraum ist bereits ein anderer Patient eingetragen.',
                 )
                 return prev
@@ -3899,7 +4543,7 @@ export default function App() {
             return next
           }
 
-          window.alert(
+          alertOnce(
             'Bitte ein freies Feld oder einen Termin ohne Patient wählen.',
           )
           return prev
@@ -3910,23 +4554,32 @@ export default function App() {
           if (!a) return prev
           const startK = makeSlotKey(dk, room, startSlot)
           const startCur = prev[startK]
-          const pname = startCur?.patient?.trim()
-            ? startCur.patient
-            : undefined
-          const pcode = startCur?.patient?.trim()
-            ? startCur.patientCode
-            : undefined
+          const pname =
+            !isTeamMeetingArt(a) && startCur?.patient?.trim()
+              ? startCur.patient
+              : undefined
+          const pcode =
+            !isTeamMeetingArt(a) && startCur?.patient?.trim()
+              ? startCur.patientCode
+              : undefined
 
-          const blocked = artFromPanelBlockedReason(
-            prev,
-            dk,
-            room,
-            startSlot,
-            a,
-            mitarbeiter,
-          )
-          if (blocked) {
-            window.alert(blocked)
+          const blockedAgain = isTeamMeetingArt(a)
+            ? teamMeetingFromPanelBlockedReason(
+                prev,
+                dk,
+                room,
+                startSlot,
+                a,
+              )
+            : artFromPanelBlockedReason(
+                prev,
+                dk,
+                room,
+                startSlot,
+                a,
+                mitarbeiter,
+              )
+          if (blockedAgain) {
             return prev
           }
           const span = Math.min(Math.max(1, a.slots), max - startSlot)
@@ -3934,7 +4587,7 @@ export default function App() {
           for (let i = 0; i < span; i++) {
             const k = makeSlotKey(dk, room, startSlot + i)
             const cur = { ...(next[k] ?? {}) }
-            next[k] = {
+            const base: CellData = {
               ...cur,
               ...(pname
                 ? { patient: pname, patientCode: pcode }
@@ -3943,6 +4596,24 @@ export default function App() {
               artId: a.id,
               artColor: a.color,
             }
+            if (isTeamMeetingArt(a)) {
+              delete base.patient
+              delete base.patientCode
+              delete base.staff
+              delete base.staffId
+              delete base.teamStaffIds
+            }
+            next[k] = base
+          }
+          if (isTeamMeetingArt(a)) {
+            queueMicrotask(() =>
+              setTerminPickerModal({
+                kind: 'teamMeeting',
+                dk,
+                room,
+                anchorSlot: startSlot,
+              }),
+            )
           }
           return next
         }
@@ -3998,8 +4669,22 @@ export default function App() {
         if (payload.kind === 'staff') {
           const s = staffById(payload.id)
           if (!s) return prev
+          const k0 = makeSlotKey(dk, room, startSlot)
+          const cur0 = prev[k0]
+          if (findArtIdForCell(cur0, arten) === TEAM_MEETING_ART_ID) {
+            alertOnce(
+              'Teammeetings: Teilnehmer bitte im Termin-Dialog (Klick auf den Termin) auswählen.',
+            )
+            return prev
+          }
+          if (isStaffAbsentAtSlot(s, dk, startSlot)) {
+            alertOnce(
+              'Der Mitarbeiter ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.',
+            )
+            return prev
+          }
           if (!isStaffSlotAvailable(s, wd, startSlot)) {
-            window.alert(
+            alertOnce(
               'Dieser Mitarbeiter ist zu dieser Zeit in seinem Wochenplan nicht als verfügbar markiert.',
             )
             return prev
@@ -4008,7 +4693,7 @@ export default function App() {
           const cur = { ...(prev[k] ?? {}) }
           const artId = findArtIdForCell(cur, arten)
           if (artId && !s.allowedArtIds.includes(artId)) {
-            window.alert(
+            alertOnce(
               'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
             )
             return prev
@@ -4022,14 +4707,26 @@ export default function App() {
         return prev
       })
     },
-    [patients, arten, muster, mitarbeiter],
+    [patients, arten, muster, mitarbeiter, setTerminPickerModal],
   )
+
+  useEffect(() => {
+    if (terminPickerModal?.kind !== 'teamMeeting') return
+    const { dk, room, anchorSlot } = terminPickerModal
+    const { start } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const anchor = slotCells[makeSlotKey(dk, room, start)]
+    setTeamMeetingSelectedIds(
+      anchor?.teamStaffIds?.length ? [...anchor.teamStaffIds] : [],
+    )
+    setTeamMeetingRepeatWeeks(1)
+  }, [terminPickerModal, slotCells])
 
   const handleDropOnSlot = useCallback(
     (e: React.DragEvent, dk: string, room: Room, slotIndex: number) => {
       e.preventDefault()
       setDragOverKey(null)
       setArtDragHighlight(null)
+      if (calendarTabId !== 'main') return
       const payload = parseDragPayload(e.dataTransfer)
       if (!payload) return
       if (payload.kind === 'moveBlock') {
@@ -4049,7 +4746,7 @@ export default function App() {
       }
       applyDrop(dk, room, slotIndex, payload)
     },
-    [applyDrop, applyMoveBlock, applyResizeBlock],
+    [applyDrop, applyMoveBlock, applyResizeBlock, calendarTabId],
   )
 
   const handleDropOnWeekCell = useCallback(
@@ -4057,6 +4754,7 @@ export default function App() {
       e.preventDefault()
       setDragOverKey(null)
       setArtDragHighlight(null)
+      if (calendarTabId !== 'main') return
       const payload = parseDragPayload(e.dataTransfer)
       if (!payload) return
       if (payload.kind === 'moveBlock') {
@@ -4129,7 +4827,7 @@ export default function App() {
             musterStamp,
           )
           if ('error' in res) {
-            window.alert(res.error)
+            alertOnce(res.error)
             return prev
           }
           queueMicrotask(() =>
@@ -4144,7 +4842,7 @@ export default function App() {
       }
       applyDrop(dk, room, 0, payload)
     },
-    [applyDrop, applyMoveBlock, muster, arten, mitarbeiter],
+    [applyDrop, applyMoveBlock, muster, arten, mitarbeiter, calendarTabId],
   )
 
   const toggleSlot = useCallback((dk: string, room: Room, slotIndex: number) => {
@@ -4167,9 +4865,15 @@ export default function App() {
   const exportTerminToIcs = useCallback(() => {
     if (!terminPickerModal) return
     const { dk, room, anchorSlot } = terminPickerModal
-    const pair = cellDataToPatientExportPair(slotCells, dk, room, anchorSlot)
+    const pair = cellDataToPatientExportPair(
+      slotCells,
+      dk,
+      room,
+      anchorSlot,
+      mitarbeiter,
+    )
     if (!pair) {
-      window.alert('Kein gültiger Termin für den Export.')
+      alertOnce('Kein gültiger Termin für den Export.')
       return
     }
     const fileBase = safeIcsZipPathSegment(
@@ -4177,7 +4881,7 @@ export default function App() {
       90,
     )
     downloadSingleTerminIcsFile(pair.patient, pair.row, fileBase)
-  }, [terminPickerModal, slotCells])
+  }, [terminPickerModal, slotCells, mitarbeiter])
 
   const assignArtToTerminFromModal = useCallback(
     (artId: string) => {
@@ -4202,8 +4906,14 @@ export default function App() {
         if (!isCellBooked(prev[startK])) return prev
         const wd = weekdayMon0FromDate(parseDateKey(dk))
         for (let sl = start; sl <= end; sl++) {
+          if (isStaffAbsentAtSlot(s, dk, sl)) {
+            alertOnce(
+              'Der Mitarbeiter ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.',
+            )
+            return prev
+          }
           if (!isStaffSlotAvailable(s, wd, sl)) {
-            window.alert(
+            alertOnce(
               'Dieser Mitarbeiter ist zu dieser Zeit in seinem Wochenplan nicht als verfügbar markiert.',
             )
             return prev
@@ -4212,7 +4922,7 @@ export default function App() {
           const cur = prev[k]
           const artId = findArtIdForCell(cur, arten)
           if (artId && !staffHasArtAllowed(s, artId)) {
-            window.alert(
+            alertOnce(
               'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
             )
             return prev
@@ -4249,6 +4959,132 @@ export default function App() {
     })
     setTerminPickerModal(null)
   }, [terminPickerModal])
+
+  const removeTeamParticipantsFromModal = useCallback(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'teamMeeting') return
+    const { dk, room, anchorSlot } = terminPickerModal
+    setSlotCells((prev) => {
+      const { start, end } = findBlockBounds(prev, dk, room, anchorSlot)
+      const next = { ...prev }
+      for (let sl = start; sl <= end; sl++) {
+        const k = makeSlotKey(dk, room, sl)
+        const cur = next[k]
+        if (!cur) continue
+        const { teamStaffIds: _t, ...rest } = cur
+        next[k] = rest
+      }
+      return next
+    })
+    setTerminPickerModal(null)
+  }, [terminPickerModal])
+
+  const applyTeamMeetingParticipantsToSingleOccurrence = useCallback(
+    (dk: string, room: Room, anchorSlot: number, selectedIds: string[]) => {
+      const art = arten.find((a) => a.id === TEAM_MEETING_ART_ID)
+      if (!art) return
+      setSlotCells((prev) => {
+        const { start, end } = findBlockBounds(prev, dk, room, anchorSlot)
+        const wd = weekdayMon0FromDate(parseDateKey(dk))
+        const eligible = selectedIds.filter((id) => {
+          const s = mitarbeiter.find((m) => m.id === id)
+          if (!s) return false
+          if (!staffHasArtAllowed(s, TEAM_MEETING_ART_ID)) return false
+          for (let sl = start; sl <= end; sl++) {
+            if (isStaffAbsentAtSlot(s, dk, sl)) return false
+            if (!isStaffSlotAvailableForDate(s, dk, wd, sl)) return false
+          }
+          return true
+        })
+        const next = { ...prev }
+        for (let sl = start; sl <= end; sl++) {
+          const k = makeSlotKey(dk, room, sl)
+          const cur = { ...(next[k] ?? {}) }
+          const out: CellData = {
+            ...cur,
+            art: art.label,
+            artId: art.id,
+            artColor: art.color,
+          }
+          if (eligible.length) out.teamStaffIds = [...eligible]
+          else delete out.teamStaffIds
+          next[k] = out
+        }
+        return next
+      })
+    },
+    [arten, mitarbeiter],
+  )
+
+  const saveTeamMeetingFromModal = useCallback(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'teamMeeting') return
+    const { dk, room, anchorSlot } = terminPickerModal
+    const art = arten.find((a) => a.id === TEAM_MEETING_ART_ID)
+    if (!art) return
+    const repeatWeeks = Math.max(1, Math.min(52, teamMeetingRepeatWeeks))
+    const selected = teamMeetingSelectedIds
+
+    setSlotCells((prev) => {
+      let next = { ...prev }
+      const { start, end } = findBlockBounds(prev, dk, room, anchorSlot)
+      const span = end - start + 1
+
+      for (let w = 0; w < repeatWeeks; w++) {
+        const d = addDays(parseDateKey(dk), w * 7)
+        const dkW = dateKey(d)
+        const wd = weekdayMon0FromDate(parseDateKey(dkW))
+
+        const eligibleForWeek = selected.filter((id) => {
+          const s = mitarbeiter.find((m) => m.id === id)
+          if (!s) return false
+          if (!staffHasArtAllowed(s, TEAM_MEETING_ART_ID)) return false
+          for (let sl = start; sl <= end; sl++) {
+            if (isStaffAbsentAtSlot(s, dkW, sl)) return false
+            if (!isStaffSlotAvailableForDate(s, dkW, wd, sl)) return false
+          }
+          return true
+        })
+
+        if (w > 0) {
+          const blocked = teamMeetingFromPanelBlockedReason(
+            next,
+            dkW,
+            room,
+            start,
+            art,
+          )
+          if (blocked) continue
+        }
+
+        for (let i = 0; i < span; i++) {
+          const k = makeSlotKey(dkW, room, start + i)
+          const cur = { ...(next[k] ?? {}) }
+          const teamStaffIds =
+            eligibleForWeek.length > 0 ? [...eligibleForWeek] : undefined
+          const nk: CellData = {
+            ...cur,
+            art: art.label,
+            artId: art.id,
+            artColor: art.color,
+            patient: undefined,
+            patientCode: undefined,
+            staff: undefined,
+            staffId: undefined,
+          }
+          if (teamStaffIds) nk.teamStaffIds = teamStaffIds
+          else delete nk.teamStaffIds
+          next[k] = nk
+        }
+      }
+      return next
+    })
+    setTerminPickerModal(null)
+  }, [
+    terminPickerModal,
+    arten,
+    teamMeetingRepeatWeeks,
+    teamMeetingSelectedIds,
+    mitarbeiter,
+  ])
 
   const clearTerminBlockFromModal = useCallback(() => {
     if (!terminPickerModal) return
@@ -4310,7 +5146,8 @@ export default function App() {
   )
 
   const artDropPreview = useMemo(() => {
-    if (!artDragHighlight || viewMode !== 'day') return null
+    if (!artDragHighlight || viewMode !== 'day' || calendarTabId !== 'main')
+      return null
     const a = arten.find((x) => x.id === artDragHighlight.artId)
     if (!a) return null
     const fullKeys = new Set<string>()
@@ -4335,7 +5172,21 @@ export default function App() {
         } else if (
           artSpanSlots > 1 &&
           !slotIndexInCalendarLunchPause(sl) &&
-          someStaffCanTreatArtAtSingleSlot(mitarbeiter, a.id, wd, sl)
+          (isTeamMeetingArt(a)
+            ? someStaffEligibleForTeamMeetingSlot(
+                mitarbeiter,
+                a.id,
+                dk,
+                wd,
+                sl,
+              )
+            : someStaffCanTreatArtAtSingleSlot(
+                mitarbeiter,
+                a.id,
+                dk,
+                wd,
+                sl,
+              ))
         ) {
           partialKeys.add(k)
         }
@@ -4345,6 +5196,7 @@ export default function App() {
   }, [
     artDragHighlight,
     viewMode,
+    calendarTabId,
     slotCells,
     arten,
     mitarbeiter,
@@ -4362,6 +5214,15 @@ export default function App() {
         )
       : -1
 
+  const weekHasToday = weekDays.some((d) => dateKey(d) === dateKey(now))
+  const minsNowClamped =
+    now.getHours() * 60 + now.getMinutes() - DAY_START_HOUR * 60
+  const slotNowInDay =
+    minsNowClamped >= 0 &&
+    minsNowClamped < (DAY_END_HOUR - DAY_START_HOUR) * 60
+      ? Math.floor(minsNowClamped / SLOT_MINUTES)
+      : -1
+
   const terminModalDetail = useMemo(() => {
     if (!terminPickerModal) return null
     const { kind, dk, room, anchorSlot } = terminPickerModal
@@ -4369,7 +5230,7 @@ export default function App() {
     const startK = makeSlotKey(dk, room, start)
     const sample = slotCells[startK]
     if (!sample || !isCellBooked(sample)) return null
-    const line = cellDisplayLine(sample)
+    const line = cellDisplayLine(sample, mitarbeiter)
     const timeRange =
       start === end
         ? slotIndexToLabel(start)
@@ -4383,7 +5244,23 @@ export default function App() {
       currentStaffId: sample.staffId,
       blockArtId: findArtIdForCell(sample, arten),
     }
-  }, [terminPickerModal, slotCells, arten])
+  }, [terminPickerModal, slotCells, arten, mitarbeiter])
+
+  const teamMeetingEligibleStaffForModal = useMemo(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'teamMeeting') return null
+    const { dk, room, anchorSlot } = terminPickerModal
+    const { start, end } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const wd = weekdayMon0FromDate(parseDateKey(dk))
+    return mitarbeiter
+      .filter((st) => staffHasArtAllowed(st, TEAM_MEETING_ART_ID))
+      .filter((st) => {
+        for (let sl = start; sl <= end; sl++) {
+          if (isStaffAbsentAtSlot(st, dk, sl)) return false
+          if (!isStaffSlotAvailableForDate(st, dk, wd, sl)) return false
+        }
+        return true
+      })
+  }, [terminPickerModal, slotCells, mitarbeiter])
 
   /** Hauptkalender · Mitarbeiter-Zuordnung: nur MA mit Freigabe für die Art und Verfügbarkeit auf jedem Slot des Blocks */
   const staffPickListForTerminModal = useMemo(() => {
@@ -4400,6 +5277,7 @@ export default function App() {
       return staffWhoCanPerformArtOnWholeSpan(
         mitarbeiter,
         artId,
+        dk,
         wd,
         start,
         span,
@@ -4407,7 +5285,7 @@ export default function App() {
     }
     return mitarbeiter.filter((s) => {
       for (let sl = start; sl <= end; sl++) {
-        if (!isStaffSlotAvailable(s, wd, sl)) return false
+        if (!isStaffSlotAvailableForDate(s, dk, wd, sl)) return false
       }
       return true
     })
@@ -4584,13 +5462,13 @@ export default function App() {
   const runPatientExportDownloads = useCallback(async () => {
     const p = patients.find((x) => x.id === patientExportSelectedId)
     if (!p) {
-      window.alert('Bitte einen Patienten auswählen.')
+      alertOnce('Bitte einen Patienten auswählen.')
       return
     }
     let from = patientExportFrom
     let to = patientExportTo
     if (!from || !to) {
-      window.alert('Bitte Von- und Bis-Datum wählen.')
+      alertOnce('Bitte Von- und Bis-Datum wählen.')
       return
     }
     if (from > to) {
@@ -4600,7 +5478,7 @@ export default function App() {
     }
     const rows = collectPatientAppointmentsInRange(slotCells, p, from, to)
     if (rows.length === 0) {
-      window.alert(
+      alertOnce(
         'Im gewählten Zeitraum wurden keine Termine für diesen Patienten gefunden.',
       )
       return
@@ -4622,13 +5500,13 @@ export default function App() {
   const runStaffExportPdf = useCallback(async () => {
     const s = mitarbeiter.find((x) => x.id === staffExportSelectedId)
     if (!s) {
-      window.alert('Bitte einen Mitarbeiter auswählen.')
+      alertOnce('Bitte einen Mitarbeiter auswählen.')
       return
     }
     let from = staffExportFrom
     let to = staffExportTo
     if (!from || !to) {
-      window.alert('Bitte Von- und Bis-Datum wählen.')
+      alertOnce('Bitte Von- und Bis-Datum wählen.')
       return
     }
     if (from > to) {
@@ -4638,7 +5516,7 @@ export default function App() {
     }
     const rows = collectStaffAppointmentsInRange(slotCells, s, from, to)
     if (rows.length === 0) {
-      window.alert(
+      alertOnce(
         'Im gewählten Zeitraum wurden keine Termine für diesen Mitarbeiter gefunden.',
       )
       return
@@ -4658,13 +5536,13 @@ export default function App() {
 
   const runRoomExportPdf = useCallback(async () => {
     if (!roomExportRoom) {
-      window.alert('Bitte einen Raum auswählen.')
+      alertOnce('Bitte einen Raum auswählen.')
       return
     }
     let from = roomExportFrom
     let to = roomExportTo
     if (!from || !to) {
-      window.alert('Bitte Von- und Bis-Datum wählen.')
+      alertOnce('Bitte Von- und Bis-Datum wählen.')
       return
     }
     if (from > to) {
@@ -4701,7 +5579,7 @@ export default function App() {
     if (!staffModal) return
     const name = staffDraftName.trim()
     if (!name) {
-      window.alert('Bitte einen Namen eingeben.')
+      alertOnce('Bitte einen Namen eingeben.')
       return
     }
     const slotsN = slotCount()
@@ -4793,7 +5671,7 @@ export default function App() {
   const addBelegungsart = (): boolean => {
     const label = newArtLabel.trim()
     if (!label) {
-      window.alert('Bitte eine Bezeichnung für die Belegungsart eingeben.')
+      alertOnce('Bitte eine Bezeichnung für die Belegungsart eingeben.')
       return false
     }
     const slots = Math.min(
@@ -4863,7 +5741,7 @@ export default function App() {
     if (!editingArtId) return
     const label = editArtLabel.trim()
     if (!label) {
-      window.alert('Bitte eine Bezeichnung eingeben.')
+      alertOnce('Bitte eine Bezeichnung eingeben.')
       return
     }
     const slots = Math.min(
@@ -4892,7 +5770,7 @@ export default function App() {
 
   const removeBelegungsart = (a: BelegungsartItem) => {
     if (arten.length <= 1) {
-      window.alert('Es muss mindestens eine Belegungsart bestehen bleiben.')
+      alertOnce('Es muss mindestens eine Belegungsart bestehen bleiben.')
       return
     }
     if (
@@ -4992,7 +5870,7 @@ export default function App() {
   const saveMusterModal = useCallback(() => {
     const label = musterDraftLabel.trim()
     if (!label) {
-      window.alert('Bitte eine Bezeichnung eingeben.')
+      alertOnce('Bitte eine Bezeichnung eingeben.')
       return
     }
     if (!musterModal) return
@@ -5149,6 +6027,27 @@ export default function App() {
     })
     if (staffModal?.mode === 'edit' && staffModal.id === s.id) setStaffModal(null)
   }
+
+  /** Heute und drei Monate zurück: Verhältnis belegte zu verfügbaren Zellen (Wochenplan). */
+  const staffUtilizationById = useMemo(() => {
+    const today = calendarDate(new Date())
+    const fromDk = dateKey(addCalendarMonths(today, -3))
+    const toDk = dateKey(today)
+    const map = new Map<
+      string,
+      { pct: number | null; booked: number; available: number }
+    >()
+    for (const s of mitarbeiter) {
+      const available = countStaffAvailableSlotsInRange(s, fromDk, toDk)
+      const booked = countStaffBookedSlotsInRange(slotCells, s, fromDk, toDk)
+      const pct =
+        available > 0
+          ? Math.min(100, Math.round((booked / available) * 1000) / 10)
+          : null
+      map.set(s.id, { pct, booked, available })
+    }
+    return map
+  }, [mitarbeiter, slotCells])
 
   const belowCalendarPanels = (
     <div className="calendar-below-panels">
@@ -5355,36 +6254,58 @@ export default function App() {
       <section className="panel panel-below-calendar" aria-label="Mitarbeiter">
         <h2 className="panel-title">Mitarbeiter</h2>
         <ul className="panel-list panel-list-compact staff-panel-list">
-          {mitarbeiter.map((s) => (
-            <li key={s.id} className="staff-panel-row">
-              <button
-                type="button"
-                className="drag-chip staff-chip"
-                draggable
-                onDragStart={(e) => onDragStart(e, { kind: 'staff', id: s.id })}
-                onDragEnd={endPanelOrCellDrag}
-                aria-label={`${s.name} in die Planung ziehen`}
-              >
-                <span className="chip-label">{s.name}</span>
-              </button>
-              <div className="staff-panel-row-actions">
+          {mitarbeiter.map((s) => {
+            const u = staffUtilizationById.get(s.id)
+            const utilTitle = u
+              ? u.available > 0
+                ? `Auslastung: ${u.booked.toLocaleString('de-DE')} von ${u.available.toLocaleString('de-DE')} im Wochenplan verfügbaren Zellen mit Buchung belegt (heute und die letzten 3 Monate).`
+                : 'Keine als verfügbar markierten Zellen im Wochenplan im Zeitraum heute und die letzten 3 Monate.'
+              : ''
+            const utilLabel =
+              u && u.available > 0 && u.pct !== null
+                ? `${u.pct.toLocaleString('de-DE', {
+                    minimumFractionDigits: 0,
+                    maximumFractionDigits: 1,
+                  })} %`
+                : '—'
+            return (
+              <li key={s.id} className="staff-panel-row">
                 <button
                   type="button"
-                  className="btn-patient-action"
-                  onClick={() => openStaffModalEdit(s.id)}
+                  className="drag-chip staff-chip"
+                  draggable
+                  onDragStart={(e) => onDragStart(e, { kind: 'staff', id: s.id })}
+                  onDragEnd={endPanelOrCellDrag}
+                  aria-label={`${s.name} in die Planung ziehen`}
                 >
-                  Bearbeiten
+                  <span className="chip-label">{s.name}</span>
                 </button>
-                <button
-                  type="button"
-                  className="btn-patient-action btn-patient-delete"
-                  onClick={() => deleteStaffMember(s)}
-                >
-                  Löschen
-                </button>
-              </div>
-            </li>
-          ))}
+                <div className="staff-panel-row-actions">
+                  <span
+                    className="staff-panel-util"
+                    title={utilTitle}
+                    aria-label={utilTitle || 'Auslastung'}
+                  >
+                    {utilLabel}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-patient-action"
+                    onClick={() => openStaffModalEdit(s.id)}
+                  >
+                    Bearbeiten
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-patient-action btn-patient-delete"
+                    onClick={() => deleteStaffMember(s)}
+                  >
+                    Löschen
+                  </button>
+                </div>
+              </li>
+            )
+          })}
         </ul>
         <button type="button" className="btn-add btn-staff-create" onClick={openStaffModalCreate}>
           Mitarbeiter anlegen
@@ -5432,7 +6353,11 @@ export default function App() {
       for (const room of ROOMS) {
         for (let sl = 0; sl < slotsN; sl++) {
           if (slotIndexInCalendarLunchPause(sl)) continue
-          if (eligible.every((s) => isStaffSlotAvailable(s, wd, sl))) {
+          if (
+            eligible.every((s) =>
+              isStaffSlotAvailableForDate(s, dayDk, wd, sl),
+            )
+          ) {
             keys.add(makeSlotKey(dayDk, room, sl))
           }
         }
@@ -5674,6 +6599,12 @@ export default function App() {
               type="button"
               className={viewMode === 'day' ? 'active' : ''}
               aria-pressed={viewMode === 'day'}
+              disabled={calendarTabId !== 'main'}
+              title={
+                calendarTabId !== 'main'
+                  ? 'Im Mitarbeiter-Kalender nur Wochenansicht Mo–So'
+                  : undefined
+              }
               onClick={() => setViewMode('day')}
             >
               Tagesansicht
@@ -5688,9 +6619,6 @@ export default function App() {
             </button>
           </div>
           <div className="toolbar-today-group">
-            <button type="button" className="btn-today" onClick={goToday}>
-              Heute
-            </button>
             <button
               type="button"
               className="btn-undo"
@@ -5702,7 +6630,37 @@ export default function App() {
               Rückgängig
             </button>
           </div>
+          <div
+            className="toolbar-export-group"
+            role="group"
+            aria-label="Daten exportieren"
+          >
+            <button
+              type="button"
+              className="btn-today btn-toolbar-export"
+              onClick={openPatientExportModal}
+            >
+              Export Patient
+            </button>
+            <button
+              type="button"
+              className="btn-today btn-toolbar-export"
+              onClick={openStaffExportModal}
+            >
+              Export Mitarbeiter
+            </button>
+            <button
+              type="button"
+              className="btn-today btn-toolbar-export"
+              onClick={openRoomExportModal}
+            >
+              Export Raum
+            </button>
+          </div>
           <div className="nav-arrows">
+            <button type="button" className="btn-today" onClick={goToday}>
+              Heute
+            </button>
             <button type="button" className="btn-icon" onClick={navPrev} aria-label="Zurück">
               ‹
             </button>
@@ -5715,14 +6673,14 @@ export default function App() {
       </header>
 
       <div className="app-body">
-        <aside className="side-panels" aria-label="Patienten">
-          <section className="panel panel-patients" aria-label="Patienten-Panel">
-            <h2 className="panel-title">Patienten</h2>
-            <p className="panel-desc">
-              Zuerst in eine <strong>leere</strong> Zelle ziehen; danach die
-              Belegungsart auf dieselbe Zelle – diese erhält die Farbe der Art.
-            </p>
-            <div className="patient-search-wrap" role="search">
+        <div className="calendar-main-row">
+          <aside
+            className="side-panels side-panels--calendar"
+            aria-label="Patienten"
+          >
+            <section className="panel panel-patients" aria-label="Patienten-Panel">
+              <h2 className="panel-title">Patienten</h2>
+              <div className="patient-search-wrap" role="search">
               <input
                 id="patient-search"
                 type="search"
@@ -5733,8 +6691,8 @@ export default function App() {
                 aria-label="Patienten suchen nach Name oder Patienten-ID"
                 autoComplete="off"
               />
-            </div>
-            <ul className="panel-list patient-panel-list">
+              </div>
+              <ul className="panel-list patient-panel-list">
               {filteredPatients.length === 0 ? (
                 <li className="patient-search-empty">
                   {patients.length === 0
@@ -5819,8 +6777,8 @@ export default function App() {
                 </li>
                 ))
               )}
-            </ul>
-            <div className="panel-add">
+              </ul>
+              <div className="panel-add">
               <input
                 type="text"
                 value={newPatientName}
@@ -5842,46 +6800,244 @@ export default function App() {
               <button type="button" className="btn-add" onClick={addPatient}>
                 Hinzufügen
               </button>
-            </div>
-          </section>
+              </div>
+            </section>
+        </aside>
+
+        <div className="main-column main-column--calendar" aria-label="Hauptkalender">
           <div
-            className="export-buttons-stack"
-            role="group"
-            aria-label="Daten exportieren"
+            className="calendar-view-tabs"
+            role="tablist"
+            aria-label="Kalender wechseln"
           >
             <button
               type="button"
-              className="btn-today"
-              onClick={openPatientExportModal}
+              role="tab"
+              className={`calendar-view-tab ${calendarTabId === 'main' ? 'calendar-view-tab--active' : ''}`}
+              aria-selected={calendarTabId === 'main'}
+              id="calendar-tab-main"
+              onClick={() => setCalendarTabId('main')}
             >
-              Export Patient
+              Hauptkalender
             </button>
-            <button
-              type="button"
-              className="btn-today"
-              onClick={openStaffExportModal}
-            >
-              Export Mitarbeiter
-            </button>
-            <button type="button" className="btn-today" onClick={openRoomExportModal}>
-              Export Raum
-            </button>
+            {mitarbeiter.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                role="tab"
+                className={`calendar-view-tab ${calendarTabId === s.id ? 'calendar-view-tab--active' : ''}`}
+                aria-selected={calendarTabId === s.id}
+                id={`calendar-tab-${s.id}`}
+                title={`Termine von ${s.name} (Ansicht)`}
+                onClick={() => setCalendarTabId(s.id)}
+              >
+                {s.name}
+              </button>
+            ))}
           </div>
-        </aside>
+          {isStaffCalendarReadOnly && calendarTabStaffMember ? (
+            <div className="grid-wrap grid-wrap--staff-readonly staff-week-grid-wrap">
+                <div
+                  className="plan-grid staff-week-grid"
+                  style={{
+                    gridTemplateColumns: `minmax(3.25rem, 4rem) repeat(7, minmax(0, 1fr))`,
+                    gridTemplateRows: `auto repeat(${slots}, minmax(0, 1fr))`,
+                  }}
+                >
+                  <div
+                    className="corner staff-week-corner"
+                    style={{ gridColumn: 1, gridRow: 1 }}
+                  />
+                  {weekDays.map((d, di) => {
+                    const dk = dateKey(d)
+                    const isDToday = dk === dateKey(new Date())
+                    return (
+                      <button
+                        key={dk}
+                        type="button"
+                        className={`staff-week-col-head ${isDToday ? 'is-today' : ''}`}
+                        style={{ gridColumn: di + 2, gridRow: 1 }}
+                        onClick={() =>
+                          openStaffAbsenceModal({
+                            fromDk: dk,
+                            toDk: dk,
+                            allDay: true,
+                          })
+                        }
+                        title="Ganztägige Abwesenheit für diesen Tag eintragen"
+                      >
+                        <span className="staff-week-col-wd">
+                          {d.toLocaleDateString('de-DE', { weekday: 'short' })}
+                        </span>
+                        <span className="staff-week-col-dm">
+                          {d.toLocaleDateString('de-DE', {
+                            day: 'numeric',
+                            month: 'short',
+                          })}
+                        </span>
+                      </button>
+                    )
+                  })}
+                  {Array.from({ length: slots }, (_, slotIndex) => (
+                    <Fragment key={slotIndex}>
+                      <div
+                        className={`time-label ${weekHasToday && slotIndex === slotNowInDay ? 'now-line' : ''} ${slotIndexInCalendarLunchPause(slotIndex) ? 'time-label--lunch-pause' : ''}`}
+                        style={{ gridColumn: 1, gridRow: slotIndex + 2 }}
+                      >
+                        {slotIndexToLabel(slotIndex)}
+                      </div>
+                      {weekDays.map((d, di) => {
+                        const dk = dateKey(d)
+                        const bookingsHere = staffBookingsAtSlot(
+                          cellsForActiveCalendarView,
+                          dk,
+                          slotIndex,
+                          calendarTabStaffMember,
+                        )
+                        const hasBooking = bookingsHere.length > 0
+                        const a0 = bookingsHere[0]?.data
+                        const p0 = a0?.patient?.trim()
+                        const isTeam0 =
+                          a0?.artId === TEAM_MEETING_ART_ID ||
+                          (a0?.teamStaffIds?.length ?? 0) > 0
+                        const baseLabel = isTeam0
+                          ? 'Teammeeting'
+                          : (p0 ?? 'Termin')
+                        const absentHere = isStaffAbsentAtSlot(
+                          calendarTabStaffMember,
+                          dk,
+                          slotIndex,
+                        )
 
-        <div className="main-column">
-          <p className="hint">
-            {viewMode === 'day'
-              ? 'Ablauf: Patient in freie Zelle ziehen, dann per Klick Belegungsart wählen (ohne Art zuerst), danach Mitarbeiter. Oder Art/Mitarbeiter aus dem Panel ziehen. Termin ziehen zum Verschieben; Rand für die Dauer. Freie Zelle: Klick markiert Belegung.'
-              : 'Patient zuerst in leeres Feld, dann Belegungsart (ab 08:00). Termin aus der Zelle oder Wochenfeld ziehen zum Verschieben. Klick öffnet den Tag in der Tagesansicht.'}
-          </p>
-
-          {viewMode === 'week' ? (
+                        // Terminblöcke zusammenfassen: nur wenn genau 1 Buchung am Slot
+                        // (bei Mehrfachbelegung bleibt die Zelle „einzeln“)
+                        if (hasBooking && bookingsHere.length === 1) {
+                          const only = bookingsHere[0]!
+                          const { start, end } = findBlockBounds(
+                            cellsForActiveCalendarView,
+                            dk,
+                            only.room,
+                            slotIndex,
+                          )
+                          if (slotIndex !== start) {
+                            return null
+                          }
+                          const anyAbsentInSpan = Array.from(
+                            { length: end - start + 1 },
+                            (_, i) =>
+                              isStaffAbsentAtSlot(
+                                calendarTabStaffMember,
+                                dk,
+                                start + i,
+                              ),
+                          ).some(Boolean)
+                          const isNowHere =
+                            dk === dateKey(now) &&
+                            slotNowInDay >= start &&
+                            slotNowInDay <= end &&
+                            slotNowInDay >= 0
+                          return (
+                            <button
+                              key={`${dk}-${start}-span`}
+                              type="button"
+                              className={[
+                                'staff-week-cell',
+                                'staff-week-cell--booked',
+                                anyAbsentInSpan
+                                  ? 'staff-week-cell--absent-conflict'
+                                  : '',
+                                slotIndexInCalendarLunchPause(slotIndex)
+                                  ? 'staff-week-cell--lunch-pause'
+                                  : '',
+                                isNowHere ? 'staff-week-cell--now' : '',
+                              ]
+                                .filter(Boolean)
+                                .join(' ')}
+                              style={{
+                                gridColumn: di + 2,
+                                gridRow: `${start + 2} / ${end + 3}`,
+                              }}
+                              title={`${only.room} · ${slotIndexToLabel(start)}–${slotEndTimeLabelExclusive(end)} · ${baseLabel}`}
+                              onClick={() =>
+                                openStaffAbsenceModal({
+                                  fromDk: dk,
+                                  toDk: dk,
+                                  allDay: false,
+                                  startSlot: start,
+                                  endSlot: end,
+                                })
+                              }
+                            >
+                              <span className="staff-week-cell-inner">
+                                {baseLabel}
+                              </span>
+                            </button>
+                          )
+                        }
+                        const cellLabel = hasBooking
+                          ? bookingsHere.length > 1
+                            ? `${baseLabel} · +${bookingsHere.length - 1}`
+                            : baseLabel
+                          : absentHere
+                            ? 'Abwesend'
+                            : '—'
+                        const isNowHere =
+                          dk === dateKey(now) &&
+                          slotIndex === slotNowInDay &&
+                          slotNowInDay >= 0
+                        return (
+                          <button
+                            key={`${dk}-${slotIndex}`}
+                            type="button"
+                            className={[
+                              'staff-week-cell',
+                              hasBooking ? 'staff-week-cell--booked' : '',
+                              absentHere && !hasBooking
+                                ? 'staff-week-cell--absent'
+                                : '',
+                              absentHere && hasBooking
+                                ? 'staff-week-cell--absent-conflict'
+                                : '',
+                              slotIndexInCalendarLunchPause(slotIndex)
+                                ? 'staff-week-cell--lunch-pause'
+                                : '',
+                              isNowHere ? 'staff-week-cell--now' : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' ')}
+                            style={{ gridColumn: di + 2, gridRow: slotIndex + 2 }}
+                            title={
+                              hasBooking
+                                ? `${bookingsHere.map((b) => b.room).join(', ')} · ${baseLabel}`
+                                : absentHere
+                                  ? 'Abwesend — Klick für Abwesenheit'
+                                  : 'Klick: Abwesenheit (Zeitfenster)'
+                            }
+                            onClick={() =>
+                              openStaffAbsenceModal({
+                                fromDk: dk,
+                                toDk: dk,
+                                allDay: false,
+                                startSlot: slotIndex,
+                                endSlot: slotIndex,
+                              })
+                            }
+                          >
+                            <span className="staff-week-cell-inner">{cellLabel}</span>
+                          </button>
+                        )
+                      })}
+                    </Fragment>
+                  ))}
+                </div>
+              </div>
+          ) : viewMode === 'week' ? (
             <div className="grid-wrap">
               <div
                 className="plan-grid week-grid"
                 style={{
                   gridTemplateColumns: `minmax(7.5rem, 9rem) repeat(${ROOMS.length}, minmax(5rem, 1fr))`,
+                  gridTemplateRows: `auto repeat(7, minmax(0, 1fr))`,
                 }}
               >
                 <div className="corner" />
@@ -5907,7 +7063,11 @@ export default function App() {
                         </span>
                       </div>
                       {ROOMS.map((room) => {
-                        const booked = bookingsForDayRoom(slotCells, dk, room)
+                        const booked = bookingsForDayRoom(
+                          cellsForActiveCalendarView,
+                          dk,
+                          room,
+                        )
                         const summary = summarizeSlots(booked)
                         const wk = `w|${dk}|${room}`
                         return (
@@ -5955,6 +7115,7 @@ export default function App() {
                 className="plan-grid day-grid"
                 style={{
                   gridTemplateColumns: `minmax(3.25rem, 4rem) repeat(${ROOMS.length}, minmax(5rem, 1fr))`,
+                  gridTemplateRows: `auto repeat(${slots}, minmax(0, 1fr))`,
                 }}
               >
                 <div className="corner" style={{ gridColumn: 1, gridRow: 1 }} />
@@ -5971,10 +7132,12 @@ export default function App() {
                   const lunchPauseRow = slotIndexInCalendarLunchPause(slotIndex)
                   const rowMergeNext = ROOMS.some((room) => {
                     const d =
-                      slotCells[makeSlotKey(activeDayKey, room, slotIndex)]
+                      cellsForActiveCalendarView[
+                        makeSlotKey(activeDayKey, room, slotIndex)
+                      ]
                     if (!isCellBooked(d)) return false
                     const seg = daySlotBlockSegment(
-                      slotCells,
+                      cellsForActiveCalendarView,
                       activeDayKey,
                       room,
                       slotIndex,
@@ -6000,11 +7163,11 @@ export default function App() {
                     {ROOMS.map((room, roomIdx) => {
                       const gridCol = roomIdx + 2
                       const kHere = makeSlotKey(activeDayKey, room, slotIndex)
-                      const dataHere = slotCells[kHere]
+                      const dataHere = cellsForActiveCalendarView[kHere]
                       const booked = isCellBooked(dataHere)
                       const bounds = booked
                         ? findBlockBounds(
-                            slotCells,
+                            cellsForActiveCalendarView,
                             activeDayKey,
                             room,
                             slotIndex,
@@ -6038,12 +7201,15 @@ export default function App() {
                         room,
                         anchorSl,
                       )
-                      const anchorData = slotCells[anchorKey]
-                      const line = cellDisplayLine(anchorData)
-                      const terminParts = cellTerminLabelParts(anchorData)
+                      const anchorData = cellsForActiveCalendarView[anchorKey]
+                      const line = cellDisplayLine(anchorData, mitarbeiter)
+                      const terminParts = cellTerminLabelParts(
+                        anchorData,
+                        mitarbeiter,
+                      )
                       const accent = cellAccentColor(anchorData)
                       const blockSegFirst = daySlotBlockSegment(
-                        slotCells,
+                        cellsForActiveCalendarView,
                         activeDayKey,
                         room,
                         anchorSl,
@@ -6052,7 +7218,7 @@ export default function App() {
                       const lastSl =
                         slotIndicesForShell[slotIndicesForShell.length - 1]
                       const blockSegLast = daySlotBlockSegment(
-                        slotCells,
+                        cellsForActiveCalendarView,
                         activeDayKey,
                         room,
                         lastSl,
@@ -6149,11 +7315,11 @@ export default function App() {
                           <div className="slot-cell-span-body">
                             {slotIndicesForShell.map((sl) => {
                               const k = makeSlotKey(activeDayKey, room, sl)
-                              const data = slotCells[k]
+                              const data = cellsForActiveCalendarView[k]
                               const subBooked = isCellBooked(data)
-                              const subLine = cellDisplayLine(data)
+                              const subLine = cellDisplayLine(data, mitarbeiter)
                               const subSeg = daySlotBlockSegment(
-                                slotCells,
+                                cellsForActiveCalendarView,
                                 activeDayKey,
                                 room,
                                 sl,
@@ -6226,6 +7392,18 @@ export default function App() {
                                           )
                                         ]
                                       if (
+                                        findArtIdForCell(
+                                          blockStartData,
+                                          arten,
+                                        ) === TEAM_MEETING_ART_ID
+                                      ) {
+                                        setTerminPickerModal({
+                                          kind: 'teamMeeting',
+                                          dk: activeDayKey,
+                                          room,
+                                          anchorSlot: sl,
+                                        })
+                                      } else if (
                                         patientTerminNeedsArtChoice(
                                           blockStartData,
                                           arten,
@@ -6332,7 +7510,10 @@ export default function App() {
                               <span
                                 className={`slot-cell-termin-line ${terminParts.staffName ? 'slot-cell-termin-staff' : 'slot-cell-termin-assign'}`}
                               >
-                                {terminParts.staffName ?? 'Mitarbeiter zuteilen'}
+                                {terminParts.staffName ??
+                                  (anchorData?.artId === TEAM_MEETING_ART_ID
+                                    ? 'Teilnehmer wählen'
+                                    : 'Mitarbeiter zuteilen')}
                               </span>
                             </div>
                           ) : null}
@@ -6345,8 +7526,9 @@ export default function App() {
               </div>
             </div>
           )}
-          {belowCalendarPanels}
         </div>
+        </div>
+        {belowCalendarPanels}
       </div>
 
       {patientExportOpen ? (
@@ -6413,7 +7595,7 @@ export default function App() {
                     className="btn-edit-save"
                     onClick={() => {
                       if (!patientExportSelectedId) {
-                        window.alert('Bitte einen Patienten auswählen.')
+                        alertOnce('Bitte einen Patienten auswählen.')
                         return
                       }
                       setPatientExportStep(2)
@@ -6546,7 +7728,7 @@ export default function App() {
                     className="btn-edit-save"
                     onClick={() => {
                       if (!staffExportSelectedId) {
-                        window.alert('Bitte einen Mitarbeiter auswählen.')
+                        alertOnce('Bitte einen Mitarbeiter auswählen.')
                         return
                       }
                       setStaffExportStep(2)
@@ -6664,7 +7846,7 @@ export default function App() {
                     className="btn-edit-save"
                     onClick={() => {
                       if (!roomExportRoom) {
-                        window.alert('Bitte einen Raum auswählen.')
+                        alertOnce('Bitte einen Raum auswählen.')
                         return
                       }
                       setRoomExportStep(2)
@@ -6814,6 +7996,186 @@ export default function App() {
         </div>
       ) : null}
 
+      {staffAbsenceModalId && staffAbsenceModalStaffView ? (
+        <div
+          className="staff-modal-overlay"
+          onClick={closeStaffAbsenceModal}
+          role="presentation"
+        >
+          <div
+            className="staff-modal staff-absence-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="staff-absence-modal-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="staff-absence-modal-title" className="staff-modal-title">
+              Urlaub & Abwesenheit
+            </h2>
+            <p className="staff-modal-hint">
+              <strong>{staffAbsenceModalStaffView.name}</strong> — in den
+              gewählten Zeiträumen ist der Mitarbeiter für Termine nicht
+              verfügbar (Hauptkalender).
+            </p>
+            <div className="staff-absence-modal-list-wrap">
+              <div className="staff-absence-modal-list-head">
+                Eingetragene Zeiträume
+              </div>
+              {(
+                [...(staffAbsenceModalStaffView.absences ?? [])].sort((a, b) =>
+                  a.fromDk.localeCompare(b.fromDk),
+                )
+              ).length === 0 ? (
+                <p className="staff-absence-modal-empty muted">
+                  Noch keine Einträge.
+                </p>
+              ) : (
+                <ul className="staff-absence-modal-list">
+                  {[
+                    ...(staffAbsenceModalStaffView.absences ?? []),
+                  ]
+                    .sort((a, b) => a.fromDk.localeCompare(b.fromDk))
+                    .map((a) => (
+                      <li key={a.id} className="staff-absence-modal-row">
+                        <span className="staff-absence-modal-range">
+                          {formatAbsencePeriodSummary(a)}
+                        </span>
+                        <span className="staff-absence-modal-kind">
+                          {a.kind === 'urlaub' ? 'Urlaub' : 'Abwesenheit'}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn-edit-cancel staff-absence-remove"
+                          onClick={() => removeStaffAbsence(a.id)}
+                        >
+                          Entfernen
+                        </button>
+                      </li>
+                    ))}
+                </ul>
+              )}
+            </div>
+            <div className="staff-absence-modal-new">
+              <div className="staff-absence-modal-new-head">Neuer Zeitraum</div>
+              <label className="staff-modal-label staff-absence-inline">
+                Von
+                <input
+                  type="date"
+                  value={staffAbsenceFormFrom}
+                  onChange={(e) => setStaffAbsenceFormFrom(e.target.value)}
+                  aria-label="Abwesenheit von"
+                />
+              </label>
+              <label className="staff-modal-label staff-absence-inline">
+                Bis
+                <input
+                  type="date"
+                  value={staffAbsenceFormTo}
+                  onChange={(e) => setStaffAbsenceFormTo(e.target.value)}
+                  aria-label="Abwesenheit bis"
+                />
+              </label>
+              <fieldset className="staff-absence-kind-fieldset">
+                <legend className="sr-only">Art der Abwesenheit</legend>
+                <label className="staff-absence-radio">
+                  <input
+                    type="radio"
+                    name="staff-absence-kind"
+                    checked={staffAbsenceFormKind === 'urlaub'}
+                    onChange={() => setStaffAbsenceFormKind('urlaub')}
+                  />
+                  Urlaub
+                </label>
+                <label className="staff-absence-radio">
+                  <input
+                    type="radio"
+                    name="staff-absence-kind"
+                    checked={staffAbsenceFormKind === 'abwesend'}
+                    onChange={() => setStaffAbsenceFormKind('abwesend')}
+                  />
+                  Sonstige Abwesenheit
+                </label>
+              </fieldset>
+              <fieldset className="staff-absence-scope-fieldset">
+                <legend className="staff-absence-scope-legend">Umfang (alle Räume)</legend>
+                <label className="staff-absence-radio">
+                  <input
+                    type="radio"
+                    name="staff-absence-scope"
+                    checked={staffAbsenceFormAllDay}
+                    onChange={() => setStaffAbsenceFormAllDay(true)}
+                  />
+                  Ganztägig (alle Zeitslots des Tages)
+                </label>
+                <label className="staff-absence-radio">
+                  <input
+                    type="radio"
+                    name="staff-absence-scope"
+                    checked={!staffAbsenceFormAllDay}
+                    onChange={() => setStaffAbsenceFormAllDay(false)}
+                  />
+                  Stundenweise (Zeitfenster pro Kalendertag)
+                </label>
+              </fieldset>
+              {!staffAbsenceFormAllDay ? (
+                <div className="staff-absence-slot-range">
+                  <label className="staff-modal-label staff-absence-inline">
+                    Von (Uhrzeit)
+                    <select
+                      className="staff-modal-name-input"
+                      value={staffAbsenceFormStartSlot}
+                      onChange={(e) =>
+                        setStaffAbsenceFormStartSlot(Number(e.target.value))
+                      }
+                      aria-label="Abwesenheit ab Slot"
+                    >
+                      {Array.from({ length: slots }, (_, i) => (
+                        <option key={i} value={i}>
+                          {slotIndexToLabel(i)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="staff-modal-label staff-absence-inline">
+                    Bis (Uhrzeit)
+                    <select
+                      className="staff-modal-name-input"
+                      value={staffAbsenceFormEndSlot}
+                      onChange={(e) =>
+                        setStaffAbsenceFormEndSlot(Number(e.target.value))
+                      }
+                      aria-label="Abwesenheit bis Slot"
+                    >
+                      {Array.from({ length: slots }, (_, i) => (
+                        <option key={i} value={i}>
+                          {slotIndexToLabel(i)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              ) : null}
+            </div>
+            <div className="staff-modal-footer">
+              <button
+                type="button"
+                className="btn-edit-save"
+                onClick={saveStaffAbsence}
+              >
+                Zeitraum speichern
+              </button>
+              <button
+                type="button"
+                className="btn-edit-cancel"
+                onClick={closeStaffAbsenceModal}
+              >
+                Schließen
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {terminPickerModal ? (
         <div
           className="staff-modal-overlay"
@@ -6830,7 +8192,9 @@ export default function App() {
             <h2 id="termin-picker-title" className="staff-modal-title">
               {terminPickerModal.kind === 'art'
                 ? 'Belegungsart wählen'
-                : 'Mitarbeiter zuordnen'}
+                : terminPickerModal.kind === 'teamMeeting'
+                  ? 'Teammeeting · Teilnehmer'
+                  : 'Mitarbeiter zuordnen'}
             </h2>
             {terminModalDetail ? (
               terminPickerModal.kind === 'art' ? (
@@ -6891,6 +8255,126 @@ export default function App() {
                       onClick={clearTerminBlockFromModal}
                     >
                       Termin leeren
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-edit-save"
+                      onClick={closeTerminPickerModal}
+                    >
+                      Schließen
+                    </button>
+                  </div>
+                </>
+              ) : terminPickerModal.kind === 'teamMeeting' ? (
+                <>
+                  <p className="staff-modal-hint termin-staff-summary">
+                    {terminModalDetail.room} · {terminModalDetail.timeRange}
+                    {terminModalDetail.line ? (
+                      <>
+                        <br />
+                        <span className="termin-staff-line">
+                          {terminModalDetail.line}
+                        </span>
+                      </>
+                    ) : null}
+                  </p>
+                  <p className="staff-modal-hint">
+                    Teilnehmer auswählen (Mehrfachauswahl). Bei
+                    Wiederholungen erscheint der Termin nur bei Mitarbeitern,
+                    die nicht abwesend sind und im Wochenplan frei sind —
+                    fehlen für eine Woche alle Teilnehmer, wird diese
+                    Wiederholung übersprungen.
+                  </p>
+                  <label className="staff-modal-label">
+                    Reihentermin (Anzahl Wochen)
+                    <input
+                      type="number"
+                      className="staff-modal-name-input"
+                      min={1}
+                      max={52}
+                      value={teamMeetingRepeatWeeks}
+                      onChange={(e) =>
+                        setTeamMeetingRepeatWeeks(
+                          Math.max(
+                            1,
+                            Math.min(52, Number(e.target.value) || 1),
+                          ),
+                        )
+                      }
+                      aria-label="Reihentermin Wochenanzahl"
+                    />
+                  </label>
+                  <ul className="termin-staff-pick-list">
+                    {teamMeetingEligibleStaffForModal === null ? (
+                      <li className="muted">Termin nicht gefunden.</li>
+                    ) : teamMeetingEligibleStaffForModal.length === 0 ? (
+                      <li className="muted">
+                        In diesem Zeitraum ist kein Mitarbeiter verfügbar.
+                      </li>
+                    ) : (
+                      teamMeetingEligibleStaffForModal.map((st) => (
+                          <li key={st.id}>
+                            <label className="termin-team-pick-row">
+                              <input
+                                type="checkbox"
+                                checked={teamMeetingSelectedIds.includes(st.id)}
+                                onChange={() => {
+                                  if (
+                                    !terminPickerModal ||
+                                    terminPickerModal.kind !== 'teamMeeting'
+                                  ) {
+                                    return
+                                  }
+                                  const nextSelected = teamMeetingSelectedIds.includes(
+                                    st.id,
+                                  )
+                                    ? teamMeetingSelectedIds.filter((x) => x !== st.id)
+                                    : [...teamMeetingSelectedIds, st.id]
+                                  setTeamMeetingSelectedIds(nextSelected)
+                                  applyTeamMeetingParticipantsToSingleOccurrence(
+                                    terminPickerModal.dk,
+                                    terminPickerModal.room,
+                                    terminPickerModal.anchorSlot,
+                                    nextSelected,
+                                  )
+                                }}
+                              />
+                              <span>{st.name}</span>
+                            </label>
+                          </li>
+                        ))
+                    )}
+                  </ul>
+                  <div className="staff-modal-footer termin-staff-footer">
+                    {teamMeetingSelectedIds.length > 0 ? (
+                      <button
+                        type="button"
+                        className="btn-edit-cancel"
+                        onClick={removeTeamParticipantsFromModal}
+                      >
+                        Teilnehmer leeren
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="btn-edit-cancel"
+                      onClick={exportTerminToIcs}
+                    >
+                      Als .ics exportieren
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-termin-clear"
+                      onClick={clearTerminBlockFromModal}
+                    >
+                      Termin leeren
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-edit-save"
+                      onClick={saveTeamMeetingFromModal}
+                    >
+                      Speichern
                     </button>
                     <button
                       type="button"

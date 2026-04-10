@@ -12,16 +12,18 @@
 }
 
 .app-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  min-width: 0;
+}
+
+.calendar-main-row {
   display: grid;
   grid-template-columns: minmax(13rem, 15.5rem) 1fr;
   gap: 1.25rem;
-  align-items: start;
-}
-
-@media (max-width: 900px) {
-  .app-body {
-    grid-template-columns: 1fr;
-  }
+  align-items: stretch;
+  min-width: 0;
 }
 
 .main-column {
@@ -94,19 +96,331 @@
   min-width: 0;
 }
 
-.side-panels .export-buttons-stack {
+.side-panels--calendar {
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.45rem;
+}
+
+.side-panels--calendar .panel-patients {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.side-panels--calendar .panel-patients .panel-title,
+.side-panels--calendar .patient-search-wrap {
   flex-shrink: 0;
 }
 
-.side-panels .export-buttons-stack .btn-today {
-  width: 100%;
-  box-sizing: border-box;
+.side-panels--calendar .panel-patients .patient-panel-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
 }
 
-/* Kürzere Patientenliste — Platz für Panel Kollision darunter (links neben dem Bereich mit Belegungsmuster) */
+.side-panels--calendar .panel-patients .panel-add {
+  margin-top: auto;
+  flex-shrink: 0;
+}
+
+.main-column--calendar {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+/* Einheitliche Höhe/Breite: Hauptkalender und Mitarbeiter-Wochenansicht gleicher Kasten */
+.main-column--calendar > .grid-wrap {
+  flex: 1 1 auto;
+  align-self: stretch;
+  width: 100%;
+  min-width: 0;
+  min-height: min(70vh, 720px);
+  max-height: min(70vh, 720px);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.calendar-view-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.4rem;
+  margin-bottom: 0.45rem;
+  flex-shrink: 0;
+}
+
+.calendar-view-tab {
+  appearance: none;
+  font: inherit;
+  font-size: 0.72rem;
+  line-height: 1.2;
+  padding: 0.28rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  cursor: pointer;
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.calendar-view-tab:hover {
+  background: var(--surface-hover);
+  color: var(--text-h);
+}
+
+.calendar-view-tab:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
+
+.calendar-view-tab--active {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border-subtle));
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-2));
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.grid-wrap--staff-readonly .slot-cell-main,
+.grid-wrap--staff-readonly .week-cell {
+  cursor: default;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.week-cell--staff-absent {
+  background: color-mix(in srgb, var(--text-muted) 9%, var(--surface-2));
+}
+
+.week-cell-absent-label {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.slot-cell--staff-absent:not(.booked) {
+  background: color-mix(in srgb, var(--text-muted) 12%, var(--slot-free)) !important;
+  cursor: pointer;
+}
+
+.staff-absence-modal .staff-absence-modal-list-wrap {
+  margin: 0.75rem 0;
+  max-height: 11rem;
+  overflow-y: auto;
+}
+
+.staff-absence-modal-list-head,
+.staff-absence-modal-new-head {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-h);
+  margin-bottom: 0.35rem;
+}
+
+.staff-absence-modal-empty {
+  font-size: 0.75rem;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.staff-absence-modal-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.staff-absence-modal-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 0.35rem 0.5rem;
+  align-items: center;
+  font-size: 0.72rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.staff-absence-modal-range {
+  font-variant-numeric: tabular-nums;
+}
+
+.staff-absence-modal-kind {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+}
+
+.staff-absence-remove {
+  font-size: 0.65rem !important;
+  padding: 0.2rem 0.45rem !important;
+}
+
+.staff-absence-modal-new {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  align-items: flex-end;
+  margin-bottom: 0.5rem;
+}
+
+.staff-week-grid-wrap {
+  min-height: 0;
+}
+
+.staff-week-col-head {
+  appearance: none;
+  font: inherit;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.1rem;
+  padding: 0.35rem 0.2rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--surface-2);
+  cursor: pointer;
+  color: var(--text-h);
+}
+
+.staff-week-col-head.is-today {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border-subtle));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface-2));
+}
+
+.staff-week-col-wd {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.staff-week-col-dm {
+  font-size: 0.62rem;
+  color: var(--text-muted);
+}
+
+.staff-week-cell {
+  appearance: none;
+  font: inherit;
+  font-size: 0.62rem;
+  line-height: 1.2;
+  padding: 0.12rem 0.2rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text-h);
+  cursor: pointer;
+  text-align: center;
+  overflow: hidden;
+  min-height: 1.35rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.staff-week-cell--booked {
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  font-weight: 600;
+}
+
+.staff-week-cell--absent {
+  background: color-mix(in srgb, var(--text-muted) 14%, var(--slot-free));
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.staff-week-cell--absent-conflict {
+  outline: 1px dashed color-mix(in srgb, #b91c1c 45%, transparent);
+}
+
+.staff-week-cell--lunch-pause {
+  opacity: 0.85;
+}
+
+.staff-week-cell--now {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.staff-week-cell-inner {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.staff-absence-scope-fieldset {
+  border: none;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.staff-absence-scope-legend {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-h);
+  margin-bottom: 0.15rem;
+  padding: 0;
+}
+
+.staff-absence-slot-range {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  align-items: flex-end;
+  width: 100%;
+  margin-top: 0.35rem;
+}
+
+.staff-modal-label.staff-absence-inline {
+  flex: 0 0 auto;
+  margin-bottom: 0;
+}
+
+.staff-absence-kind-fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.staff-absence-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+@media (max-width: 900px) {
+  .calendar-main-row {
+    grid-template-columns: 1fr;
+  }
+}
+
 .panel-patients {
   display: flex;
   flex-direction: column;
@@ -114,8 +428,6 @@
 }
 
 .panel-patients .patient-panel-list {
-  max-height: 10.5rem;
-  overflow-y: auto;
   padding-right: 0.2rem;
 }
 
@@ -841,6 +1153,18 @@
   flex-wrap: wrap;
 }
 
+.toolbar-export-group {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.btn-toolbar-export {
+  padding: 0.42rem 0.6rem;
+  font-size: 0.8rem;
+}
+
 .btn-undo {
   font: inherit;
   font-size: 0.875rem;
@@ -872,6 +1196,10 @@
   align-items: center;
   gap: 0.35rem;
   margin-left: auto;
+}
+
+.nav-arrows .btn-today {
+  margin-right: 0.35rem;
 }
 
 .nav-label {
@@ -925,6 +1253,43 @@
   display: grid;
   gap: 0;
   min-width: min(100%, 640px);
+}
+
+/* Hauptkalender & MA-Wochenansicht: gleiche Mindestbreite; volle Höhe des Kastens (keine weiße Fläche) */
+.main-column--calendar .plan-grid {
+  width: 100%;
+  min-width: min(100%, 52rem);
+  box-sizing: border-box;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.main-column--calendar .week-grid .week-cell {
+  height: 100%;
+  box-sizing: border-box;
+}
+
+.main-column--calendar .week-grid .row-head {
+  height: 100%;
+  box-sizing: border-box;
+}
+
+.main-column--calendar .day-grid .time-label {
+  min-height: 0;
+}
+
+.main-column--calendar .day-grid .slot-cell-shell {
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.main-column--calendar .staff-week-grid .staff-week-cell {
+  min-height: 0;
+  height: 100%;
+}
+
+.main-column--calendar .staff-week-grid .staff-week-col-head {
+  min-height: 2.5rem;
 }
 
 .corner {
@@ -2030,6 +2395,22 @@
   overflow-y: auto;
 }
 
+.termin-team-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.termin-team-pick-row input {
+  flex-shrink: 0;
+}
+
 .termin-staff-pick-btn {
   display: block;
   width: 100%;
@@ -2123,8 +2504,18 @@
 .staff-panel-row-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 0.35rem 0.65rem;
   padding-left: 0.1rem;
+}
+
+.staff-panel-util {
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  min-width: 3rem;
+  flex-shrink: 0;
 }
 
 .btn-staff-create {
