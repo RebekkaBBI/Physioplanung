@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react'
@@ -9,6 +10,10 @@ import { AuthContext, type AuthState } from './authContextCore'
 import { isSupabaseConfigured } from './config'
 import { getSupabaseBrowserClient } from './supabaseClient'
 import type { AppRole, UserProfile } from './types'
+
+/** Max. Cloud-Sitzung ab erstem Login (Supabase erneuert JWTs sonst unbegrenzt). */
+const CLOUD_SESSION_MAX_MS = 2 * 60 * 60 * 1000
+const CLOUD_SESSION_STARTED_AT_KEY = 'physio.cloudSessionStartedAt'
 
 function parseRole(raw: string | null | undefined): AppRole {
   if (
@@ -91,6 +96,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [refreshProfile])
 
+  useEffect(() => {
+    if (!isSupabaseConfigured() || !session) return
+    try {
+      if (!sessionStorage.getItem(CLOUD_SESSION_STARTED_AT_KEY)) {
+        sessionStorage.setItem(CLOUD_SESSION_STARTED_AT_KEY, String(Date.now()))
+      }
+    } catch {
+      /* z. B. private mode */
+    }
+  }, [session])
+
+  const signOutRef = useRef<() => Promise<void>>(async () => {})
+
   const signIn = useCallback(async (email: string, password: string) => {
     const supabase = getSupabaseBrowserClient()
     if (!supabase) return { error: 'Supabase ist nicht konfiguriert.' }
@@ -102,12 +120,40 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const signOut = useCallback(async () => {
+    try {
+      sessionStorage.removeItem(CLOUD_SESSION_STARTED_AT_KEY)
+    } catch {
+      /* ignore */
+    }
     const supabase = getSupabaseBrowserClient()
     if (supabase) await supabase.auth.signOut()
     setSession(null)
     setProfile(null)
     setProfileError(null)
   }, [])
+
+  signOutRef.current = signOut
+
+  useEffect(() => {
+    if (!isSupabaseConfigured() || !session) return
+    const tick = () => {
+      let started: number
+      try {
+        const raw = sessionStorage.getItem(CLOUD_SESSION_STARTED_AT_KEY)
+        if (!raw) return
+        started = Number(raw)
+      } catch {
+        return
+      }
+      if (!Number.isFinite(started)) return
+      if (Date.now() - started >= CLOUD_SESSION_MAX_MS) {
+        void signOutRef.current()
+      }
+    }
+    tick()
+    const id = window.setInterval(tick, 60_000)
+    return () => window.clearInterval(id)
+  }, [session])
 
   const value = useMemo<AuthState>(
     () => ({
