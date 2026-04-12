@@ -68,3 +68,136 @@
 body {
   margin: 0;
 }
+
+.cloud-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100svh;
+  background: var(--bg);
+}
+
+.cloud-loading-text {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 1.05rem;
+}
+
+.toolbar-viewer-hint {
+  margin: 0;
+  flex: 1 1 12rem;
+  max-width: 28rem;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+
+.toolbar-account {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+
+.toolbar-account-role {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+  background: var(--surface-2);
+}
+
+.toolbar-account-name {
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.login-cloud {
+  min-height: 100svh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: var(--bg);
+}
+
+.login-cloud-card {
+  width: 100%;
+  max-width: 22rem;
+  padding: 1.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-sm);
+}
+
+.login-cloud-title {
+  margin: 0 0 0.25rem;
+  font-size: 1.25rem;
+  color: var(--text-h);
+}
+
+.login-cloud-hint {
+  margin: 0 0 1.25rem;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.login-cloud-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.login-cloud-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.login-cloud-field input {
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  color: var(--text-h);
+  background: var(--surface);
+}
+
+.login-cloud-error {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #c53030;
+}
+
+@media (prefers-color-scheme: dark) {
+  .login-cloud-error {
+    color: #fc8181;
+  }
+}
+
+.login-cloud-submit {
+  margin-top: 0.25rem;
+  padding: 0.55rem 1rem;
+  border: none;
+  border-radius: 6px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+}
+
+.login-cloud-submit:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}

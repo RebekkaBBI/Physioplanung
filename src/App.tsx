@@ -23,6 +23,12 @@ import './App.css'
 // YELLOW_BACKUP: automatische Voll-Backups — Schlüssel & Ring in ./backup.ts (Suche: YELLOW_BACKUP)
 import { startWeeklyBackupScheduler } from './backup'
 // YELLOW_AI: KI-API (Chat) — siehe src/ai/ (Suche: YELLOW_AI)
+import { useAuth } from './cloud/useAuth'
+import { can } from './cloud/permissions'
+import {
+  fetchWorkspaceDocuments,
+  scheduleWorkspaceUpsert,
+} from './cloud/workspaceSync'
 
 const ROOMS = [
   'Physio 1',
@@ -1024,6 +1030,11 @@ function saveSlotCells(next: Record<string, CellData>) {
   localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(next))
 }
 
+function parseSlotCellsFromUnknown(parsed: unknown): Record<string, CellData> {
+  if (!parsed || typeof parsed !== 'object') return {}
+  return parsed as Record<string, CellData>
+}
+
 function normalizeMusterUsageCountById(raw: unknown): Record<string, number> {
   if (!raw || typeof raw !== 'object') return {}
   const out: Record<string, number> = {}
@@ -1035,64 +1046,71 @@ function normalizeMusterUsageCountById(raw: unknown): Record<string, number> {
   return out
 }
 
-function loadPanels(): {
+type LoadedPanels = {
   patients: PatientItem[]
   arten: BelegungsartItem[]
   muster: BelegungsmusterItem[]
   mitarbeiter: MitarbeiterItem[]
   musterUsageCountById: Record<string, number>
-} | null {
+}
+
+function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
+  if (!parsed || typeof parsed !== 'object') return null
+  const o = parsed as {
+    patients?: PatientItem[]
+    arten?: BelegungsartItem[]
+    muster?: BelegungsmusterItem[]
+    mitarbeiter?: MitarbeiterItem[]
+    artenCatalogVersion?: number
+    musterUsageCountById?: unknown
+  }
+  const catalogOk =
+    (o.artenCatalogVersion ?? 0) >= ARTEN_CATALOG_VERSION &&
+    Array.isArray(o.arten) &&
+    o.arten.length > 0
+  const resolvedArten = ensureTeamMeetingArtInCatalog(
+    catalogOk ? o.arten! : DEFAULT_ARTEN,
+  )
+  const artIdsForMigrate = resolvedArten.map((a) => a.id)
+  return {
+    patients: Array.isArray(o.patients)
+      ? o.patients.map((p: PatientItem) => ({
+          ...p,
+          patientCode:
+            typeof p.patientCode === 'string' ? p.patientCode : '',
+        }))
+      : DEFAULT_PATIENTS,
+    arten: resolvedArten,
+    muster: ensureVerlaengerungswocheMusterPreset(
+      ensureOberschenkelOpMusterPreset(
+        Array.isArray(o.muster)
+          ? o.muster.map(normalizeMusterItem)
+          : DEFAULT_MUSTER,
+        resolvedArten,
+      ),
+    ),
+    mitarbeiter: Array.isArray(o.mitarbeiter)
+      ? o.mitarbeiter
+          .filter(
+            (s) => s && typeof s.id === 'string' && typeof s.name === 'string',
+          )
+          .map((s) =>
+            migrateMitarbeiter(
+              s as { id: string; name: string } & Partial<MitarbeiterItem>,
+              artIdsForMigrate,
+              slotCount(),
+            ),
+          )
+      : DEFAULT_MITARBEITER,
+    musterUsageCountById: normalizeMusterUsageCountById(o.musterUsageCountById),
+  }
+}
+
+function loadPanels(): LoadedPanels | null {
   try {
     const raw = localStorage.getItem(STORAGE_PANELS)
     if (!raw) return null
-    const o = JSON.parse(raw) as {
-      patients?: PatientItem[]
-      arten?: BelegungsartItem[]
-      muster?: BelegungsmusterItem[]
-      mitarbeiter?: MitarbeiterItem[]
-      artenCatalogVersion?: number
-      musterUsageCountById?: unknown
-    }
-    const catalogOk =
-      (o.artenCatalogVersion ?? 0) >= ARTEN_CATALOG_VERSION &&
-      Array.isArray(o.arten) &&
-      o.arten.length > 0
-    const resolvedArten = ensureTeamMeetingArtInCatalog(
-      catalogOk ? o.arten! : DEFAULT_ARTEN,
-    )
-    const artIdsForMigrate = resolvedArten.map((a) => a.id)
-    return {
-      patients: Array.isArray(o.patients)
-        ? o.patients.map((p: PatientItem) => ({
-            ...p,
-            patientCode:
-              typeof p.patientCode === 'string' ? p.patientCode : '',
-          }))
-        : DEFAULT_PATIENTS,
-      arten: resolvedArten,
-      muster: ensureVerlaengerungswocheMusterPreset(
-        ensureOberschenkelOpMusterPreset(
-          Array.isArray(o.muster)
-            ? o.muster.map(normalizeMusterItem)
-            : DEFAULT_MUSTER,
-          resolvedArten,
-        ),
-      ),
-      mitarbeiter: Array.isArray(o.mitarbeiter)
-        ? o.mitarbeiter
-            .filter(
-              (s) => s && typeof s.id === 'string' && typeof s.name === 'string',
-            )
-            .map((s) =>
-              migrateMitarbeiter(
-                s as { id: string; name: string } & Partial<MitarbeiterItem>,
-                artIdsForMigrate,
-                slotCount(),
-              ),
-            )
-        : DEFAULT_MITARBEITER,
-      musterUsageCountById: normalizeMusterUsageCountById(o.musterUsageCountById),
-    }
+    return parsePanelsFromJsonObject(JSON.parse(raw))
   } catch {
     return null
   }
@@ -1114,20 +1132,28 @@ function savePanelsState(p: {
   )
 }
 
+function parseUiFromUnknown(parsed: unknown): {
+  viewMode: ViewMode
+  anchorDateKey: string
+} | null {
+  if (!parsed || typeof parsed !== 'object') return null
+  const o = parsed as { viewMode?: unknown; anchorDateKey?: unknown }
+  const vm =
+    o.viewMode === 'day' || o.viewMode === 'week' ? o.viewMode : null
+  const ak =
+    typeof o.anchorDateKey === 'string' &&
+    /^\d{4}-\d{2}-\d{2}$/.test(o.anchorDateKey)
+      ? o.anchorDateKey
+      : null
+  if (!vm || !ak) return null
+  return { viewMode: vm, anchorDateKey: ak }
+}
+
 function loadUiState(): { viewMode: ViewMode; anchorDateKey: string } | null {
   try {
     const raw = localStorage.getItem(STORAGE_UI)
     if (!raw) return null
-    const o = JSON.parse(raw) as { viewMode?: unknown; anchorDateKey?: unknown }
-    const vm =
-      o.viewMode === 'day' || o.viewMode === 'week' ? o.viewMode : null
-    const ak =
-      typeof o.anchorDateKey === 'string' &&
-      /^\d{4}-\d{2}-\d{2}$/.test(o.anchorDateKey)
-        ? o.anchorDateKey
-        : null
-    if (!vm || !ak) return null
-    return { viewMode: vm, anchorDateKey: ak }
+    return parseUiFromUnknown(JSON.parse(raw))
   } catch {
     return null
   }
@@ -4111,9 +4137,35 @@ function cloneSlotMap(c: Record<string, CellData>): Record<string, CellData> {
   }
 }
 
-export default function App() {
-  const initialPanels = useMemo(() => loadPanels(), [])
-  const initialUi = useMemo(() => loadUiState(), [])
+export type AppProps = { cloudSyncEnabled?: boolean }
+
+export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
+  const { profile, signOut, session } = useAuth()
+  const accountLabel =
+    profile?.display_name?.trim() ||
+    session?.user?.email ||
+    ''
+  const appRole = cloudSyncEnabled ? (profile?.role ?? null) : null
+  const organizationId =
+    cloudSyncEnabled && profile?.organization_id
+      ? profile.organization_id
+      : null
+  const mayPatientWrite = can(appRole, 'patients:write')
+  const mayArtenWrite = can(appRole, 'arten:write')
+  const mayMusterWrite = can(appRole, 'muster:write')
+  const mayStaffWrite = can(appRole, 'staff:write')
+  const mayStaffAbsences = can(appRole, 'staff:absences')
+  const mayExport = can(appRole, 'export:run')
+  const isViewer = cloudSyncEnabled && appRole === 'viewer'
+
+  const initialPanels = useMemo(
+    () => (cloudSyncEnabled ? null : loadPanels()),
+    [cloudSyncEnabled],
+  )
+  const initialUi = useMemo(
+    () => (cloudSyncEnabled ? null : loadUiState()),
+    [cloudSyncEnabled],
+  )
   const [viewMode, setViewMode] = useState<ViewMode>(
     () => initialUi?.viewMode ?? 'week',
   )
@@ -4123,8 +4175,8 @@ export default function App() {
         ? parseDateKey(initialUi.anchorDateKey)
         : calendarDate(new Date()),
   )
-  const [slotCells, setSlotCellsBase] = useState<Record<string, CellData>>(
-    loadSlotCells,
+  const [slotCells, setSlotCellsBase] = useState<Record<string, CellData>>(() =>
+    cloudSyncEnabled ? {} : loadSlotCells(),
   )
   const slotCellsRef = useRef(slotCells)
   slotCellsRef.current = slotCells
@@ -4283,16 +4335,83 @@ export default function App() {
     targetOn: boolean
     weekParity: 'even' | 'odd'
   } | null>(null)
+  const [cloudHydrated, setCloudHydrated] = useState(!cloudSyncEnabled)
+
+  useEffect(() => {
+    if (!cloudSyncEnabled) {
+      setCloudHydrated(true)
+      return
+    }
+    if (!organizationId) {
+      setCloudHydrated(false)
+      return
+    }
+    let cancelled = false
+    setCloudHydrated(false)
+    void (async () => {
+      try {
+        const byType = await fetchWorkspaceDocuments(organizationId)
+        if (cancelled) return
+        if (byType.slots !== undefined) {
+          setSlotCellsBase(parseSlotCellsFromUnknown(byType.slots))
+          slotUndoStackRef.current = []
+          setCanUndoSlots(false)
+        }
+        if (byType.panels !== undefined) {
+          const parsed = parsePanelsFromJsonObject(byType.panels)
+          if (parsed) {
+            setPatients(parsed.patients)
+            setArten(parsed.arten)
+            setMuster(parsed.muster)
+            setMitarbeiter(parsed.mitarbeiter)
+            setMusterUsageCountById(parsed.musterUsageCountById)
+          }
+        }
+        if (byType.ui !== undefined) {
+          const ui = parseUiFromUnknown(byType.ui)
+          if (ui) {
+            setViewMode(ui.viewMode)
+            setAnchorDate(parseDateKey(ui.anchorDateKey))
+          }
+        }
+      } catch (e) {
+        console.error('Cloud-Hydration', e)
+      } finally {
+        if (!cancelled) setCloudHydrated(true)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [cloudSyncEnabled, organizationId])
+
   /* Automatisches Speichern: Kalender, Stammdaten, Ansicht — bei jeder Änderung */
   useEffect(() => {
+    if (cloudSyncEnabled) {
+      if (!cloudHydrated || !organizationId || appRole === 'viewer') return
+      scheduleWorkspaceUpsert(organizationId, 'slots', slotCells)
+      return
+    }
     saveSlotCells(slotCells)
-  }, [slotCells])
+  }, [slotCells, cloudSyncEnabled, cloudHydrated, organizationId, appRole])
 
   useEffect(() => {
     setCanUndoSlots(slotUndoStackRef.current.length > 0)
   }, [slotCells])
 
   useEffect(() => {
+    if (cloudSyncEnabled) {
+      if (!cloudHydrated || !organizationId || appRole === 'viewer') return
+      scheduleWorkspaceUpsert(organizationId, 'panels', {
+        patients,
+        arten,
+        muster,
+        mitarbeiter,
+        musterUsageCountById,
+        artenCatalogVersion: ARTEN_CATALOG_VERSION,
+      })
+      return
+    }
     savePanelsState({
       patients,
       arten,
@@ -4300,15 +4419,34 @@ export default function App() {
       mitarbeiter,
       musterUsageCountById,
     })
-  }, [patients, arten, muster, mitarbeiter, musterUsageCountById])
+  }, [
+    patients,
+    arten,
+    muster,
+    mitarbeiter,
+    musterUsageCountById,
+    cloudSyncEnabled,
+    cloudHydrated,
+    organizationId,
+    appRole,
+  ])
 
   useEffect(() => {
+    if (cloudSyncEnabled) {
+      if (!cloudHydrated || !organizationId || appRole === 'viewer') return
+      scheduleWorkspaceUpsert(organizationId, 'ui', {
+        viewMode,
+        anchorDateKey: dateKey(anchorDate),
+      })
+      return
+    }
     saveUiState(viewMode, anchorDate)
-  }, [viewMode, anchorDate])
+  }, [viewMode, anchorDate, cloudSyncEnabled, cloudHydrated, organizationId, appRole])
 
   useEffect(() => {
+    if (cloudSyncEnabled) return undefined
     return startWeeklyBackupScheduler()
-  }, [])
+  }, [cloudSyncEnabled])
 
   useEffect(() => {
     if (calendarTabId !== 'main' || viewMode !== 'day') return
@@ -5626,6 +5764,10 @@ export default function App() {
   }
 
   const addPatient = () => {
+    if (cloudSyncEnabled && !mayPatientWrite) {
+      alertOnce('Keine Berechtigung zum Anlegen von Patienten.')
+      return
+    }
     const name = newPatientName.trim()
     const patientCode = newPatientCode.trim()
     if (!name || !patientCode) return
@@ -5644,12 +5786,17 @@ export default function App() {
   }, [])
 
   const startEditPatient = (p: PatientItem) => {
+    if (cloudSyncEnabled && !mayPatientWrite) {
+      alertOnce('Keine Berechtigung zum Bearbeiten von Patienten.')
+      return
+    }
     setEditingPatientId(p.id)
     setEditPatientName(p.name)
     setEditPatientCode(p.patientCode)
   }
 
   const saveEditPatient = () => {
+    if (cloudSyncEnabled && !mayPatientWrite) return
     const name = editPatientName.trim()
     const patientCode = editPatientCode.trim()
     if (!editingPatientId || !name || !patientCode) return
@@ -5662,6 +5809,10 @@ export default function App() {
   }
 
   const deletePatient = (p: PatientItem) => {
+    if (cloudSyncEnabled && !mayPatientWrite) {
+      alertOnce('Keine Berechtigung zum Löschen von Patienten.')
+      return
+    }
     if (
       !window.confirm(
         `Patient „${p.name}“ (${p.patientCode}) wirklich löschen?`,
@@ -5829,6 +5980,10 @@ export default function App() {
   }, [roomExportRoom, roomExportFrom, roomExportTo, slotCells])
 
   const openStaffModalCreate = () => {
+    if (cloudSyncEnabled && !mayStaffWrite) {
+      alertOnce('Keine Berechtigung zum Anlegen von Mitarbeitenden.')
+      return
+    }
     setStaffDraftName('')
     setStaffDraftAvail(emptyStaffAvailability(slotCount()))
     setStaffDraftAvailOdd(emptyStaffAvailability(slotCount()))
@@ -5838,6 +5993,10 @@ export default function App() {
   }
 
   const openStaffModalEdit = (id: string) => {
+    if (cloudSyncEnabled && !mayStaffWrite) {
+      alertOnce('Keine Berechtigung zum Bearbeiten von Mitarbeitenden.')
+      return
+    }
     const s = mitarbeiter.find((x) => x.id === id)
     if (!s) return
     setStaffDraftName(s.name)
@@ -5856,6 +6015,10 @@ export default function App() {
 
   const saveStaffModal = () => {
     if (!staffModal) return
+    if (cloudSyncEnabled && !mayStaffWrite) {
+      alertOnce('Keine Berechtigung zum Bearbeiten von Mitarbeitenden.')
+      return
+    }
     const name = staffDraftName.trim()
     if (!name) {
       alertOnce('Bitte einen Namen eingeben.')
@@ -5996,6 +6159,10 @@ export default function App() {
   const noStaffDraftArtsSelected = staffDraftArtIds.length === 0
 
   const addBelegungsart = (): boolean => {
+    if (cloudSyncEnabled && !mayArtenWrite) {
+      alertOnce('Keine Berechtigung zum Bearbeiten der Belegungsarten.')
+      return false
+    }
     const label = newArtLabel.trim()
     if (!label) {
       alertOnce('Bitte eine Bezeichnung für die Belegungsart eingeben.')
@@ -6033,11 +6200,15 @@ export default function App() {
   }
 
   const openNewArtModal = useCallback(() => {
+    if (cloudSyncEnabled && !mayArtenWrite) {
+      alertOnce('Keine Berechtigung zum Bearbeiten der Belegungsarten.')
+      return
+    }
     setNewArtLabel('')
     setNewArtMinutes(60)
     setNewArtColor('#0d9488')
     setNewArtModalOpen(true)
-  }, [])
+  }, [cloudSyncEnabled, mayArtenWrite])
 
   const closeNewArtModal = useCallback(() => {
     setNewArtModalOpen(false)
@@ -6058,6 +6229,10 @@ export default function App() {
   }, [])
 
   const startEditArt = (a: BelegungsartItem) => {
+    if (cloudSyncEnabled && !mayArtenWrite) {
+      alertOnce('Keine Berechtigung zum Bearbeiten der Belegungsarten.')
+      return
+    }
     setEditingArtId(a.id)
     setEditArtLabel(a.label)
     setEditArtMinutes(a.slots * SLOT_MINUTES)
@@ -6065,6 +6240,7 @@ export default function App() {
   }
 
   const saveEditArt = () => {
+    if (cloudSyncEnabled && !mayArtenWrite) return
     if (!editingArtId) return
     const label = editArtLabel.trim()
     if (!label) {
@@ -6096,6 +6272,10 @@ export default function App() {
   }
 
   const removeBelegungsart = (a: BelegungsartItem) => {
+    if (cloudSyncEnabled && !mayArtenWrite) {
+      alertOnce('Keine Berechtigung zum Bearbeiten der Belegungsarten.')
+      return
+    }
     if (arten.length <= 1) {
       alertOnce('Es muss mindestens eine Belegungsart bestehen bleiben.')
       return
@@ -6178,13 +6358,21 @@ export default function App() {
   )
 
   const openMusterModalCreate = useCallback(() => {
+    if (cloudSyncEnabled && !mayMusterWrite) {
+      alertOnce('Keine Berechtigung für Belegungsmuster.')
+      return
+    }
     setMusterDraftLabel('')
     setMusterDraftCells(injectMusterPauseSlots({}, 3))
     setMusterHighlightArtId(null)
     setMusterModal({ mode: 'create', templateWeekCount: 3 })
-  }, [])
+  }, [cloudSyncEnabled, mayMusterWrite])
 
   const openMusterModalEdit = useCallback((m: BelegungsmusterItem) => {
+    if (cloudSyncEnabled && !mayMusterWrite) {
+      alertOnce('Keine Berechtigung für Belegungsmuster.')
+      return
+    }
     setMusterDraftLabel(m.label)
     const tw = m.templateWeekCount === 1 ? 1 : 3
     setMusterHighlightArtId(null)
@@ -6192,9 +6380,10 @@ export default function App() {
       injectMusterPauseSlots(musterTemplateToVirtual(m.templateCells), tw),
     )
     setMusterModal({ mode: 'edit', id: m.id, templateWeekCount: tw })
-  }, [])
+  }, [cloudSyncEnabled, mayMusterWrite])
 
   const saveMusterModal = useCallback(() => {
+    if (cloudSyncEnabled && !mayMusterWrite) return
     const label = musterDraftLabel.trim()
     if (!label) {
       alertOnce('Bitte eine Bezeichnung eingeben.')
@@ -6234,9 +6423,15 @@ export default function App() {
     musterDraftCells,
     musterModal,
     closeMusterModal,
+    cloudSyncEnabled,
+    mayMusterWrite,
   ])
 
   const removeMuster = (m: BelegungsmusterItem) => {
+    if (cloudSyncEnabled && !mayMusterWrite) {
+      alertOnce('Keine Berechtigung für Belegungsmuster.')
+      return
+    }
     if (!window.confirm(`Belegungsmuster „${m.label}“ wirklich entfernen?`)) {
       return
     }
@@ -6337,6 +6532,10 @@ export default function App() {
   }, [clearMusterDraftBlock])
 
   const deleteStaffMember = (s: MitarbeiterItem) => {
+    if (cloudSyncEnabled && !mayStaffWrite) {
+      alertOnce('Keine Berechtigung zum Löschen von Mitarbeitenden.')
+      return
+    }
     if (!window.confirm(`Mitarbeiter „${s.name}“ wirklich löschen?`)) return
     setMitarbeiter((list) => list.filter((x) => x.id !== s.id))
     setSlotCells((prev) => {
@@ -6502,6 +6701,7 @@ export default function App() {
                       <button
                         type="button"
                         className="btn-patient-action"
+                        disabled={!mayArtenWrite}
                         onClick={() => startEditArt(a)}
                       >
                         Bearbeiten
@@ -6509,6 +6709,7 @@ export default function App() {
                       <button
                         type="button"
                         className="btn-patient-action btn-patient-delete"
+                        disabled={!mayArtenWrite}
                         onClick={() => removeBelegungsart(a)}
                       >
                         Löschen
@@ -6521,7 +6722,12 @@ export default function App() {
           ))}
         </ul>
         <div className="panel-add panel-add-arten panel-add-arten--modal-trigger">
-          <button type="button" className="btn-add" onClick={openNewArtModal}>
+          <button
+            type="button"
+            className="btn-add"
+            disabled={!mayArtenWrite}
+            onClick={openNewArtModal}
+          >
             Belegungsart hinzufügen
           </button>
         </div>
@@ -6556,6 +6762,7 @@ export default function App() {
                     <button
                       type="button"
                       className="btn-patient-action"
+                      disabled={!mayMusterWrite}
                       onClick={() => openMusterModalEdit(m)}
                     >
                       Bearbeiten
@@ -6563,6 +6770,7 @@ export default function App() {
                     <button
                       type="button"
                       className="btn-patient-action btn-patient-delete"
+                      disabled={!mayMusterWrite}
                       onClick={() => removeMuster(m)}
                     >
                       Löschen
@@ -6573,7 +6781,12 @@ export default function App() {
             </li>
           ))}
         </ul>
-        <button type="button" className="btn-add" onClick={openMusterModalCreate}>
+        <button
+          type="button"
+          className="btn-add"
+          disabled={!mayMusterWrite}
+          onClick={openMusterModalCreate}
+        >
           Neues Belegungsmuster anlegen
         </button>
       </section>
@@ -6618,6 +6831,7 @@ export default function App() {
                   <button
                     type="button"
                     className="btn-patient-action"
+                    disabled={!mayStaffWrite}
                     onClick={() => openStaffModalEdit(s.id)}
                   >
                     Bearbeiten
@@ -6625,6 +6839,7 @@ export default function App() {
                   <button
                     type="button"
                     className="btn-patient-action btn-patient-delete"
+                    disabled={!mayStaffWrite}
                     onClick={() => deleteStaffMember(s)}
                   >
                     Löschen
@@ -6634,7 +6849,12 @@ export default function App() {
             )
           })}
         </ul>
-        <button type="button" className="btn-add btn-staff-create" onClick={openStaffModalCreate}>
+        <button
+          type="button"
+          className="btn-add btn-staff-create"
+          disabled={!mayStaffWrite}
+          onClick={openStaffModalCreate}
+        >
           Mitarbeiter anlegen
         </button>
       </section>
@@ -6911,27 +7131,64 @@ export default function App() {
       </div>
     )
 
+  if (cloudSyncEnabled && !cloudHydrated) {
+    return (
+      <div className="app cloud-loading">
+        <p className="cloud-loading-text">Arbeitsbereich wird geladen …</p>
+      </div>
+    )
+  }
+
   return (
     <div className="app">
       <header className="app-header">
         <div className="app-title-row">
-          <img
-            src="/logo-bbi.png"
-            alt="BBI"
-            className="app-logo"
-            width={240}
-            height={96}
-            decoding="async"
-          />
-          <h1 className="app-title">Physio PlanungsApp</h1>
+          <div className="app-title-brand">
+            <img
+              src="/logo-bbi.png"
+              alt="BBI"
+              className="app-logo"
+              width={240}
+              height={96}
+              decoding="async"
+            />
+            <h1 className="app-title">Physio PlanungsApp</h1>
+          </div>
+          {cloudSyncEnabled ? (
+            <div className="toolbar-account" role="group" aria-label="Konto">
+              {appRole ? (
+                <span className="toolbar-account-role" title="Ihre Rolle">
+                  {appRole}
+                </span>
+              ) : null}
+              {accountLabel ? (
+                <span className="toolbar-account-name" title={accountLabel}>
+                  {accountLabel}
+                </span>
+              ) : null}
+              <button
+                type="button"
+                className="btn-today btn-toolbar-export"
+                onClick={() => void signOut()}
+              >
+                Abmelden
+              </button>
+            </div>
+          ) : null}
         </div>
         <div className="toolbar">
+          {isViewer ? (
+            <p className="toolbar-viewer-hint" role="status">
+              Nur Leseberechtigung — nur Kalenderansicht, ohne Stammdaten-Panels.
+              Abmelden oben rechts neben dem Kontonamen.
+            </p>
+          ) : null}
           <div className="segmented" role="group" aria-label="Ansicht">
             <button
               type="button"
               className={viewMode === 'day' ? 'active' : ''}
               aria-pressed={viewMode === 'day'}
-              disabled={calendarTabId !== 'main'}
+              disabled={calendarTabId !== 'main' || isViewer}
               title={
                 calendarTabId !== 'main'
                   ? 'Im Mitarbeiter-Kalender nur Wochenansicht Mo–So'
@@ -6945,6 +7202,7 @@ export default function App() {
               type="button"
               className={viewMode === 'week' ? 'active' : ''}
               aria-pressed={viewMode === 'week'}
+              disabled={isViewer}
               onClick={() => setViewMode('week')}
             >
               Wochenansicht
@@ -6954,7 +7212,7 @@ export default function App() {
             <button
               type="button"
               className="btn-undo"
-              disabled={!canUndoSlots}
+              disabled={!canUndoSlots || isViewer}
               onClick={undoSlotCells}
               title="Letzte Änderung am Terminplan rückgängig machen"
               aria-label="Letzte Änderung am Terminplan rückgängig machen"
@@ -6970,6 +7228,14 @@ export default function App() {
             <button
               type="button"
               className="btn-today btn-toolbar-export"
+              disabled={!mayExport || isViewer}
+              title={
+                isViewer
+                  ? 'Nur Leseberechtigung'
+                  : !mayExport
+                    ? 'Keine Berechtigung für Exporte'
+                    : undefined
+              }
               onClick={openPatientExportModal}
             >
               Export Patient
@@ -6977,6 +7243,14 @@ export default function App() {
             <button
               type="button"
               className="btn-today btn-toolbar-export"
+              disabled={!mayExport || isViewer}
+              title={
+                isViewer
+                  ? 'Nur Leseberechtigung'
+                  : !mayExport
+                    ? 'Keine Berechtigung für Exporte'
+                    : undefined
+              }
               onClick={openStaffExportModal}
             >
               Export Mitarbeiter
@@ -6984,6 +7258,14 @@ export default function App() {
             <button
               type="button"
               className="btn-today btn-toolbar-export"
+              disabled={!mayExport || isViewer}
+              title={
+                isViewer
+                  ? 'Nur Leseberechtigung'
+                  : !mayExport
+                    ? 'Keine Berechtigung für Exporte'
+                    : undefined
+              }
               onClick={openRoomExportModal}
             >
               Export Raum
@@ -7004,8 +7286,11 @@ export default function App() {
         </div>
       </header>
 
-      <div className="app-body">
-        <div className="calendar-main-row">
+      <div className="app-body" inert={isViewer ? true : undefined}>
+        <div
+          className={`calendar-main-row${isViewer ? ' calendar-main-row--viewer' : ''}`}
+        >
+          {!isViewer ? (
           <aside
             className="side-panels side-panels--calendar"
             aria-label="Patienten"
@@ -7091,6 +7376,7 @@ export default function App() {
                           <button
                             type="button"
                             className="btn-patient-action"
+                            disabled={!mayPatientWrite}
                             onClick={() => startEditPatient(p)}
                           >
                             Bearbeiten
@@ -7098,6 +7384,7 @@ export default function App() {
                           <button
                             type="button"
                             className="btn-patient-action btn-patient-delete"
+                            disabled={!mayPatientWrite}
                             onClick={() => deletePatient(p)}
                           >
                             Löschen
@@ -7119,6 +7406,7 @@ export default function App() {
                 placeholder="Name"
                 autoComplete="name"
                 aria-label="Patientenname"
+                disabled={!mayPatientWrite}
               />
               <input
                 type="text"
@@ -7128,13 +7416,20 @@ export default function App() {
                 placeholder="Patienten-ID"
                 autoComplete="off"
                 aria-label="Patienten-ID"
+                disabled={!mayPatientWrite}
               />
-              <button type="button" className="btn-add" onClick={addPatient}>
+              <button
+                type="button"
+                className="btn-add"
+                onClick={addPatient}
+                disabled={!mayPatientWrite}
+              >
                 Hinzufügen
               </button>
               </div>
             </section>
         </aside>
+          ) : null}
 
         <div className="main-column main-column--calendar" aria-label="Hauptkalender">
           <div
@@ -7189,14 +7484,20 @@ export default function App() {
                         type="button"
                         className={`staff-week-col-head ${isDToday ? 'is-today' : ''}`}
                         style={{ gridColumn: di + 2, gridRow: 1 }}
-                        onClick={() =>
+                        disabled={!mayStaffAbsences}
+                        onClick={() => {
+                          if (!mayStaffAbsences) return
                           openStaffAbsenceModal({
                             fromDk: dk,
                             toDk: dk,
                             allDay: true,
                           })
+                        }}
+                        title={
+                          !mayStaffAbsences
+                            ? 'Keine Berechtigung für Abwesenheiten'
+                            : 'Ganztägige Abwesenheit für diesen Tag eintragen'
                         }
-                        title="Ganztägige Abwesenheit für diesen Tag eintragen"
                       >
                         <span className="staff-week-col-wd">
                           {d.toLocaleDateString('de-DE', { weekday: 'short' })}
@@ -7368,6 +7669,7 @@ export default function App() {
                                 })
                                 return
                               }
+                              if (!mayStaffAbsences) return
                               openStaffAbsenceModal({
                                 fromDk: dk,
                                 toDk: dk,
@@ -7910,7 +8212,7 @@ export default function App() {
           )}
         </div>
         </div>
-        {belowCalendarPanels}
+        {!isViewer ? belowCalendarPanels : null}
       </div>
 
       {patientExportOpen ? (

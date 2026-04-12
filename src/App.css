@@ -26,6 +26,10 @@
   min-width: 0;
 }
 
+.calendar-main-row--viewer {
+  grid-template-columns: 1fr;
+}
+
 .main-column {
   min-width: 0;
   display: flex;
@@ -1143,9 +1147,23 @@
 .app-title-row {
   display: flex;
   align-items: center;
-  gap: 0.12rem;
+  justify-content: space-between;
+  gap: 1rem 1.5rem;
   flex-wrap: wrap;
   margin-bottom: 1rem;
+}
+
+.app-title-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.12rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.app-title-row > .toolbar-account {
+  margin-left: auto;
+  flex-shrink: 0;
 }
 
 .app-logo {
