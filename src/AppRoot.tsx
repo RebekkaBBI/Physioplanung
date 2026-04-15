@@ -6,9 +6,20 @@ import { LoginScreen } from './cloud/LoginScreen'
 export function AppRoot() {
   const configured = isSupabaseConfigured()
   const { session, loading, profile, profileError } = useAuth()
+  const allowLocalMode = import.meta.env.DEV
 
   if (!configured) {
-    return <App cloudSyncEnabled={false} />
+    if (allowLocalMode) {
+      return <App cloudSyncEnabled={false} />
+    }
+    return (
+      <div className="app cloud-loading">
+        <p className="cloud-loading-text">
+          Cloud-Anmeldung ist nicht konfiguriert. Bitte VITE_SUPABASE_URL und
+          VITE_SUPABASE_ANON_KEY im Hosting setzen.
+        </p>
+      </div>
+    )
   }
 
   if (loading) {
