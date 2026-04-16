@@ -197,6 +197,12 @@ body {
   color: #fff;
 }
 
+.login-cloud-submit.login-cloud-submit--secondary {
+  background: transparent;
+  color: var(--accent-strong);
+  border: 1px solid var(--accent-border);
+}
+
 .login-cloud-submit:disabled {
   opacity: 0.65;
   cursor: not-allowed;
