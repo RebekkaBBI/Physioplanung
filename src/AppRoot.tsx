@@ -2,6 +2,12 @@ import App from './App'
 import { useAuth } from './cloud/useAuth'
 import { isSupabaseConfigured } from './cloud/config'
 import { LoginScreen } from './cloud/LoginScreen'
+import { ResetPasswordScreen } from './cloud/ResetPasswordScreen'
+
+function isPasswordRecoveryFlow(): boolean {
+  const h = window.location.hash || ''
+  return /(?:^|[&#?])type=recovery(?:$|[&#])/.test(h)
+}
 
 export function AppRoot() {
   const configured = isSupabaseConfigured()
@@ -20,6 +26,11 @@ export function AppRoot() {
         </p>
       </div>
     )
+  }
+
+  // Supabase Password-Recovery Link: User soll ein neues Passwort setzen können.
+  if (isPasswordRecoveryFlow()) {
+    return <ResetPasswordScreen />
   }
 
   if (loading) {
