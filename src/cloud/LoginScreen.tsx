@@ -35,7 +35,7 @@ export function LoginScreen() {
     }
     setBusy(true)
     const { error: err } = await supabase.auth.resetPasswordForEmail(toEmail, {
-      redirectTo: window.location.origin,
+      redirectTo: `${window.location.origin}/reset-password`,
     })
     setBusy(false)
     if (err) {

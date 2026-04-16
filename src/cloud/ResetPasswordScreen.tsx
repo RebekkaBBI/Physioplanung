@@ -71,7 +71,7 @@ export function ResetPasswordScreen() {
             <button
               type="button"
               className="login-cloud-submit"
-              onClick={() => (window.location.href = window.location.pathname)}
+              onClick={() => (window.location.href = '/')}
             >
               Zur Anmeldung
             </button>
