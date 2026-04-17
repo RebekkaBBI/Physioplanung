@@ -9,6 +9,7 @@ import {
 import { AuthContext, type AuthState } from './authContextCore'
 import { isSupabaseConfigured } from './config'
 import { getSupabaseBrowserClient } from './supabaseClient'
+import { flushPendingWorkspaceWrites } from './workspaceSync'
 import type { AppRole, UserProfile } from './types'
 
 /** Max. Cloud-Sitzung ab erstem Login (Supabase erneuert JWTs sonst unbegrenzt). */
@@ -122,6 +123,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const signOut = useCallback(async () => {
     try {
       sessionStorage.removeItem(CLOUD_SESSION_STARTED_AT_KEY)
+    } catch {
+      /* ignore */
+    }
+    try {
+      await flushPendingWorkspaceWrites()
     } catch {
       /* ignore */
     }

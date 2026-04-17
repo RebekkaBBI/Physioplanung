@@ -27,6 +27,7 @@ import { useAuth } from './cloud/useAuth'
 import { can } from './cloud/permissions'
 import {
   fetchWorkspaceDocuments,
+  flushPendingWorkspaceWrites,
   scheduleWorkspaceUpsert,
 } from './cloud/workspaceSync'
 
@@ -4336,6 +4337,35 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     weekParity: 'even' | 'odd'
   } | null>(null)
   const [cloudHydrated, setCloudHydrated] = useState(!cloudSyncEnabled)
+
+  useEffect(() => {
+    if (!cloudSyncEnabled) return
+    const onSaveErr = (e: Event) => {
+      const msg = (e as CustomEvent<{ message?: string }>).detail?.message ?? ''
+      alertOnce(
+        `Speichern in der Cloud ist fehlgeschlagen.${msg ? ` (${msg})` : ''} Prüfen Sie Ihre Rolle (admin/planung/therapie — nicht „viewer“), ob die Tabellen-Migration in Supabase läuft und die Netzwerkverbindung.`,
+      )
+    }
+    window.addEventListener('physio-workspace-save-error', onSaveErr)
+    return () =>
+      window.removeEventListener('physio-workspace-save-error', onSaveErr)
+  }, [cloudSyncEnabled])
+
+  useEffect(() => {
+    if (!cloudSyncEnabled) return
+    const flush = () => {
+      void flushPendingWorkspaceWrites()
+    }
+    const onVis = () => {
+      if (document.visibilityState === 'hidden') flush()
+    }
+    window.addEventListener('pagehide', flush)
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      window.removeEventListener('pagehide', flush)
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [cloudSyncEnabled])
 
   useEffect(() => {
     if (!cloudSyncEnabled) {
