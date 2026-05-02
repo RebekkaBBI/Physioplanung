@@ -1437,7 +1437,7 @@ async function downloadPatientAppointmentsPdf(
   rows: PatientAppointmentExportRow[],
   fileBase: string,
 ) {
-  const templateUrl = `${import.meta.env.BASE_URL}BBI.pdf`
+  const templateUrl = '/BBI.pdf'
   let templateBytes: ArrayBuffer
   try {
     const res = await fetch(templateUrl)
@@ -1692,7 +1692,7 @@ async function downloadStaffAppointmentsPdf(
   rows: StaffAppointmentExportRow[],
   fileBase: string,
 ) {
-  const templateUrl = `${import.meta.env.BASE_URL}BBI.pdf`
+  const templateUrl = '/BBI.pdf'
   let templateBytes: ArrayBuffer
   try {
     const res = await fetch(templateUrl)
@@ -5373,7 +5373,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     const selected = teamMeetingSelectedIds
 
     setSlotCells((prev) => {
-      let next = { ...prev }
+      const next = { ...prev }
       const { start, end } = findBlockBounds(prev, dk, room, anchorSlot)
       const span = end - start + 1
 

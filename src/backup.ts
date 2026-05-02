@@ -56,7 +56,7 @@ export function writeRotatingBackup(payload: string): void {
   } catch {
     meta = { writeIndex: 0 }
   }
-  let idx =
+  const idx =
     typeof meta.writeIndex === 'number' &&
     Number.isFinite(meta.writeIndex) &&
     meta.writeIndex >= 0 &&

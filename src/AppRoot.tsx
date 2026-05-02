@@ -18,7 +18,7 @@ function isPasswordRecoveryFlow(): boolean {
 export function AppRoot() {
   const configured = isSupabaseConfigured()
   const { session, loading, profile, profileError } = useAuth()
-  const allowLocalMode = import.meta.env.DEV
+  const allowLocalMode = process.env.NODE_ENV === 'development'
 
   if (!configured) {
     if (allowLocalMode) {

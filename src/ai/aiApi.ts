@@ -3,10 +3,10 @@
  * YELLOW_AI — API-Schnittstelle für KI-Interaktion (OpenAI-kompatibles Chat)
  * Im Projekt suchen: YELLOW_AI
  *
- * Konfiguration (optional, Vite): .env mit
- *   VITE_AI_BASE_URL   z. B. https://api.openai.com/v1
- *   VITE_AI_API_KEY    Bearer-Token (nur clientseitig; Produktion: eigener Proxy!)
- *   VITE_AI_MODEL      z. B. gpt-4o-mini
+ * Konfiguration (optional, Next.js): .env.local mit
+ *   NEXT_PUBLIC_AI_BASE_URL   z. B. https://api.openai.com/v1
+ *   NEXT_PUBLIC_AI_API_KEY    Bearer-Token (nur clientseitig; Produktion: eigener Proxy!)
+ *   NEXT_PUBLIC_AI_MODEL      z. B. gpt-4o-mini
  *
  * Ohne .env: baseUrl/apiKey leer → Aufruf wirft hilfreichen Fehler.
  * ============================================================================
@@ -46,9 +46,9 @@ function normalizeBaseUrl(url: string): string {
 
 function configFromEnv(): AiClientConfig {
   return {
-    baseUrl: (import.meta.env.VITE_AI_BASE_URL ?? '').trim(),
-    apiKey: (import.meta.env.VITE_AI_API_KEY ?? '').trim() || undefined,
-    defaultModel: (import.meta.env.VITE_AI_MODEL ?? 'gpt-4o-mini').trim(),
+    baseUrl: (process.env.NEXT_PUBLIC_AI_BASE_URL ?? '').trim(),
+    apiKey: (process.env.NEXT_PUBLIC_AI_API_KEY ?? '').trim() || undefined,
+    defaultModel: (process.env.NEXT_PUBLIC_AI_MODEL ?? 'gpt-4o-mini').trim(),
     chatCompletionsPath: DEFAULT_CHAT_PATH,
   }
 }

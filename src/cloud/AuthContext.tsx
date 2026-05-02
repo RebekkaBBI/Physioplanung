@@ -138,7 +138,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setProfileError(null)
   }, [])
 
-  signOutRef.current = signOut
+  useEffect(() => {
+    signOutRef.current = signOut
+  }, [signOut])
 
   useEffect(() => {
     if (!isSupabaseConfigured() || !session) return
