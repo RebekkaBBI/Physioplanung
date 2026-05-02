@@ -1,6 +1,8 @@
-import { getSupabaseBrowserClient } from './supabaseClient'
+import { upsertWorkspaceDocumentAction, fetchWorkspaceDocumentsAction } from '@/actions/workspace'
+import { isSupabaseConfigured } from './config'
+import type { WorkspaceDocType } from './workspaceDocTypes'
 
-export type WorkspaceDocType = 'slots' | 'panels' | 'ui'
+export type { WorkspaceDocType } from './workspaceDocTypes'
 
 const SAVE_ERROR_EVENT = 'physio-workspace-save-error'
 
@@ -27,19 +29,13 @@ async function runUpsert(
   docType: WorkspaceDocType,
   body: unknown,
 ): Promise<void> {
-  const supabase = getSupabaseBrowserClient()
-  if (!supabase) return
-  const { error } = await supabase.from('workspace_documents').upsert(
-    {
-      organization_id: organizationId,
-      doc_type: docType,
-      body: body as Record<string, unknown>,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: 'organization_id,doc_type' },
+  const result = await upsertWorkspaceDocumentAction(
+    organizationId,
+    docType,
+    body,
   )
-  if (error) {
-    dispatchSaveError(error.message)
+  if (!result.ok) {
+    dispatchSaveError(result.error)
   }
 }
 
@@ -60,8 +56,7 @@ function runDebounced(
 }
 
 /**
- * Speichert workspace_documents mit Debounce. Fehler (z. B. RLS) werden geloggt
- * und als Event gemeldet — vorher wurden Fehler still verschluckt.
+ * Speichert workspace_documents mit Debounce über Server Action (Session aus Cookie).
  */
 export function scheduleWorkspaceUpsert(
   organizationId: string,
@@ -69,8 +64,7 @@ export function scheduleWorkspaceUpsert(
   body: unknown,
   debounceMs = 400,
 ): void {
-  const supabase = getSupabaseBrowserClient()
-  if (!supabase) return
+  if (!isSupabaseConfigured()) return
   const key = `${organizationId}:${docType}`
   pendingBodies.set(key, { organizationId, docType, body })
   runDebounced(key, debounceMs, () => {
@@ -80,10 +74,6 @@ export function scheduleWorkspaceUpsert(
   })
 }
 
-/**
- * Alle ausstehenden (noch nicht ausgeführten) Speicherungen sofort ausführen.
- * Wichtig vor Tab-Schließen / Logout, damit kein Debounce Daten verwirft.
- */
 export async function flushPendingWorkspaceWrites(): Promise<void> {
   const keys = [...timers.keys()]
   const tasks: Promise<void>[] = []
@@ -102,22 +92,10 @@ export async function flushPendingWorkspaceWrites(): Promise<void> {
 export async function fetchWorkspaceDocuments(
   organizationId: string,
 ): Promise<Partial<Record<WorkspaceDocType, unknown>>> {
-  const supabase = getSupabaseBrowserClient()
-  if (!supabase) return {}
-  const { data, error } = await supabase
-    .from('workspace_documents')
-    .select('doc_type, body')
-    .eq('organization_id', organizationId)
-  if (error) {
-    console.error('fetchWorkspaceDocuments', error.message)
+  const res = await fetchWorkspaceDocumentsAction(organizationId)
+  if (!res.ok) {
+    console.error('fetchWorkspaceDocuments', res.error)
     return {}
   }
-  const out: Partial<Record<WorkspaceDocType, unknown>> = {}
-  for (const row of data ?? []) {
-    const t = row.doc_type as WorkspaceDocType
-    if (t === 'slots' || t === 'panels' || t === 'ui') {
-      out[t] = row.body
-    }
-  }
-  return out
+  return res.data
 }

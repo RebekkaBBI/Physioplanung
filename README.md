@@ -37,3 +37,14 @@ Unter **Authentication → URL Configuration** u. a.:
 ## Deployment
 
 Vercel erkennt Next.js automatisch. Die frühere `vercel.json`-SPA-Rewrite wurde entfernt.
+
+## Architektur (Supabase + Next.js)
+
+- **`@supabase/ssr`**: Browser-Client (`createBrowserClient`) und Server-Client (`createServerClient`) mit Cookies.
+- **`middleware.ts`**: Aktualisiert die Auth-Session (Refresh), bevor App/API laufen.
+- **Server Actions** (`src/actions/workspace.ts`): Lesen/Schreiben von `workspace_documents` mit `getUser()` + Prüfung `profiles.organization_id` (zusätzlich zu RLS).
+- **API (optional)**:
+  - `GET /api/auth/session` — nur mit gültiger Session: `{ authenticated, userId, email }`, sonst 401.
+  - `POST /api/workspace` — JSON `{ "organization_id", "doc_type": "slots"|"panels"|"ui", "body" }`, sonst 401/403.
+
+Es wird **kein** `service_role`-Key im Browser oder in diesen Routen verwendet; Schutz über Session + RLS + Organisations-Check.
