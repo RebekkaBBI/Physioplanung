@@ -36,7 +36,22 @@ Unter **Authentication → URL Configuration** u. a.:
 
 ## Deployment
 
-Vercel erkennt Next.js automatisch. Die frühere `vercel.json`-SPA-Rewrite wurde entfernt.
+Vercel nutzt **Next.js** (Ausgabe unter `.next`, **nicht** `dist`).
+
+### Wenn der Build fehlschlägt: „No Output Directory named dist“
+
+Das Projekt war früher **Vite** (`dist`). In Vercel die Einstellung zurücksetzen:
+
+1. **Project → Settings → General**
+2. Abschnitt **Build & Development Settings**
+3. **Framework Preset:** `Next.js` (oder „Override“ aus, damit Auto-Erkennung greift)
+4. **Output Directory:** leer lassen bzw. **Override deaktivieren** — dort darf **nicht** `dist` stehen
+5. **Build Command:** leer lassen (Standard: `next build`) oder explizit `next build`
+6. Speichern und **Redeploy**
+
+Im Repo liegt `vercel.json` nur mit `"framework": "nextjs"` zur Orientierung — ohne `outputDirectory`.
+
+Die frühere SPA-`vercel.json` mit Rewrite auf `index.html` ist entfernt (würde Next.js stören).
 
 ## Architektur (Supabase + Next.js)
 
