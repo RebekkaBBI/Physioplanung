@@ -80,10 +80,16 @@ export async function fetchWorkspaceDocumentsAction(
     slots: null,
     panels: null,
     ui: null,
+    role_permissions: null,
   }
   for (const row of data ?? []) {
     const t = row.doc_type as WorkspaceDocType
-    if (t === 'slots' || t === 'panels' || t === 'ui') {
+    if (
+      t === 'slots' ||
+      t === 'panels' ||
+      t === 'ui' ||
+      t === 'role_permissions'
+    ) {
       out[t] = row.body
       versions[t] = row.updated_at
     }

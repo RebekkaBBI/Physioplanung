@@ -25,7 +25,16 @@ import './App.css'
 import { startWeeklyBackupScheduler } from './backup'
 // YELLOW_AI: KI-API (Chat) — siehe src/ai/ (Suche: YELLOW_AI)
 import { useAuth } from './cloud/useAuth'
-import { can } from './cloud/permissions'
+import {
+  ALL_CAPABILITIES,
+  buildFullRoleCapabilityMatrix,
+  can,
+  CAPABILITY_LABEL_DE,
+  parseRoleCapabilityDocument,
+  roleCapabilityDocumentBody,
+  type Capability,
+  type RoleCapabilityMatrix,
+} from './cloud/permissions'
 import { getSupabaseBrowserClient } from './cloud/supabaseClient'
 import type { AppRole } from './cloud/types'
 import {
@@ -4240,12 +4249,19 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     cloudSyncEnabled && profile?.organization_id
       ? profile.organization_id
       : null
-  const mayPatientWrite = can(appRole, 'patients:write')
-  const mayArtenWrite = can(appRole, 'arten:write')
-  const mayMusterWrite = can(appRole, 'muster:write')
-  const mayStaffWrite = can(appRole, 'staff:write')
-  const mayStaffAbsences = can(appRole, 'staff:absences')
-  const mayExport = can(appRole, 'export:run')
+  const [roleCapabilityMatrix, setRoleCapabilityMatrix] =
+    useState<RoleCapabilityMatrix | null>(null)
+
+  const mayPatientWrite = can(appRole, 'patients:write', roleCapabilityMatrix)
+  const mayArtenWrite = can(appRole, 'arten:write', roleCapabilityMatrix)
+  const mayMusterWrite = can(appRole, 'muster:write', roleCapabilityMatrix)
+  const mayStaffWrite = can(appRole, 'staff:write', roleCapabilityMatrix)
+  const mayStaffAbsences = can(appRole, 'staff:absences', roleCapabilityMatrix)
+  const mayExport = can(appRole, 'export:run', roleCapabilityMatrix)
+  const mayCalendarWrite = can(appRole, 'calendar:write', roleCapabilityMatrix)
+  const mayCalendarWriteRef = useRef(true)
+  mayCalendarWriteRef.current = mayCalendarWrite
+
   const isViewer = cloudSyncEnabled && appRole === 'viewer'
   const isCloudAdmin = cloudSyncEnabled && appRole === 'admin'
 
@@ -4276,6 +4292,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   const setSlotCells = useCallback(
     (updater: SetStateAction<Record<string, CellData>>) => {
+      if (cloudSyncEnabled && !mayCalendarWriteRef.current) return
       setSlotCellsBase((prev) => {
         slotUndoStackRef.current.push(cloneSlotMap(prev))
         if (slotUndoStackRef.current.length > SLOT_UNDO_MAX) {
@@ -4290,14 +4307,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         return next
       })
     },
-    [],
+    [cloudSyncEnabled],
   )
 
   const undoSlotCells = useCallback(() => {
+    if (cloudSyncEnabled && !mayCalendarWrite) return
     const snap = slotUndoStackRef.current.pop()
     if (!snap) return
     setSlotCellsBase(cloneSlotMap(snap))
-  }, [])
+  }, [cloudSyncEnabled, mayCalendarWrite])
   const [patients, setPatients] = useState<PatientItem[]>(
     () => initialPanels?.patients ?? DEFAULT_PATIENTS,
   )
@@ -4467,10 +4485,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   useEffect(() => {
     if (!cloudSyncEnabled) {
+      setRoleCapabilityMatrix(null)
       setCloudHydrated(true)
       return
     }
     if (!organizationId) {
+      setRoleCapabilityMatrix(null)
       setCloudHydrated(false)
       return
     }
@@ -4501,6 +4521,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             setViewMode(ui.viewMode)
             setAnchorDate(parseDateKey(ui.anchorDateKey))
           }
+        }
+        if (byType.role_permissions !== undefined) {
+          setRoleCapabilityMatrix(
+            parseRoleCapabilityDocument(byType.role_permissions),
+          )
+        } else {
+          setRoleCapabilityMatrix(null)
         }
       } catch (e) {
         console.error('Cloud-Hydration', e)
@@ -4568,6 +4595,27 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       people: buckets.get(role) ?? [],
     }))
   }, [adminOrgProfiles])
+
+  const adminRoleMatrixFull = useMemo(
+    () => buildFullRoleCapabilityMatrix(roleCapabilityMatrix),
+    [roleCapabilityMatrix],
+  )
+
+  const updateRoleCapabilitySwitch = useCallback(
+    (role: AppRole, cap: Capability, enabled: boolean) => {
+      if (!organizationId) return
+      const nextFull = buildFullRoleCapabilityMatrix(roleCapabilityMatrix)
+      nextFull[role][cap] = enabled
+      setRoleCapabilityMatrix(nextFull)
+      scheduleWorkspaceUpsert(
+        organizationId,
+        'role_permissions',
+        roleCapabilityDocumentBody(nextFull),
+        650,
+      )
+    },
+    [organizationId, roleCapabilityMatrix],
+  )
 
   /* Automatisches Speichern: Kalender, Stammdaten, Ansicht — bei jeder Änderung */
   useEffect(() => {
@@ -5241,6 +5289,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       e.preventDefault()
       setDragOverKey(null)
       setArtDragHighlight(null)
+      if (cloudSyncEnabled && !mayCalendarWrite) {
+        dragSourceRef.current = null
+        setMusterEditorDragOverKey(null)
+        setArtDragHighlight(null)
+        return
+      }
       if (calendarTabId !== 'main') return
       const payload = parseDragPayload(e.dataTransfer)
       if (!payload) return
@@ -5261,7 +5315,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       }
       applyDrop(dk, room, slotIndex, payload)
     },
-    [applyDrop, applyMoveBlock, applyResizeBlock, calendarTabId],
+    [
+      applyDrop,
+      applyMoveBlock,
+      applyResizeBlock,
+      calendarTabId,
+      cloudSyncEnabled,
+      mayCalendarWrite,
+    ],
   )
 
   const handleDropOnWeekCell = useCallback(
@@ -5269,6 +5330,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       e.preventDefault()
       setDragOverKey(null)
       setArtDragHighlight(null)
+      if (cloudSyncEnabled && !mayCalendarWrite) {
+        dragSourceRef.current = null
+        setMusterEditorDragOverKey(null)
+        setArtDragHighlight(null)
+        return
+      }
       if (calendarTabId !== 'main') return
       const payload = parseDragPayload(e.dataTransfer)
       if (!payload) return
@@ -5365,10 +5432,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       mitarbeiter,
       calendarTabId,
       setSlotCells,
+      cloudSyncEnabled,
+      mayCalendarWrite,
     ],
   )
 
   const toggleSlot = useCallback((dk: string, room: Room, slotIndex: number) => {
+    if (cloudSyncEnabled && !mayCalendarWrite) return
     const k = makeSlotKey(dk, room, slotIndex)
     setSlotCells((prev) => {
       const next = { ...prev }
@@ -5379,7 +5449,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       }
       return next
     })
-  }, [setSlotCells])
+  }, [setSlotCells, cloudSyncEnabled, mayCalendarWrite])
 
   const closeTerminPickerModal = useCallback(() => {
     setTerminPickerModal(null)
@@ -7097,37 +7167,93 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         >
           <h2 className="panel-title">Rollenübersicht</h2>
           <p className="roles-overview-hint">
-            Anmeldungen in Ihrer Organisation nach Zugriffsrolle (Cloud-Konto) —
-            getrennt von der Therapeutenliste oben.
+            Anmeldungen nach Cloud-Rolle (getrennt von der Therapeutenliste) und
+            welche Rolle welche Aktion ausführen darf. Schalter speichern die
+            Matrix in der Organisation.
           </p>
-          {adminOrgProfilesLoading ? (
-            <p className="roles-overview-muted">Lade Konten …</p>
-          ) : adminOrgProfilesError ? (
-            <p className="roles-overview-muted" role="alert">
-              {adminOrgProfilesError}
-            </p>
-          ) : (
-            <div className="roles-overview-body">
-              {adminOrgProfilesByRole.map(({ role, people }) => (
-                <div key={role} className="roles-overview-group">
-                  <h3 className="roles-overview-role-title">
-                    {cloudRoleLabelDe(role)}
-                  </h3>
-                  {people.length === 0 ? (
-                    <p className="roles-overview-muted">—</p>
-                  ) : (
-                    <ul className="roles-overview-names">
-                      {people.map((p) => (
-                        <li key={p.id}>
-                          {p.display_name?.trim() || 'Kein Anzeigename'}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
+          <div className="roles-overview-layout">
+            <div className="roles-overview-accounts-col">
+              <h3 className="roles-overview-subtitle">Konten</h3>
+              {adminOrgProfilesLoading ? (
+                <p className="roles-overview-muted">Lade Konten …</p>
+              ) : adminOrgProfilesError ? (
+                <p className="roles-overview-muted" role="alert">
+                  {adminOrgProfilesError}
+                </p>
+              ) : (
+                <div className="roles-overview-body roles-overview-body--accounts">
+                  {adminOrgProfilesByRole.map(({ role, people }) => (
+                    <div key={role} className="roles-overview-group">
+                      <h4 className="roles-overview-role-title">
+                        {cloudRoleLabelDe(role)}
+                      </h4>
+                      {people.length === 0 ? (
+                        <p className="roles-overview-muted">—</p>
+                      ) : (
+                        <ul className="roles-overview-names">
+                          {people.map((p) => (
+                            <li key={p.id}>
+                              {p.display_name?.trim() || 'Kein Anzeigename'}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  ))}
                 </div>
-              ))}
+              )}
             </div>
-          )}
+            <div className="roles-overview-matrix-col">
+              <h3 className="roles-overview-subtitle">Berechtigungen</h3>
+              <p className="roles-overview-hint roles-matrix-hint">
+                Pro Rolle ein Schalter pro Recht. Deaktivierte Rechte gelten nach
+                dem nächsten Speichern für alle Konten dieser Rolle.
+              </p>
+              <div className="roles-permissions-table-wrap">
+                <table className="roles-permissions-table">
+                  <thead>
+                    <tr>
+                      <th scope="col" className="roles-permissions-cap-col">
+                        Berechtigung
+                      </th>
+                      {CLOUD_ROLE_ORDER.map((role) => (
+                        <th key={role} scope="col" className="roles-permissions-role-col">
+                          {cloudRoleLabelDe(role)}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ALL_CAPABILITIES.map((cap) => (
+                      <tr key={cap}>
+                        <th scope="row" className="roles-permissions-cap-col">
+                          {CAPABILITY_LABEL_DE[cap]}
+                        </th>
+                        {CLOUD_ROLE_ORDER.map((role) => (
+                          <td key={`${cap}-${role}`} className="roles-permissions-switch-cell">
+                            <button
+                              type="button"
+                              role="switch"
+                              className="muster-art-avail-switch roles-permission-switch"
+                              aria-checked={adminRoleMatrixFull[role][cap]}
+                              aria-label={`${cloudRoleLabelDe(role)}: ${CAPABILITY_LABEL_DE[cap]}`}
+                              onClick={() =>
+                                updateRoleCapabilitySwitch(
+                                  role,
+                                  cap,
+                                  !adminRoleMatrixFull[role][cap],
+                                )
+                              }
+                            />
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
         </section>
       ) : null}
     </div>

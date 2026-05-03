@@ -123,7 +123,12 @@ export async function fetchWorkspaceDocuments(
     console.error('fetchWorkspaceDocuments', res.error)
     return {}
   }
-  for (const t of ['slots', 'panels', 'ui'] as const) {
+  for (const t of [
+    'slots',
+    'panels',
+    'ui',
+    'role_permissions',
+  ] as const) {
     workspaceDocVersions.set(`${organizationId}:${t}`, res.versions[t])
   }
   return res.data

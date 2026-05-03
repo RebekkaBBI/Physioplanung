@@ -113,12 +113,97 @@
   line-height: 1.35;
 }
 
-.panel-roles-overview .roles-overview-body {
+.panel-roles-overview .roles-overview-layout {
+  display: grid;
+  grid-template-columns: minmax(11rem, 1fr) minmax(0, 2.2fr);
+  gap: 1rem 1.25rem;
+  align-items: start;
   flex: 1 1 auto;
   min-height: 0;
-  max-height: 14rem;
+  max-height: 22rem;
+  overflow: hidden;
+}
+
+@media (max-width: 900px) {
+  .panel-roles-overview .roles-overview-layout {
+    grid-template-columns: 1fr;
+    max-height: none;
+  }
+}
+
+.panel-roles-overview .roles-overview-subtitle {
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin: 0 0 0.35rem;
+  color: var(--text-muted);
+}
+
+.panel-roles-overview .roles-overview-body--accounts {
+  max-height: 11rem;
   overflow-y: auto;
   padding-right: 0.25rem;
+}
+
+.panel-roles-overview .roles-matrix-hint {
+  margin-top: 0;
+  margin-bottom: 0.45rem;
+}
+
+.panel-roles-overview .roles-permissions-table-wrap {
+  overflow: auto;
+  max-height: 14rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.panel-roles-overview .roles-permissions-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.panel-roles-overview .roles-permissions-table th,
+.panel-roles-overview .roles-permissions-table td {
+  padding: 0.3rem 0.4rem;
+  border-bottom: 1px solid var(--border-subtle);
+  text-align: center;
+  vertical-align: middle;
+}
+
+.panel-roles-overview .roles-permissions-table tbody tr:last-child th,
+.panel-roles-overview .roles-permissions-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.panel-roles-overview .roles-permissions-cap-col {
+  text-align: left;
+  font-weight: 500;
+  white-space: nowrap;
+  position: sticky;
+  left: 0;
+  background: var(--surface);
+  z-index: 1;
+  box-shadow: 1px 0 0 var(--border-subtle);
+}
+
+.panel-roles-overview .roles-permissions-role-col {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  max-width: 5.5rem;
+  line-height: 1.2;
+}
+
+.panel-roles-overview .roles-permissions-switch-cell {
+  padding: 0.25rem;
+}
+
+.panel-roles-overview .roles-permission-switch {
+  display: block;
+  margin: 0 auto;
+  transform: scale(0.88);
 }
 
 .panel-roles-overview .roles-overview-group + .roles-overview-group {
