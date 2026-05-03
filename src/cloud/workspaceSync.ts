@@ -9,6 +9,8 @@ const SAVE_ERROR_EVENT = 'physio-workspace-save-error'
 const timers = new Map<string, ReturnType<typeof setTimeout>>()
 /** Letzter bekannter updated_at pro Org+Dokument (Optimistic Lock) */
 const workspaceDocVersions = new Map<string, string | null>()
+/** Serielle Ausführung pro Key — verhindert parallele Upserts mit veraltetem base */
+const upsertTailByKey = new Map<string, Promise<void>>()
 /** Letzter Stand pro Dokument — für Debounce und Flush beim Tab-Schließen */
 const pendingBodies = new Map<
   string,
@@ -26,7 +28,7 @@ function dispatchSaveError(message: string) {
   console.error('workspace_documents upsert:', message)
 }
 
-async function runUpsert(
+async function runUpsertOnce(
   organizationId: string,
   docType: WorkspaceDocType,
   body: unknown,
@@ -44,6 +46,21 @@ async function runUpsert(
     return
   }
   workspaceDocVersions.set(key, result.updated_at)
+}
+
+/** Reiht Upserts pro Org+Dokument hintereinander (kein paralleles „stale base“). */
+function enqueueUpsert(
+  organizationId: string,
+  docType: WorkspaceDocType,
+  body: unknown,
+): Promise<void> {
+  const key = `${organizationId}:${docType}`
+  const prev = upsertTailByKey.get(key) ?? Promise.resolve()
+  const next = prev
+    .catch(() => {})
+    .then(() => runUpsertOnce(organizationId, docType, body))
+  upsertTailByKey.set(key, next)
+  return next
 }
 
 function runDebounced(
@@ -77,7 +94,7 @@ export function scheduleWorkspaceUpsert(
   runDebounced(key, debounceMs, () => {
     const row = pendingBodies.get(key)
     if (!row) return
-    void runUpsert(row.organizationId, row.docType, row.body)
+    void enqueueUpsert(row.organizationId, row.docType, row.body)
   })
 }
 
@@ -90,7 +107,9 @@ export async function flushPendingWorkspaceWrites(): Promise<void> {
     timers.delete(key)
     const row = pendingBodies.get(key)
     if (row) {
-      tasks.push(runUpsert(row.organizationId, row.docType, row.body))
+      tasks.push(
+        enqueueUpsert(row.organizationId, row.docType, row.body),
+      )
     }
   }
   await Promise.all(tasks)
