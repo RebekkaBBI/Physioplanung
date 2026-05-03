@@ -5,6 +5,7 @@ import { LoginScreen } from './cloud/LoginScreen'
 import { ResetPasswordScreen } from './cloud/ResetPasswordScreen'
 
 function isPasswordRecoveryFlow(): boolean {
+  if (typeof window === 'undefined') return false
   const normalizedPath = window.location.pathname.replace(/\/+$/, '') || '/'
   if (normalizedPath === '/reset-password') return true
   const h = window.location.hash || ''
