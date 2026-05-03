@@ -5019,39 +5019,46 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         if (payload.kind === 'staff') {
           const s = staffById(payload.id)
           if (!s) return prev
-          const k0 = makeSlotKey(dk, room, startSlot)
-          const cur0 = prev[k0]
-          if (findArtIdForCell(cur0, arten) === TEAM_MEETING_ART_ID) {
+          const { start, end } = findBlockBounds(prev, dk, room, startSlot)
+          const startK = makeSlotKey(dk, room, start)
+          if (!isCellBooked(prev[startK])) return prev
+          const anchorCell = prev[startK]
+          if (findArtIdForCell(anchorCell, arten) === TEAM_MEETING_ART_ID) {
             alertOnce(
               'Teammeetings: Teilnehmer bitte im Termin-Dialog (Klick auf den Termin) auswählen.',
             )
             return prev
           }
-          if (isStaffAbsentAtSlot(s, dk, startSlot)) {
-            alertOnce(
-              'Der Mitarbeiter ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.',
-            )
-            return prev
+          for (let sl = start; sl <= end; sl++) {
+            if (isStaffAbsentAtSlot(s, dk, sl)) {
+              alertOnce(
+                'Der Mitarbeiter ist in diesem Zeitraum als abwesend (Urlaub/Abwesenheit) eingetragen.',
+              )
+              return prev
+            }
+            if (!isStaffSlotAvailable(s, wd, sl, dk)) {
+              alertOnce(
+                'Dieser Mitarbeiter ist zu dieser Zeit in seinem Wochenplan nicht als verfügbar markiert.',
+              )
+              return prev
+            }
+            const kk = makeSlotKey(dk, room, sl)
+            const curSl = prev[kk]
+            const artId = findArtIdForCell(curSl, arten)
+            if (artId && !staffHasArtAllowed(s, artId)) {
+              alertOnce(
+                'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
+              )
+              return prev
+            }
           }
-          if (!isStaffSlotAvailable(s, wd, startSlot, dk)) {
-            alertOnce(
-              'Dieser Mitarbeiter ist zu dieser Zeit in seinem Wochenplan nicht als verfügbar markiert.',
-            )
-            return prev
+          const next = { ...prev }
+          for (let sl = start; sl <= end; sl++) {
+            const k = makeSlotKey(dk, room, sl)
+            const cur = { ...(next[k] ?? {}) }
+            next[k] = { ...cur, staff: s.name, staffId: s.id }
           }
-          const k = makeSlotKey(dk, room, startSlot)
-          const cur = { ...(prev[k] ?? {}) }
-          const artId = findArtIdForCell(cur, arten)
-          if (artId && !s.allowedArtIds.includes(artId)) {
-            alertOnce(
-              'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
-            )
-            return prev
-          }
-          return {
-            ...prev,
-            [k]: { ...cur, staff: s.name, staffId: s.id },
-          }
+          return next
         }
 
         return prev
