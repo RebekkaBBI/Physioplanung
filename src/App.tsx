@@ -4775,7 +4775,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         ) ?? prev,
       )
     },
-    [arten, mitarbeiter],
+    [arten, mitarbeiter, setSlotCells],
   )
 
   const applyResizeBlock = useCallback(
@@ -4802,7 +4802,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         ) ?? prev,
       )
     },
-    [arten, mitarbeiter],
+    [arten, mitarbeiter, setSlotCells],
   )
 
   const applyDrop = useCallback(
@@ -5056,7 +5056,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         return prev
       })
     },
-    [patients, arten, muster, mitarbeiter, setTerminPickerModal],
+    [patients, arten, muster, mitarbeiter, setTerminPickerModal, setSlotCells],
   )
 
   useEffect(() => {
@@ -5191,7 +5191,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       }
       applyDrop(dk, room, 0, payload)
     },
-    [applyDrop, applyMoveBlock, muster, arten, mitarbeiter, calendarTabId],
+    [
+      applyDrop,
+      applyMoveBlock,
+      muster,
+      arten,
+      mitarbeiter,
+      calendarTabId,
+      setSlotCells,
+    ],
   )
 
   const toggleSlot = useCallback((dk: string, room: Room, slotIndex: number) => {
@@ -5205,7 +5213,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       }
       return next
     })
-  }, [])
+  }, [setSlotCells])
 
   const closeTerminPickerModal = useCallback(() => {
     setTerminPickerModal(null)
@@ -5287,7 +5295,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       })
       setTerminPickerModal(null)
     },
-    [terminPickerModal, mitarbeiter, arten],
+    [terminPickerModal, mitarbeiter, arten, setSlotCells, setTerminPickerModal],
   )
 
   const removeStaffFromTerminBlock = useCallback(() => {
@@ -5307,7 +5315,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       return next
     })
     setTerminPickerModal(null)
-  }, [terminPickerModal])
+  }, [terminPickerModal, setSlotCells, setTerminPickerModal])
 
   const removeTeamParticipantsFromModal = useCallback(() => {
     if (!terminPickerModal || terminPickerModal.kind !== 'teamMeeting') return
@@ -5325,7 +5333,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       return next
     })
     setTerminPickerModal(null)
-  }, [terminPickerModal])
+  }, [terminPickerModal, setSlotCells, setTerminPickerModal])
 
   const applyTeamMeetingParticipantsToSingleOccurrence = useCallback(
     (dk: string, room: Room, anchorSlot: number, selectedIds: string[]) => {
@@ -5361,7 +5369,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         return next
       })
     },
-    [arten, mitarbeiter],
+    [arten, mitarbeiter, setSlotCells],
   )
 
   const saveTeamMeetingFromModal = useCallback(() => {
@@ -5433,6 +5441,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     teamMeetingRepeatWeeks,
     teamMeetingSelectedIds,
     mitarbeiter,
+    setSlotCells,
+    setTerminPickerModal,
   ])
 
   const clearTerminBlockFromModal = useCallback(() => {
@@ -5448,7 +5458,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       return next
     })
     setTerminPickerModal(null)
-  }, [terminPickerModal])
+  }, [terminPickerModal, setSlotCells, setTerminPickerModal])
 
   const openDayForCell = useCallback((d: Date) => {
     setAnchorDate(calendarDate(d))
