@@ -1049,6 +1049,11 @@
   border-right: 1px solid var(--border-subtle);
 }
 
+.slot-cell-shell.slot-cell-shell--op-placeholder {
+  background: color-mix(in srgb, var(--text-muted) 6%, var(--slot-free, #f8fafc));
+  pointer-events: none;
+}
+
 /* Termin über mehrere Zeilen: keine Zwischenlinie unter Start/Mitte */
 .slot-cell-shell.slot-shell--merge-next {
   border-bottom: none;

@@ -93,6 +93,11 @@ const SLOT_MINUTES = 30
 const DAY_START_HOUR = 8
 const DAY_END_HOUR = 22
 
+/** Tab „OP“: Tagesraster 07:00–18:00 (Daten weiter global 08:00–22:00). */
+const OP_TAB_VIEW_START_HOUR = 7
+const OP_TAB_VIEW_END_HOUR = 18
+const CALENDAR_TAB_OP = 'op' as const
+
 const MIME_PHYSIO = 'application/x-physio-planung+json'
 
 const WEEKDAY_SHORT_DE = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']
@@ -270,6 +275,47 @@ function slotIndexToLabel(i: number): string {
   const h = Math.floor(mins / 60)
   const m = mins % 60
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+}
+
+function opViewSlotCount(): number {
+  return ((OP_TAB_VIEW_END_HOUR - OP_TAB_VIEW_START_HOUR) * 60) / SLOT_MINUTES
+}
+
+function opViewIndexToGlobalSlot(viewIndex: number): number | null {
+  const g =
+    viewIndex +
+    ((OP_TAB_VIEW_START_HOUR - DAY_START_HOUR) * 60) / SLOT_MINUTES
+  if (g < 0 || g >= slotCount()) return null
+  return g
+}
+
+function opGlobalSlotToViewIndex(globalSlot: number): number | null {
+  const v =
+    globalSlot +
+    ((DAY_START_HOUR - OP_TAB_VIEW_START_HOUR) * 60) / SLOT_MINUTES
+  if (v < 0 || v >= opViewSlotCount()) return null
+  return v
+}
+
+function opViewSlotIndexToLabel(viewIndex: number): string {
+  const mins = OP_TAB_VIEW_START_HOUR * 60 + viewIndex * SLOT_MINUTES
+  const h = Math.floor(mins / 60)
+  const m = mins % 60
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+}
+
+function opViewGridRowRangeFromGlobalBounds(
+  startG: number,
+  endG: number,
+): { v0: number; v1: number } {
+  let v0 = opGlobalSlotToViewIndex(startG)
+  let v1 = opGlobalSlotToViewIndex(endG)
+  if (v0 === null) v0 = 0
+  if (v1 === null) v1 = opViewSlotCount() - 1
+  v0 = Math.max(0, Math.min(opViewSlotCount() - 1, v0))
+  v1 = Math.max(0, Math.min(opViewSlotCount() - 1, v1))
+  if (v1 < v0) v1 = v0
+  return { v0, v1 }
 }
 
 function makeSlotKey(dateKeyStr: string, room: string, slotIndex: number): string {
@@ -3654,10 +3700,10 @@ function formatAbsencePeriodSummary(p: StaffAbsencePeriod): string {
 /** Gefilterte Kopie: nur Slots mit zugewiesenem MA (gleiche Datenbasis wie Hauptkalender). */
 function projectCellsForCalendarTab(
   cells: Record<string, CellData>,
-  tab: 'main' | string,
+  tab: 'main' | typeof CALENDAR_TAB_OP | string,
   staffList: MitarbeiterItem[],
 ): Record<string, CellData> {
-  if (tab === 'main') return cells
+  if (tab === 'main' || tab === CALENDAR_TAB_OP) return cells
   const staff = staffList.find((s) => s.id === tab)
   if (!staff) return cells
   const next: Record<string, CellData> = {}
@@ -4437,7 +4483,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const dragSourceRef = useRef<'panel' | 'cell' | 'resize' | null>(null)
   const suppressSlotClickAfterDrag = useRef(0)
   /** Hauptkalender-Tab oder Mitarbeiter-ID — MA-Ansicht ist schreibgeschützte gefilterte Kopie */
-  const [calendarTabId, setCalendarTabId] = useState<'main' | string>('main')
+  const [calendarTabId, setCalendarTabId] = useState<
+    'main' | typeof CALENDAR_TAB_OP | string
+  >('main')
   /** Mitarbeiter-Verfügbarkeit: Klick+Ziehen zum Markieren/Demarkieren */
   const staffAvailPaintRef = useRef<{
     active: boolean
@@ -4681,13 +4729,24 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   }, [cloudSyncEnabled])
 
   useEffect(() => {
-    if (calendarTabId !== 'main' || viewMode !== 'day') return
+    if (
+      (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP) ||
+      viewMode !== 'day'
+    ) {
+      return
+    }
     const terminSlot = pendingScrollToTerminSlotRef.current
     if (terminSlot !== null && Number.isFinite(terminSlot)) {
       pendingScrollToTerminSlotRef.current = null
+      const viewRow =
+        calendarTabId === CALENDAR_TAB_OP
+          ? opGlobalSlotToViewIndex(terminSlot)
+          : terminSlot
+      if (calendarTabId === CALENDAR_TAB_OP && viewRow === null) return
+      const scrollRow = viewRow ?? terminSlot
       const scrollToTerminRow = (attempt: number) => {
         const el = dayGridRef.current?.querySelector(
-          `[data-slot-row="${terminSlot}"]`,
+          `[data-slot-row="${scrollRow}"]`,
         )
         if (el) {
           el.scrollIntoView({ block: 'center', behavior: 'smooth' })
@@ -4706,9 +4765,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       now.getHours() * 60 + now.getMinutes() - DAY_START_HOUR * 60
     if (mins < 0 || mins >= (DAY_END_HOUR - DAY_START_HOUR) * 60) return
     const slot = Math.floor(mins / SLOT_MINUTES)
+    const viewRow =
+      calendarTabId === CALENDAR_TAB_OP ? opGlobalSlotToViewIndex(slot) : slot
+    if (calendarTabId === CALENDAR_TAB_OP && viewRow === null) return
+    const scrollRow = viewRow ?? slot
     requestAnimationFrame(() => {
       dayGridRef.current
-        ?.querySelector(`[data-slot-row="${slot}"]`)
+        ?.querySelector(`[data-slot-row="${scrollRow}"]`)
         ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
     })
   }, [calendarTabId, viewMode, anchorDate])
@@ -4775,7 +4838,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const activeDayKey = dateKey(anchorDate)
 
   useEffect(() => {
-    if (calendarTabId === 'main') return
+    if (calendarTabId === 'main' || calendarTabId === CALENDAR_TAB_OP) return
     if (!mitarbeiter.some((s) => s.id === calendarTabId)) {
       setCalendarTabId('main')
     }
@@ -4786,7 +4849,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     [slotCells, calendarTabId, mitarbeiter],
   )
 
-  const isStaffCalendarReadOnly = calendarTabId !== 'main'
+  const isStaffCalendarReadOnly =
+    calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP
 
   const [staffAbsenceModalId, setStaffAbsenceModalId] = useState<string | null>(
     null,
@@ -4807,7 +4871,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   )
 
   const calendarTabStaffMember = useMemo(() => {
-    if (calendarTabId === 'main') return null
+    if (calendarTabId === 'main' || calendarTabId === CALENDAR_TAB_OP)
+      return null
     return mitarbeiter.find((s) => s.id === calendarTabId) ?? null
   }, [calendarTabId, mitarbeiter])
 
@@ -4819,7 +4884,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       startSlot?: number
       endSlot?: number
     }) => {
-      if (calendarTabId === 'main') return
+      if (calendarTabId === 'main' || calendarTabId === CALENDAR_TAB_OP)
+        return
       const from = prefs?.fromDk ?? activeDayKey
       setStaffAbsenceFormFrom(from)
       setStaffAbsenceFormTo(prefs?.toDk ?? from)
@@ -4940,13 +5006,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   }, [mitarbeiter, staffAbsenceModalId])
 
   useEffect(() => {
-    if (calendarTabId !== 'main') setViewMode('week')
+    if (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP) {
+      setViewMode('week')
+    }
   }, [calendarTabId])
 
   const goToday = useCallback(() => {
     const today = calendarDate(new Date())
     setAnchorDate(today)
-    if (calendarTabId === 'main') {
+    if (calendarTabId === 'main' || calendarTabId === CALENDAR_TAB_OP) {
       setViewMode('day')
       pendingScrollToNow.current = true
     } else {
@@ -5295,7 +5363,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         setArtDragHighlight(null)
         return
       }
-      if (calendarTabId !== 'main') return
+      if (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP) return
+      // Day grid always passes global slot indices (OP rows map view→global before render).
+      const globalSlot = slotIndex
+      if (globalSlot < 0 || globalSlot >= slotCount()) {
+        dragSourceRef.current = null
+        setMusterEditorDragOverKey(null)
+        setArtDragHighlight(null)
+        return
+      }
       const payload = parseDragPayload(e.dataTransfer)
       if (!payload) return
       if (payload.kind === 'moveBlock') {
@@ -5305,15 +5381,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           payload.fromSlot,
           dk,
           room,
-          slotIndex,
+          globalSlot,
         )
         return
       }
       if (payload.kind === 'resizeBlock') {
-        applyResizeBlock(dk, room, slotIndex, payload)
+        applyResizeBlock(dk, room, globalSlot, payload)
         return
       }
-      applyDrop(dk, room, slotIndex, payload)
+      applyDrop(dk, room, globalSlot, payload)
     },
     [
       applyDrop,
@@ -5336,7 +5412,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         setArtDragHighlight(null)
         return
       }
-      if (calendarTabId !== 'main') return
+      if (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP)
+        return
       const payload = parseDragPayload(e.dataTransfer)
       if (!payload) return
       if (payload.kind === 'moveBlock') {
@@ -5837,6 +5914,11 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       : `KW ${getWeekNumber(weekStart)} · ${formatWeekRange(weekStart)}`
 
   const slots = slotCount()
+  const isOpDayCalendar =
+    calendarTabId === CALENDAR_TAB_OP &&
+    viewMode === 'day' &&
+    !isStaffCalendarReadOnly
+  const dayGridRowCount = isOpDayCalendar ? opViewSlotCount() : slots
 
   const draggedArtForPreview = useMemo(
     () =>
@@ -5847,8 +5929,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   )
 
   const artDropPreview = useMemo(() => {
-    if (!artDragHighlight || viewMode !== 'day' || calendarTabId !== 'main')
+    if (
+      !artDragHighlight ||
+      viewMode !== 'day' ||
+      (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP)
+    ) {
       return null
+    }
     const a = arten.find((x) => x.id === artDragHighlight.artId)
     if (!a) return null
     const fullKeys = new Set<string>()
@@ -5856,8 +5943,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     const dk = activeDayKey
     const wd = weekdayMon0FromDate(parseDateKey(dk))
     const artSpanSlots = Math.max(1, a.slots)
+    const isOpArt = calendarTabId === CALENDAR_TAB_OP
+    const slotLoopN = isOpArt ? opViewSlotCount() : slots
     for (const room of ROOMS) {
-      for (let sl = 0; sl < slots; sl++) {
+      for (let vi = 0; vi < slotLoopN; vi++) {
+        const sl = isOpArt ? opViewIndexToGlobalSlot(vi) : vi
+        if (sl === null) continue
         const k = makeSlotKey(dk, room, sl)
         if (
           cellIsValidArtPanelDropPreview(
@@ -7586,9 +7677,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               type="button"
               className={viewMode === 'day' ? 'active' : ''}
               aria-pressed={viewMode === 'day'}
-              disabled={calendarTabId !== 'main' || isViewer}
+              disabled={
+                (calendarTabId !== 'main' &&
+                  calendarTabId !== CALENDAR_TAB_OP) ||
+                isViewer
+              }
               title={
-                calendarTabId !== 'main'
+                calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP
                   ? 'Im Mitarbeiter-Kalender nur Wochenansicht Mo–So'
                   : undefined
               }
@@ -7844,6 +7939,17 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               onClick={() => setCalendarTabId('main')}
             >
               Hauptkalender
+            </button>
+            <button
+              type="button"
+              role="tab"
+              className={`calendar-view-tab ${calendarTabId === CALENDAR_TAB_OP ? 'calendar-view-tab--active' : ''}`}
+              aria-selected={calendarTabId === CALENDAR_TAB_OP}
+              id="calendar-tab-op"
+              title="Tagesraster 07:00–18:00 Uhr (gleiche Buchungen wie Hauptkalender)"
+              onClick={() => setCalendarTabId(CALENDAR_TAB_OP)}
+            >
+              OP
             </button>
             {mitarbeiter.map((s) => (
               <button
@@ -8192,7 +8298,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                 className="plan-grid day-grid"
                 style={{
                   gridTemplateColumns: `minmax(3.25rem, 4rem) repeat(${ROOMS.length}, minmax(5rem, 1fr))`,
-                  gridTemplateRows: `auto repeat(${slots}, minmax(0, 1fr))`,
+                  gridTemplateRows: `auto repeat(${dayGridRowCount}, minmax(0, 1fr))`,
                 }}
               >
                 <div className="corner" style={{ gridColumn: 1, gridRow: 1 }} />
@@ -8205,7 +8311,39 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                     {r}
                   </div>
                 ))}
-                {Array.from({ length: slots }, (_, slotIndex) => {
+                {Array.from({ length: dayGridRowCount }, (_, viewSlotIdx) => {
+                  const g = isOpDayCalendar
+                    ? opViewIndexToGlobalSlot(viewSlotIdx)
+                    : viewSlotIdx
+                  if (isOpDayCalendar && g === null) {
+                    return (
+                      <div
+                        key={`op-pad-${viewSlotIdx}`}
+                        className="day-slot-row"
+                        data-slot-row={viewSlotIdx}
+                        style={{ display: 'contents' }}
+                      >
+                        <div
+                          className="time-label"
+                          style={{ gridColumn: 1, gridRow: viewSlotIdx + 2 }}
+                        >
+                          {opViewSlotIndexToLabel(viewSlotIdx)}
+                        </div>
+                        {ROOMS.map((room, ri) => (
+                          <div
+                            key={room}
+                            className="slot-cell-shell slot-cell-shell--op-placeholder"
+                            style={{
+                              gridColumn: ri + 2,
+                              gridRow: viewSlotIdx + 2,
+                            }}
+                            aria-hidden="true"
+                          />
+                        ))}
+                      </div>
+                    )
+                  }
+                  const slotIndex = g as number
                   const lunchPauseRow = slotIndexInCalendarLunchPause(slotIndex)
                   const rowMergeNext = ROOMS.some((room) => {
                     const d =
@@ -8224,18 +8362,20 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                   })
                   return (
                   <div
-                    key={slotIndex}
+                    key={viewSlotIdx}
                     className="day-slot-row"
-                    data-slot-row={slotIndex}
+                    data-slot-row={viewSlotIdx}
                     style={{
                       display: 'contents',
                     }}
                   >
                     <div
-                      className={`time-label ${slotIndex === currentSlot ? 'now-line' : ''} ${rowMergeNext ? 'time-label--merge-next' : ''} ${lunchPauseRow ? 'time-label--lunch-pause' : ''}`}
-                      style={{ gridColumn: 1, gridRow: slotIndex + 2 }}
+                      className={`time-label ${slotIndex === currentSlot && currentSlot >= 0 ? 'now-line' : ''} ${rowMergeNext ? 'time-label--merge-next' : ''} ${lunchPauseRow ? 'time-label--lunch-pause' : ''}`}
+                      style={{ gridColumn: 1, gridRow: viewSlotIdx + 2 }}
                     >
-                      {slotIndexToLabel(slotIndex)}
+                      {isOpDayCalendar
+                        ? opViewSlotIndexToLabel(viewSlotIdx)
+                        : slotIndexToLabel(slotIndex)}
                     </div>
                     {ROOMS.map((room, roomIdx) => {
                       const gridCol = roomIdx + 2
@@ -8257,7 +8397,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                         booked &&
                         bounds !== null &&
                         spanLen > 1 &&
-                        slotIndex !== bounds.start
+                        (isOpDayCalendar
+                          ? viewSlotIdx !==
+                            opViewGridRowRangeFromGlobalBounds(
+                              bounds.start,
+                              bounds.end,
+                            ).v0
+                          : slotIndex !== bounds.start)
                       if (skipBecauseSpanned) {
                         return null
                       }
@@ -8270,8 +8416,17 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           : [slotIndex]
                       const gridRow =
                         booked && bounds
-                          ? `${bounds.start + 2} / ${bounds.end + 3}`
-                          : slotIndex + 2
+                          ? isOpDayCalendar
+                            ? (() => {
+                                const { v0, v1 } =
+                                  opViewGridRowRangeFromGlobalBounds(
+                                    bounds.start,
+                                    bounds.end,
+                                  )
+                                return `${v0 + 2} / ${v1 + 3}`
+                              })()
+                            : `${bounds.start + 2} / ${bounds.end + 3}`
+                          : viewSlotIdx + 2
                       const anchorSl = slotIndicesForShell[0]
                       const anchorKey = makeSlotKey(
                         activeDayKey,
