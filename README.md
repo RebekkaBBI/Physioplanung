@@ -22,7 +22,7 @@ npm start
 
 Siehe `.env.example`. Für Supabase im Browser:
 
-- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_URL` — nur die Projekt-Root-URL (`https://<ref>.supabase.co`), **ohne** `/rest/v1` oder andere Pfade (sonst Auth/DB-Fehler „Invalid path…“).
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 
 **Vercel:** dieselben Namen setzen (nicht mehr `VITE_*`). Bestehende Werte aus den alten Variablen kopieren.

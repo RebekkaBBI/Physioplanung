@@ -1,6 +1,7 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 import type { Database } from '@/database.types'
+import { normalizeSupabaseProjectUrl } from '@/lib/supabase/projectUrl'
 
 /**
  * Session-Cookies aktualisieren (Refresh), bevor Server Components / Actions laufen.
@@ -11,8 +12,8 @@ export async function updateSession(request: NextRequest) {
   })
 
   const supabase = createServerClient<Database>(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    normalizeSupabaseProjectUrl(process.env.NEXT_PUBLIC_SUPABASE_URL!),
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!.trim(),
     {
       cookies: {
         getAll() {

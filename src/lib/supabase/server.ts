@@ -1,6 +1,7 @@
 import { createServerClient } from '@supabase/ssr'
 import { cookies } from 'next/headers'
 import type { Database } from '@/database.types'
+import { normalizeSupabaseProjectUrl } from '@/lib/supabase/projectUrl'
 
 /**
  * Supabase-Client für Server Actions, Route Handlers und Server Components.
@@ -10,8 +11,8 @@ export async function createSupabaseServerClient() {
   const cookieStore = await cookies()
 
   return createServerClient<Database>(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    normalizeSupabaseProjectUrl(process.env.NEXT_PUBLIC_SUPABASE_URL!),
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!.trim(),
     {
       cookies: {
         getAll() {

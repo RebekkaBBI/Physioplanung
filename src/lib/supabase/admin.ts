@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js'
 import type { Database } from '@/database.types'
+import { normalizeSupabaseProjectUrl } from '@/lib/supabase/projectUrl'
 
 /**
  * Nur in Server-Routen (ohne NEXT_PUBLIC_*). Nutzt Service Role → umgeht RLS.
@@ -13,5 +14,5 @@ export function createSupabaseServiceRoleClient() {
       'SUPABASE_SERVICE_ROLE_KEY und NEXT_PUBLIC_SUPABASE_URL müssen gesetzt sein.',
     )
   }
-  return createClient<Database>(url.trim(), key.trim())
+  return createClient<Database>(normalizeSupabaseProjectUrl(url), key.trim())
 }
