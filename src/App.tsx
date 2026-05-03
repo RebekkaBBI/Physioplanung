@@ -91,7 +91,7 @@ type ViewMode = 'day' | 'week'
 
 const SLOT_MINUTES = 30
 const DAY_START_HOUR = 8
-const DAY_END_HOUR = 20
+const DAY_END_HOUR = 22
 
 const MIME_PHYSIO = 'application/x-physio-planung+json'
 
@@ -8904,7 +8904,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                 <p className="staff-modal-hint">
                   Wählen Sie einen Raum. Anschließend legen Sie den Zeitraum fest
                   (Standard: aktuelle Kalenderwoche). Die PDF-Ansicht ist A4
-                  Querformat mit den sieben Wochentagen und Zeiten 08:00–20:00
+                  Querformat mit den sieben Wochentagen und Zeiten 08:00–22:00
                   Uhr.
                 </p>
                 <ul className="patient-export-list" role="listbox">

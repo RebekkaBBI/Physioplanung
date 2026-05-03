@@ -1032,10 +1032,10 @@
     linear-gradient(
       to bottom,
       transparent 0,
-      transparent calc(100% * 4 / 12),
-      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 4 / 12),
-      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 5.5 / 12),
-      transparent calc(100% * 5.5 / 12)
+      transparent calc(100% * 4 / 14),
+      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 4 / 14),
+      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 5.5 / 14),
+      transparent calc(100% * 5.5 / 14)
     ),
     var(--accent-soft);
 }
@@ -1614,15 +1614,15 @@
   border: none;
   border-bottom: 1px solid var(--border-subtle);
   border-right: 1px solid var(--border-subtle);
-  /* 08:00–20:00 als volle Zellhöhe: 12:00–13:30 ≈ 33,3%–45,8% */
+  /* 08:00–22:00 als volle Zellhöhe: 12:00–13:30 ≈ 28,6%–39,3% */
   background:
     linear-gradient(
       to bottom,
       transparent 0,
-      transparent calc(100% * 4 / 12),
-      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 4 / 12),
-      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 5.5 / 12),
-      transparent calc(100% * 5.5 / 12)
+      transparent calc(100% * 4 / 14),
+      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 4 / 14),
+      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 5.5 / 14),
+      transparent calc(100% * 5.5 / 14)
     ),
     var(--surface);
   color: var(--text);
@@ -1637,10 +1637,10 @@
     linear-gradient(
       to bottom,
       transparent 0,
-      transparent calc(100% * 4 / 12),
-      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 4 / 12),
-      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 5.5 / 12),
-      transparent calc(100% * 5.5 / 12)
+      transparent calc(100% * 4 / 14),
+      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 4 / 14),
+      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 5.5 / 14),
+      transparent calc(100% * 5.5 / 14)
     ),
     var(--surface-hover);
 }
@@ -1650,10 +1650,10 @@
     linear-gradient(
       to bottom,
       transparent 0,
-      transparent calc(100% * 4 / 12),
-      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 4 / 12),
-      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 5.5 / 12),
-      transparent calc(100% * 5.5 / 12)
+      transparent calc(100% * 4 / 14),
+      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 4 / 14),
+      color-mix(in srgb, var(--text-muted) 11%, transparent) calc(100% * 5.5 / 14),
+      transparent calc(100% * 5.5 / 14)
     ),
     var(--booked-soft);
   color: var(--text-h);
