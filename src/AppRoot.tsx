@@ -27,8 +27,8 @@ export function AppRoot() {
     return (
       <div className="app cloud-loading">
         <p className="cloud-loading-text">
-          Cloud-Anmeldung ist nicht konfiguriert. Bitte VITE_SUPABASE_URL und
-          VITE_SUPABASE_ANON_KEY im Hosting setzen.
+          Cloud-Anmeldung ist nicht konfiguriert. Bitte NEXT_PUBLIC_SUPABASE_URL
+          und NEXT_PUBLIC_SUPABASE_ANON_KEY im Hosting setzen.
         </p>
       </div>
     )
