@@ -11,6 +11,7 @@ import {
   type MutableRefObject,
   type SetStateAction,
 } from 'react'
+import Image from 'next/image'
 import {
   PDFDocument,
   StandardFonts,
@@ -7184,13 +7185,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       <header className="app-header">
         <div className="app-title-row">
           <div className="app-title-brand">
-            <img
+            <Image
               src="/logo-bbi.png"
               alt="BBI"
               className="app-logo"
               width={240}
               height={96}
-              decoding="async"
+              priority
             />
             <h1 className="app-title">Physio PlanungsApp</h1>
           </div>
