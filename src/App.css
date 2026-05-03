@@ -36,11 +36,17 @@
   flex-direction: column;
 }
 
+.calendar-below-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-top: 1.25rem;
+}
+
 .calendar-below-panels {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 1rem;
-  margin-top: 1.25rem;
   /* Alle vier Karten (Kollision, Belegungsarten, Muster, Mitarbeiter) gleiche Höhe */
   align-items: stretch;
 }
@@ -87,6 +93,66 @@
 
 .panel-below-calendar > .btn-add.btn-staff-create {
   margin-top: auto;
+}
+
+.calendar-below-stack > .panel.panel-below-calendar {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.calendar-below-stack > .panel.panel-below-calendar.panel-roles-overview {
+  min-height: unset;
+}
+
+.panel-roles-overview .roles-overview-hint {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin: 0 0 0.65rem;
+  line-height: 1.35;
+}
+
+.panel-roles-overview .roles-overview-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 14rem;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+.panel-roles-overview .roles-overview-group + .roles-overview-group {
+  margin-top: 0.65rem;
+}
+
+.panel-roles-overview .roles-overview-role-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  margin: 0 0 0.25rem;
+}
+
+.panel-roles-overview .roles-overview-names {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.panel-roles-overview .roles-overview-names li {
+  font-size: 0.9rem;
+  padding: 0.2rem 0;
+  border-bottom: 1px solid var(--border-subtle, #e2e8f0);
+}
+
+.panel-roles-overview .roles-overview-names li:last-child {
+  border-bottom: none;
+}
+
+.panel-roles-overview .roles-overview-muted {
+  font-size: 0.85rem;
+  color: var(--text-muted);
 }
 
 .staff-chip {

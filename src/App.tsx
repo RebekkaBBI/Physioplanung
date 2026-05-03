@@ -26,11 +26,47 @@ import { startWeeklyBackupScheduler } from './backup'
 // YELLOW_AI: KI-API (Chat) — siehe src/ai/ (Suche: YELLOW_AI)
 import { useAuth } from './cloud/useAuth'
 import { can } from './cloud/permissions'
+import { getSupabaseBrowserClient } from './cloud/supabaseClient'
+import type { AppRole } from './cloud/types'
 import {
   fetchWorkspaceDocuments,
   flushPendingWorkspaceWrites,
   scheduleWorkspaceUpsert,
 } from './cloud/workspaceSync'
+
+const CLOUD_ROLE_ORDER: AppRole[] = [
+  'admin',
+  'planung',
+  'therapie',
+  'viewer',
+]
+
+function parseFetchedOrgProfileRole(
+  raw: string | null | undefined,
+): AppRole {
+  if (
+    raw === 'admin' ||
+    raw === 'planung' ||
+    raw === 'therapie' ||
+    raw === 'viewer'
+  ) {
+    return raw
+  }
+  return 'therapie'
+}
+
+function cloudRoleLabelDe(role: AppRole): string {
+  switch (role) {
+    case 'admin':
+      return 'Administrator'
+    case 'planung':
+      return 'Planung'
+    case 'therapie':
+      return 'Therapie'
+    case 'viewer':
+      return 'Nur Lesen'
+  }
+}
 
 const ROOMS = [
   'Physio 1',
@@ -4211,6 +4247,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const mayStaffAbsences = can(appRole, 'staff:absences')
   const mayExport = can(appRole, 'export:run')
   const isViewer = cloudSyncEnabled && appRole === 'viewer'
+  const isCloudAdmin = cloudSyncEnabled && appRole === 'admin'
 
   const initialPanels = useMemo(
     () => (cloudSyncEnabled ? null : loadPanels()),
@@ -4390,6 +4427,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     weekParity: 'even' | 'odd'
   } | null>(null)
   const [cloudHydrated, setCloudHydrated] = useState(!cloudSyncEnabled)
+  const [adminOrgProfiles, setAdminOrgProfiles] = useState<
+    { id: string; display_name: string | null; role: AppRole }[]
+  >([])
+  const [adminOrgProfilesLoading, setAdminOrgProfilesLoading] =
+    useState(false)
+  const [adminOrgProfilesError, setAdminOrgProfilesError] = useState<
+    string | null
+  >(null)
 
   useEffect(() => {
     if (!cloudSyncEnabled) return
@@ -4467,6 +4512,62 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       cancelled = true
     }
   }, [cloudSyncEnabled, organizationId])
+
+  useEffect(() => {
+    if (!cloudSyncEnabled || appRole !== 'admin' || !organizationId) {
+      setAdminOrgProfiles([])
+      setAdminOrgProfilesError(null)
+      setAdminOrgProfilesLoading(false)
+      return
+    }
+    let cancelled = false
+    setAdminOrgProfilesLoading(true)
+    setAdminOrgProfilesError(null)
+    const supabase = getSupabaseBrowserClient()
+    if (!supabase) {
+      setAdminOrgProfilesLoading(false)
+      setAdminOrgProfilesError('Supabase ist nicht konfiguriert.')
+      setAdminOrgProfiles([])
+      return
+    }
+    void supabase
+      .from('profiles')
+      .select('id, display_name, role')
+      .eq('organization_id', organizationId)
+      .order('role', { ascending: true })
+      .order('display_name', { ascending: true })
+      .then(({ data, error }) => {
+        if (cancelled) return
+        setAdminOrgProfilesLoading(false)
+        if (error) {
+          setAdminOrgProfilesError(error.message)
+          setAdminOrgProfiles([])
+          return
+        }
+        setAdminOrgProfiles(
+          (data ?? []).map((r) => ({
+            id: r.id,
+            display_name: r.display_name,
+            role: parseFetchedOrgProfileRole(r.role),
+          })),
+        )
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [cloudSyncEnabled, appRole, organizationId])
+
+  const adminOrgProfilesByRole = useMemo(() => {
+    const buckets = new Map<AppRole, { id: string; display_name: string | null; role: AppRole }[]>()
+    for (const role of CLOUD_ROLE_ORDER) buckets.set(role, [])
+    for (const row of adminOrgProfiles) {
+      buckets.get(row.role)?.push(row)
+    }
+    return CLOUD_ROLE_ORDER.map((role) => ({
+      role,
+      people: buckets.get(role) ?? [],
+    }))
+  }, [adminOrgProfiles])
 
   /* Automatisches Speichern: Kalender, Stammdaten, Ansicht — bei jeder Änderung */
   useEffect(() => {
@@ -6705,7 +6806,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   }, [mitarbeiter, slotCells])
 
   const belowCalendarPanels = (
-    <div className="calendar-below-panels">
+    <div className="calendar-below-stack">
+      <div className="calendar-below-panels">
       <section
         className="panel panel-below-calendar panel-kollision"
         aria-label="Kollision und offene Termine"
@@ -6987,6 +7089,47 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           Mitarbeiter anlegen
         </button>
       </section>
+      </div>
+      {isCloudAdmin ? (
+        <section
+          className="panel panel-below-calendar panel-roles-overview"
+          aria-label="Rollenübersicht Organisation"
+        >
+          <h2 className="panel-title">Rollenübersicht</h2>
+          <p className="roles-overview-hint">
+            Anmeldungen in Ihrer Organisation nach Zugriffsrolle (Cloud-Konto) —
+            getrennt von der Therapeutenliste oben.
+          </p>
+          {adminOrgProfilesLoading ? (
+            <p className="roles-overview-muted">Lade Konten …</p>
+          ) : adminOrgProfilesError ? (
+            <p className="roles-overview-muted" role="alert">
+              {adminOrgProfilesError}
+            </p>
+          ) : (
+            <div className="roles-overview-body">
+              {adminOrgProfilesByRole.map(({ role, people }) => (
+                <div key={role} className="roles-overview-group">
+                  <h3 className="roles-overview-role-title">
+                    {cloudRoleLabelDe(role)}
+                  </h3>
+                  {people.length === 0 ? (
+                    <p className="roles-overview-muted">—</p>
+                  ) : (
+                    <ul className="roles-overview-names">
+                      {people.map((p) => (
+                        <li key={p.id}>
+                          {p.display_name?.trim() || 'Kein Anzeigename'}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      ) : null}
     </div>
   )
 
