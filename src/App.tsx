@@ -87,6 +87,9 @@ const ROOMS = [
 ] as const
 
 type Room = (typeof ROOMS)[number]
+
+/** OP-Kalender: nur ein Raum (Wochenübersicht sinnvoll). */
+const OP_TAB_ROOM: Room = ROOMS[0]
 type ViewMode = 'day' | 'week'
 
 const SLOT_MINUTES = 30
@@ -5270,6 +5273,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const isStaffCalendarReadOnly =
     calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP
 
+  const calendarRooms: readonly Room[] = useMemo(
+    () =>
+      calendarTabId === CALENDAR_TAB_OP
+        ? ([OP_TAB_ROOM] as const)
+        : ROOMS,
+    [calendarTabId],
+  )
+
   const [staffAbsenceModalId, setStaffAbsenceModalId] = useState<string | null>(
     null,
   )
@@ -5896,6 +5907,58 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         const m = muster.find((x) => x.id === payload.id)
         if (!m) return
         const musterStamp: MusterApplyStamp = { label: m.label }
+        if (calendarTabId === CALENDAR_TAB_OP && room === OP_TAB_ROOM) {
+          const max = slotCount()
+          setSlotCells((prev) => {
+            let blockStart: number | null = null
+            let anchorCell: CellData | undefined
+            for (let sl = 0; sl < max; sl++) {
+              const k = makeSlotKey(dk, OP_TAB_ROOM, sl)
+              const c = prev[k]
+              if (!isCellBooked(c)) continue
+              const { start } = findBlockBounds(prev, dk, OP_TAB_ROOM, sl)
+              blockStart = start
+              anchorCell = prev[makeSlotKey(dk, OP_TAB_ROOM, start)]
+              break
+            }
+            if (blockStart === null || !anchorCell) {
+              alertOnce(
+                'An diesem Tag ist im OP-Raum keine Buchung — Muster bitte auf einen Tag mit OP-Termin ziehen oder in der Tagesansicht auf die Buchung.',
+              )
+              return prev
+            }
+            const patientN = anchorCell.patient?.trim()
+              ? anchorCell.patient
+              : ''
+            const patientC = anchorCell.patient?.trim()
+              ? anchorCell.patientCode
+              : undefined
+            const res = tryApplyMusterFromOpBooking(
+              prev,
+              m.templateCells,
+              patientN,
+              patientC,
+              arten,
+              mitarbeiter,
+              { dk, room: OP_TAB_ROOM, slotIndex: blockStart },
+              effectiveMusterTemplateWeekCount(m),
+              musterStamp,
+              m.id,
+            )
+            if ('error' in res) {
+              alertOnce(res.error)
+              return prev
+            }
+            queueMicrotask(() =>
+              setMusterUsageCountById((c) => ({
+                ...c,
+                [m.id]: (c[m.id] ?? 0) + 1,
+              })),
+            )
+            return res.next
+          })
+          return
+        }
         const weekStart = startOfWeekMonday(parseDateKey(dk))
         const max = slotCount()
         setSlotCells((prev) => {
@@ -6445,7 +6508,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     const artSpanSlots = Math.max(1, a.slots)
     const isOpArt = calendarTabId === CALENDAR_TAB_OP
     const slotLoopN = isOpArt ? opViewSlotCount() : slots
-    for (const room of ROOMS) {
+    for (const room of calendarRooms) {
       for (let vi = 0; vi < slotLoopN; vi++) {
         const sl = isOpArt ? opViewIndexToGlobalSlot(vi) : vi
         if (sl === null) continue
@@ -6495,6 +6558,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     mitarbeiter,
     activeDayKey,
     slots,
+    calendarRooms,
   ])
 
   const now = new Date()
@@ -8726,14 +8790,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               <div
                 className="plan-grid week-grid"
                 style={{
-                  gridTemplateColumns: `minmax(7.5rem, 9rem) repeat(${ROOMS.length}, minmax(5rem, 1fr))`,
+                  gridTemplateColumns: `minmax(7.5rem, 9rem) repeat(${calendarRooms.length}, minmax(5rem, 1fr))`,
                   gridTemplateRows: `auto repeat(7, minmax(0, 1fr))`,
                 }}
               >
                 <div className="corner" />
-                {ROOMS.map((r) => (
+                {calendarRooms.map((r) => (
                   <div key={r} className="col-head">
-                    {r}
+                    {calendarTabId === CALENDAR_TAB_OP ? `OP · ${r}` : r}
                   </div>
                 ))}
                 {weekDays.map((d) => {
@@ -8752,7 +8816,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           })}
                         </span>
                       </div>
-                      {ROOMS.map((room) => {
+                      {calendarRooms.map((room) => {
                         const booked = bookingsForDayRoom(
                           cellsForActiveCalendarView,
                           dk,
@@ -8804,18 +8868,18 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               <div
                 className="plan-grid day-grid"
                 style={{
-                  gridTemplateColumns: `minmax(3.25rem, 4rem) repeat(${ROOMS.length}, minmax(5rem, 1fr))`,
+                  gridTemplateColumns: `minmax(3.25rem, 4rem) repeat(${calendarRooms.length}, minmax(5rem, 1fr))`,
                   gridTemplateRows: `auto repeat(${dayGridRowCount}, minmax(0, 1fr))`,
                 }}
               >
                 <div className="corner" style={{ gridColumn: 1, gridRow: 1 }} />
-                {ROOMS.map((r, ri) => (
+                {calendarRooms.map((r, ri) => (
                   <div
                     key={r}
                     className="col-head"
                     style={{ gridColumn: ri + 2, gridRow: 1 }}
                   >
-                    {r}
+                    {calendarTabId === CALENDAR_TAB_OP ? `OP · ${r}` : r}
                   </div>
                 ))}
                 {Array.from({ length: dayGridRowCount }, (_, viewSlotIdx) => {
@@ -8836,7 +8900,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                         >
                           {opViewSlotIndexToLabel(viewSlotIdx)}
                         </div>
-                        {ROOMS.map((room, ri) => (
+                        {calendarRooms.map((room, ri) => (
                           <div
                             key={room}
                             className="slot-cell-shell slot-cell-shell--op-placeholder"
@@ -8852,7 +8916,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                   }
                   const slotIndex = g as number
                   const lunchPauseRow = slotIndexInCalendarLunchPause(slotIndex)
-                  const rowMergeNext = ROOMS.some((room) => {
+                  const rowMergeNext = calendarRooms.some((room) => {
                     const d =
                       cellsForActiveCalendarView[
                         makeSlotKey(activeDayKey, room, slotIndex)
@@ -8884,7 +8948,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                         ? opViewSlotIndexToLabel(viewSlotIdx)
                         : slotIndexToLabel(slotIndex)}
                     </div>
-                    {ROOMS.map((room, roomIdx) => {
+                    {calendarRooms.map((room, roomIdx) => {
                       const gridCol = roomIdx + 2
                       const kHere = makeSlotKey(activeDayKey, room, slotIndex)
                       const dataHere = cellsForActiveCalendarView[kHere]
@@ -9140,6 +9204,19 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                                       ) {
                                         setTerminPickerModal({
                                           kind: 'teamMeeting',
+                                          dk: activeDayKey,
+                                          room,
+                                          anchorSlot: sl,
+                                        })
+                                      } else if (
+                                        calendarTabId === CALENDAR_TAB_OP &&
+                                        patientTerminNeedsArtChoice(
+                                          blockStartData,
+                                          arten,
+                                        )
+                                      ) {
+                                        setTerminPickerModal({
+                                          kind: 'opTermin',
                                           dk: activeDayKey,
                                           room,
                                           anchorSlot: sl,
@@ -10296,9 +10373,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                   ) : (
                     <p className="staff-modal-hint">
                       Ziehen Sie ein Belegungsmuster aus dem Panel auf diese
-                      Buchung: Der OP-Tag im Muster entspricht diesem Tag; die
-                      übrigen Muster-Tage werden im Hauptkalender im passenden
-                      Raum und zur passenden Zeit eingetragen.
+                      Buchung (Tages- oder Wochenansicht): Der OP-Tag im Muster
+                      entspricht diesem Tag; die übrigen Muster-Tage werden im
+                      Hauptkalender im passenden Raum und zur passenden Zeit
+                      eingetragen.
                     </p>
                   )}
                   <TerminModalNotizFields
