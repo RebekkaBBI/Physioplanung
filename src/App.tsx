@@ -193,6 +193,10 @@ type CellData = {
   artColor?: string
   muster?: string
   musterColor?: string
+  /** Verknüpfte Muster-Instanz (OP-Anker + Hauptkalender-Termine derselben Anwendung) */
+  musterLinkId?: string
+  /** Katalog-ID des Belegungsmusters */
+  musterId?: string
   staff?: string
   staffId?: string
   /** Teammeeting: mehrere Teilnehmer-IDs (erscheinen jeweils im MA-Kalender) */
@@ -599,6 +603,8 @@ function artFromPanelBlockedReason(
   startSlot: number,
   a: BelegungsartItem,
   staffList: MitarbeiterItem[],
+  /** OP-Kalender: keine Pflicht, dass ein freier MA die ganze Spanne abdeckt (außer MA ist schon auf dem Termin). */
+  opTab = false,
 ): string | null {
   const wd = weekdayMon0FromDate(parseDateKey(dk))
   const max = slotCount()
@@ -670,7 +676,8 @@ function artFromPanelBlockedReason(
     startSlot,
     span,
   )
-  if (canTreat.length === 0) {
+  const skipPoolStaffRequirement = opTab && uniqueStaff.size === 0
+  if (!skipPoolStaffRequirement && canTreat.length === 0) {
     return 'Kein Mitarbeiter mit Freigabe für diese Belegungsart ist in diesem Zeitraum durchgehend verfügbar.'
   }
 
@@ -691,13 +698,24 @@ function cellIsValidArtPanelDropPreview(
   startSlot: number,
   a: BelegungsartItem,
   staffList: MitarbeiterItem[],
+  opTab = false,
 ): boolean {
   if (isTeamMeetingArt(a)) {
     return (
       teamMeetingFromPanelBlockedReason(cells, dk, room, startSlot, a) === null
     )
   }
-  return artFromPanelBlockedReason(cells, dk, room, startSlot, a, staffList) === null
+  return (
+    artFromPanelBlockedReason(
+      cells,
+      dk,
+      room,
+      startSlot,
+      a,
+      staffList,
+      opTab,
+    ) === null
+  )
 }
 
 /** Frei + Mitarbeiter/Art-Regeln für neu belegte Slots beim Verlängern. */
@@ -758,6 +776,8 @@ function blockSignature(c: CellData | undefined): string {
     c.staffId ?? '',
     c.staff ?? '',
     c.muster ?? '',
+    c.musterLinkId ?? '',
+    c.musterId ?? '',
     c.terminKollision ? '1' : '0',
     c.notiz ?? '',
   ]
@@ -800,6 +820,8 @@ function terminBlockSignatureIgnoringStaff(c: CellData | undefined): string {
     c.artId ?? '',
     c.art ?? '',
     c.muster ?? '',
+    c.musterLinkId ?? '',
+    c.musterId ?? '',
     c.terminKollision ? '1' : '0',
     c.notiz ?? '',
   ]
@@ -3002,6 +3024,398 @@ function applyMusterWithPatientWeek(
   return next
 }
 
+function slotsRangeOverlap(
+  a0: number,
+  a1: number,
+  b0: number,
+  b1: number,
+): boolean {
+  return a0 <= b1 && b0 <= a1
+}
+
+function collectTemplateOpOnlyDayIndices(
+  templateCells: Record<string, MusterTemplateCell>,
+  artenList: BelegungsartItem[],
+  templateWeekCount: number,
+): number[] {
+  const virt = musterTemplateToVirtual(templateCells)
+  const seen = new Set<string>()
+  const out = new Set<number>()
+  const max = slotCount()
+  const dayCount = templateWeekCount * 7
+  for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
+    const vdk = templateDkForDayIndex(dayIndex)
+    for (const room of ROOMS) {
+      for (let sl = 0; sl < max; sl++) {
+        const k = makeSlotKey(vdk, room, sl)
+        const d = virt[k]
+        if (!isCellBooked(d)) continue
+        if (seen.has(k)) continue
+        const { start, end } = findBlockBounds(virt, vdk, room, sl)
+        const cells: CellData[] = []
+        for (let s = start; s <= end; s++) {
+          const vk = makeSlotKey(vdk, room, s)
+          seen.add(vk)
+          cells.push({ ...virt[vk]! })
+        }
+        if (
+          musterBlockIsOpOnly(cells, artenList) &&
+          !musterBlockIsPauseOnly(cells)
+        ) {
+          out.add(dayIndex)
+        }
+      }
+    }
+  }
+  return [...out].sort((a, b) => a - b)
+}
+
+function newMusterLinkId(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID()
+  }
+  return `muster-link-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
+}
+
+function removeCellsByMusterLinkId(
+  prev: Record<string, CellData>,
+  linkId: string,
+): Record<string, CellData> {
+  const next = { ...prev }
+  for (const k of Object.keys(next)) {
+    if (next[k]?.musterLinkId === linkId) delete next[k]
+  }
+  return next
+}
+
+function stripPatientFromMusterLinkId(
+  prev: Record<string, CellData>,
+  linkId: string,
+): Record<string, CellData> {
+  const next = { ...prev }
+  for (const [k, c] of Object.entries(next)) {
+    if (c?.musterLinkId !== linkId) continue
+    const { patient: _p, patientCode: _pc, ...rest } = c
+    const merged = rest as CellData
+    if (!isCellBooked(merged)) delete next[k]
+    else next[k] = merged
+  }
+  return next
+}
+
+/**
+ * Belegungsmuster auf OP-Buchung: Kalendertag des Muster-OP-Tags = OP-Termin;
+ * übrige Muster-Tage wie bei Patienten-Muster im Hauptkalender.
+ */
+function applyMusterFromOpBookingOnce(
+  prev: Record<string, CellData>,
+  virt: Record<string, CellData>,
+  weekStart: Date,
+  artenList: BelegungsartItem[],
+  staffList: MitarbeiterItem[],
+  anchor: { dk: string; room: Room; slotIndex: number },
+  anchorBounds: { start: number; end: number },
+  templateWeekCount: number,
+  patientName: string,
+  patientCode: string | undefined,
+  musterStamp: MusterApplyStamp,
+  musterCatalogId: string,
+  musterLinkId: string,
+): { next: Record<string, CellData> } | { error: string } {
+  const anchorStartK = makeSlotKey(anchor.dk, anchor.room, anchorBounds.start)
+  if (prev[anchorStartK]?.musterLinkId) {
+    return { error: 'An diesem OP-Termin ist bereits ein Muster verknüpft.' }
+  }
+
+  const dayCount = templateWeekCount * 7
+  let opOverlap = false
+  const seenO = new Set<string>()
+  const max = slotCount()
+  for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
+    const vdk = templateDkForDayIndex(dayIndex)
+    const tDk = dateKey(addDays(weekStart, dayIndex))
+    if (tDk !== anchor.dk) continue
+    for (const room of ROOMS) {
+      if (room !== anchor.room) continue
+      for (let sl = 0; sl < max; sl++) {
+        const k = makeSlotKey(vdk, room, sl)
+        const d = virt[k]
+        if (!isCellBooked(d)) continue
+        if (seenO.has(k)) continue
+        const { start, end } = findBlockBounds(virt, vdk, room, sl)
+        const cells: CellData[] = []
+        for (let s = start; s <= end; s++) {
+          const vk = makeSlotKey(vdk, room, s)
+          seenO.add(vk)
+          cells.push({ ...virt[vk]! })
+        }
+        if (!musterBlockIsOpOnly(cells, artenList)) continue
+        if (
+          slotsRangeOverlap(
+            start,
+            end,
+            anchorBounds.start,
+            anchorBounds.end,
+          )
+        ) {
+          opOverlap = true
+        }
+      }
+    }
+  }
+  if (!opOverlap) {
+    return {
+      error:
+        'Der OP-Termin liegt nicht in einer OP-Zeit des Musters (Raum und Uhrzeit passen zum Muster-OP-Tag nicht).',
+    }
+  }
+
+  type NonOpOp = {
+    tDk: string
+    wd: number
+    templateRoom: Room
+    idealStart: number
+    cells: CellData[]
+  }
+  const ops: NonOpOp[] = []
+  const seen = new Set<string>()
+  for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
+    const vdk = templateDkForDayIndex(dayIndex)
+    const tDk = dateKey(addDays(weekStart, dayIndex))
+    const wd = weekdayMon0FromDate(parseDateKey(tDk))
+    for (const room of ROOMS) {
+      for (let sl = 0; sl < max; sl++) {
+        const k = makeSlotKey(vdk, room, sl)
+        const d = virt[k]
+        if (!isCellBooked(d)) continue
+        if (seen.has(k)) continue
+        const { start, end } = findBlockBounds(virt, vdk, room, sl)
+        const cells: CellData[] = []
+        for (let s = start; s <= end; s++) {
+          const vk = makeSlotKey(vdk, room, s)
+          seen.add(vk)
+          cells.push({ ...virt[vk]! })
+        }
+        if (
+          musterBlockIsOpOnly(cells, artenList) ||
+          musterBlockIsPauseOnly(cells)
+        ) {
+          continue
+        }
+        ops.push({ tDk, wd, templateRoom: room, idealStart: start, cells })
+      }
+    }
+  }
+
+  const next = { ...prev }
+  const reserved = new Set<string>()
+  for (let s = anchorBounds.start; s <= anchorBounds.end; s++) {
+    reserved.add(makeSlotKey(anchor.dk, anchor.room, s))
+  }
+  const ghostHold: CellData = {
+    art: '\u00a0',
+    artId: '__muster_anchor_hold__',
+    artColor: '#cbd5e1',
+  }
+  const ghosted: Record<string, CellData> = { ...next }
+  for (const rk of reserved) {
+    ghosted[rk] = ghostHold
+  }
+
+  for (const op of ops) {
+    const span = op.cells.length
+    const { tDk, wd, templateRoom: tr, idealStart } = op
+
+    let chosenRoom: Room = tr
+    let chosenStart: number
+    let collision: boolean
+
+    if (rangeFullyFree(ghosted, tDk, tr, idealStart, span, true)) {
+      chosenStart = idealStart
+      collision = false
+    } else {
+      const beside = findSlotBesideConflict(
+        ghosted,
+        tDk,
+        tr,
+        span,
+        idealStart,
+        true,
+      )
+      if (beside !== null) {
+        chosenStart = beside
+        collision = false
+      } else {
+        const wave = findFreeSpanWaveSameRoom(
+          ghosted,
+          tDk,
+          tr,
+          span,
+          idealStart,
+          true,
+        )
+        if (wave !== null) {
+          chosenStart = wave
+          collision = false
+        } else {
+          const anyR = findFreeSpanAnyRoom(ghosted, tDk, span, tr, true)
+          if (anyR) {
+            chosenRoom = anyR.room
+            chosenStart = anyR.start
+            collision = false
+          } else {
+            const col = pickCollisionPlacement(
+              ghosted,
+              tDk,
+              tr,
+              span,
+              idealStart,
+              true,
+            )
+            chosenRoom = col.room
+            chosenStart = col.start
+            collision = true
+          }
+        }
+      }
+    }
+
+    if (
+      !collision &&
+      !staffAllowsMusterPlacement(
+        op.cells,
+        chosenStart,
+        tDk,
+        wd,
+        artenList,
+        staffList,
+      )
+    ) {
+      const col = pickCollisionPlacement(
+        ghosted,
+        tDk,
+        tr,
+        span,
+        idealStart,
+        true,
+      )
+      chosenRoom = col.room
+      chosenStart = col.start
+      collision = true
+    }
+
+    for (let i = 0; i < span; i++) {
+      const pk = makeSlotKey(tDk, chosenRoom, chosenStart + i)
+      if (reserved.has(pk)) {
+        return {
+          error:
+            'Muster passt nicht: ein Termin würde den OP-Anker im Hauptkalender überschreiben.',
+        }
+      }
+    }
+
+    for (let i = 0; i < span; i++) {
+      delete next[makeSlotKey(tDk, chosenRoom, chosenStart + i)]
+    }
+    for (let i = 0; i < span; i++) {
+      const mk = makeSlotKey(tDk, chosenRoom, chosenStart + i)
+      const merged = mergePatientIntoMusterCell(
+        op.cells[i]!,
+        patientName,
+        patientCode,
+        collision,
+        musterStamp,
+      )
+      next[mk] = { ...merged, musterLinkId, musterId: musterCatalogId }
+    }
+    for (let i = 0; i < span; i++) {
+      ghosted[makeSlotKey(tDk, chosenRoom, chosenStart + i)] = next[
+        makeSlotKey(tDk, chosenRoom, chosenStart + i)
+      ]!
+    }
+  }
+
+  for (let s = anchorBounds.start; s <= anchorBounds.end; s++) {
+    const k = makeSlotKey(anchor.dk, anchor.room, s)
+    const base = next[k]
+    if (!base || !isCellBooked(base)) {
+      return { error: 'OP-Termin nicht gefunden.' }
+    }
+    const merged = mergePatientIntoMusterCell(
+      base,
+      patientName,
+      patientCode,
+      false,
+      musterStamp,
+    )
+    next[k] = { ...merged, musterLinkId, musterId: musterCatalogId }
+  }
+
+  return { next }
+}
+
+function tryApplyMusterFromOpBooking(
+  prev: Record<string, CellData>,
+  templateCells: Record<string, MusterTemplateCell>,
+  patientName: string,
+  patientCode: string | undefined,
+  artenList: BelegungsartItem[],
+  staffList: MitarbeiterItem[],
+  anchor: { dk: string; room: Room; slotIndex: number },
+  templateWeekCount: number,
+  musterStamp: MusterApplyStamp,
+  musterCatalogId: string,
+): { next: Record<string, CellData> } | { error: string } {
+  const opIndices = collectTemplateOpOnlyDayIndices(
+    templateCells,
+    artenList,
+    templateWeekCount,
+  )
+  if (opIndices.length === 0) {
+    return {
+      error:
+        'Dieses Belegungsmuster enthält keinen OP-Tag (Belegungsart OP).',
+    }
+  }
+
+  const virt = musterTemplateToVirtual(templateCells)
+  const anchorBounds = findBlockBounds(
+    prev,
+    anchor.dk,
+    anchor.room,
+    anchor.slotIndex,
+  )
+  const anchorDate = parseDateKey(anchor.dk)
+
+  for (const opAnchorDayIndex of opIndices) {
+    const weekStart = addDays(anchorDate, -opAnchorDayIndex)
+    const musterLinkId = newMusterLinkId()
+    const once = applyMusterFromOpBookingOnce(
+      prev,
+      virt,
+      weekStart,
+      artenList,
+      staffList,
+      anchor,
+      anchorBounds,
+      templateWeekCount,
+      patientName,
+      patientCode,
+      musterStamp,
+      musterCatalogId,
+      musterLinkId,
+    )
+    if ('next' in once) return once
+  }
+
+  return {
+    error:
+      opIndices.length > 1
+        ? 'Muster konnte mit diesem OP-Termin nicht ausgerichtet werden (mehrere OP-Tage im Muster). Bitte anderes Muster wählen oder OP-Zeit anpassen.'
+        : 'Muster konnte nicht platziert werden (Belegungen im Hauptkalender prüfen).',
+  }
+}
+
 /** Muster-Editor: Arten beliebig platzieren — überlappende reine Art-Termine werden ersetzt. */
 function applyArtDropNoPatient(
   prev: Record<string, CellData>,
@@ -3488,13 +3902,16 @@ function cellTerminLabelParts(
 function cellDisplayLine(
   data: CellData | undefined,
   staffList?: MitarbeiterItem[],
+  opts?: { hideStaffAssignmentHint?: boolean },
 ): string {
   const { patient, art, staffName } = cellTerminLabelParts(data, staffList)
   const teamMeeting =
     data?.artId === TEAM_MEETING_ART_ID || (data?.teamStaffIds?.length ?? 0) > 0
   const third = teamMeeting
     ? staffName ?? 'Teilnehmer wählen'
-    : staffName ?? 'Mitarbeiter zuteilen'
+    : opts?.hideStaffAssignmentHint
+      ? staffName ?? '—'
+      : staffName ?? 'Mitarbeiter zuteilen'
   return [patient ?? '—', art ?? '—', third].join(' · ')
 }
 
@@ -4436,6 +4853,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     | null
     | { kind: 'art'; dk: string; room: Room; anchorSlot: number }
     | { kind: 'staff'; dk: string; room: Room; anchorSlot: number }
+    | { kind: 'opTermin'; dk: string; room: Room; anchorSlot: number }
     | { kind: 'teamMeeting'; dk: string; room: Room; anchorSlot: number }
   >(null)
   const [teamMeetingSelectedIds, setTeamMeetingSelectedIds] = useState<
@@ -5106,6 +5524,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               startSlot,
               a,
               mitarbeiter,
+              calendarTabId === CALENDAR_TAB_OP,
             )
         if (blocked) {
           alertOnce(blocked)
@@ -5197,6 +5616,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                 startSlot,
                 a,
                 mitarbeiter,
+                calendarTabId === CALENDAR_TAB_OP,
               )
           if (blockedAgain) {
             return prev
@@ -5241,10 +5661,43 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           const m = musterById(payload.id)
           if (!m) return prev
           const musterStamp: MusterApplyStamp = { label: m.label }
-          const weekStart = startOfWeekMonday(parseDateKey(dk))
           const { start: blockStart } = findBlockBounds(prev, dk, room, startSlot)
           const anchorK = makeSlotKey(dk, room, blockStart)
           const anchor = prev[anchorK]
+          if (calendarTabId === CALENDAR_TAB_OP && viewMode === 'day') {
+            if (!anchor || !isCellBooked(anchor)) {
+              alertOnce('Bitte auf eine bestehende OP-Buchung ziehen.')
+              return prev
+            }
+            const patientN = anchor.patient?.trim() ? anchor.patient : ''
+            const patientC = anchor.patient?.trim()
+              ? anchor.patientCode
+              : undefined
+            const res = tryApplyMusterFromOpBooking(
+              prev,
+              m.templateCells,
+              patientN,
+              patientC,
+              arten,
+              mitarbeiter,
+              { dk, room, slotIndex: blockStart },
+              effectiveMusterTemplateWeekCount(m),
+              musterStamp,
+              m.id,
+            )
+            if ('error' in res) {
+              alertOnce(res.error)
+              return prev
+            }
+            queueMicrotask(() =>
+              setMusterUsageCountById((c) => ({
+                ...c,
+                [m.id]: (c[m.id] ?? 0) + 1,
+              })),
+            )
+            return res.next
+          }
+          const weekStart = startOfWeekMonday(parseDateKey(dk))
           if (anchor?.patient?.trim()) {
             queueMicrotask(() =>
               setMusterUsageCountById((c) => ({
@@ -5338,7 +5791,16 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         return prev
       })
     },
-    [patients, arten, muster, mitarbeiter, setTerminPickerModal, setSlotCells],
+    [
+      patients,
+      arten,
+      muster,
+      mitarbeiter,
+      calendarTabId,
+      viewMode,
+      setTerminPickerModal,
+      setSlotCells,
+    ],
   )
 
   useEffect(() => {
@@ -5518,6 +5980,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     if (cloudSyncEnabled && !mayCalendarWrite) return
     const k = makeSlotKey(dk, room, slotIndex)
     setSlotCells((prev) => {
+      const cur = prev[k]
+      if (isCellBooked(cur) && cur?.musterLinkId) {
+        alertOnce(
+          'Mit Belegungsmuster verknüpfte Termine bitte über den Termin-Dialog (Klick auf den Termin) entfernen.',
+        )
+        return prev
+      }
       const next = { ...prev }
       if (isCellBooked(next[k])) {
         delete next[k]
@@ -5770,18 +6239,49 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   const clearTerminBlockFromModal = useCallback(() => {
     if (!terminPickerModal) return
-    if (!window.confirm('Den gesamten Termin in diesem Zeitraum leeren?')) return
-    const { dk, room, anchorSlot } = terminPickerModal
+    const { dk, room, anchorSlot, kind } = terminPickerModal
+    const { start } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const link = slotCells[makeSlotKey(dk, room, start)]?.musterLinkId
+    if (kind === 'opTermin' && link) {
+      if (
+        !window.confirm(
+          'Das gesamte Belegungsmuster inklusive aller Hauptkalender-Termine dieser Verknüpfung wird entfernt. Fortfahren?',
+        )
+      ) {
+        return
+      }
+    } else if (!window.confirm('Den gesamten Termin in diesem Zeitraum leeren?')) {
+      return
+    }
     setSlotCells((prev) => {
-      const { start, end } = findBlockBounds(prev, dk, room, anchorSlot)
+      if (kind === 'opTermin' && link) {
+        return removeCellsByMusterLinkId(prev, link)
+      }
+      const { start: s0, end } = findBlockBounds(prev, dk, room, anchorSlot)
       const next = { ...prev }
-      for (let sl = start; sl <= end; sl++) {
+      for (let sl = s0; sl <= end; sl++) {
         delete next[makeSlotKey(dk, room, sl)]
       }
       return next
     })
     setTerminPickerModal(null)
-  }, [terminPickerModal, setSlotCells, setTerminPickerModal])
+  }, [terminPickerModal, slotCells, setSlotCells, setTerminPickerModal])
+
+  const stripPatientFromOpMusterBundleFromModal = useCallback(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'opTermin') return
+    const { dk, room, anchorSlot } = terminPickerModal
+    const { start } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const link = slotCells[makeSlotKey(dk, room, start)]?.musterLinkId
+    if (!link) return
+    if (
+      !window.confirm(
+        'Den Patienten von allen zugehörigen Terminen (OP und Hauptkalender) entfernen? Die Belegungen bleiben bestehen.',
+      )
+    ) {
+      return
+    }
+    setSlotCells((prev) => stripPatientFromMusterLinkId(prev, link))
+  }, [terminPickerModal, slotCells, setSlotCells])
 
   const openDayForCell = useCallback((d: Date) => {
     setAnchorDate(calendarDate(d))
@@ -5958,6 +6458,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             sl,
             a,
             mitarbeiter,
+            isOpArt,
           )
         ) {
           fullKeys.add(k)
@@ -6025,7 +6526,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     const startK = makeSlotKey(dk, room, start)
     const sample = slotCells[startK]
     if (!sample || !isCellBooked(sample)) return null
-    const line = cellDisplayLine(sample, mitarbeiter)
+    const line = cellDisplayLine(sample, mitarbeiter, {
+      hideStaffAssignmentHint: kind === 'opTermin',
+    })
     const timeRange =
       start === end
         ? slotIndexToLabel(start)
@@ -6038,6 +6541,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       currentStaff: sample.staff,
       currentStaffId: sample.staffId,
       blockArtId: findArtIdForCell(sample, arten),
+      musterLinkId: sample.musterLinkId,
+      musterId: sample.musterId,
+      musterLabel: sample.muster?.trim() ?? null,
+      hasPatient: !!sample.patient?.trim(),
     }
   }, [terminPickerModal, slotCells, arten, mitarbeiter])
 
@@ -8434,7 +8941,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                         anchorSl,
                       )
                       const anchorData = cellsForActiveCalendarView[anchorKey]
-                      const line = cellDisplayLine(anchorData, mitarbeiter)
+                      const line = cellDisplayLine(anchorData, mitarbeiter, {
+                        hideStaffAssignmentHint: isOpDayCalendar,
+                      })
                       const terminParts = cellTerminLabelParts(
                         anchorData,
                         mitarbeiter,
@@ -8647,6 +9156,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                                           room,
                                           anchorSlot: sl,
                                         })
+                                      } else if (isOpDayCalendar) {
+                                        setTerminPickerModal({
+                                          kind: 'opTermin',
+                                          dk: activeDayKey,
+                                          room,
+                                          anchorSlot: sl,
+                                        })
                                       } else {
                                         setTerminPickerModal({
                                           kind: 'staff',
@@ -8740,12 +9256,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                                 {terminParts.art ?? '—'}
                               </span>
                               <span
-                                className={`slot-cell-termin-line ${terminParts.staffName ? 'slot-cell-termin-staff' : 'slot-cell-termin-assign'}`}
+                                className={`slot-cell-termin-line ${terminParts.staffName ? 'slot-cell-termin-staff' : isOpDayCalendar ? 'slot-cell-termin-placeholder' : 'slot-cell-termin-assign'}`}
                               >
                                 {terminParts.staffName ??
                                   (anchorData?.artId === TEAM_MEETING_ART_ID
                                     ? 'Teilnehmer wählen'
-                                    : 'Mitarbeiter zuteilen')}
+                                    : isOpDayCalendar
+                                      ? '—'
+                                      : 'Mitarbeiter zuteilen')}
                               </span>
                               {terminParts.notiz ? (
                                 <span className="slot-cell-termin-line slot-cell-termin-notiz">
@@ -9539,7 +10057,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                 ? 'Belegungsart wählen'
                 : terminPickerModal.kind === 'teamMeeting'
                   ? 'Teammeeting · Teilnehmer'
-                  : 'Mitarbeiter zuordnen'}
+                  : terminPickerModal.kind === 'opTermin'
+                    ? 'Termin (OP)'
+                    : 'Mitarbeiter zuordnen'}
             </h2>
             {terminModalDetail ? (
               terminPickerModal.kind === 'art' ? (
@@ -9730,6 +10250,88 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                       onClick={saveTeamMeetingFromModal}
                     >
                       Speichern
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-edit-save"
+                      onClick={closeTerminPickerModal}
+                    >
+                      Schließen
+                    </button>
+                  </div>
+                </>
+              ) : terminPickerModal.kind === 'opTermin' ? (
+                <>
+                  <p className="staff-modal-hint termin-staff-summary">
+                    {terminModalDetail.room} · {terminModalDetail.timeRange}
+                    {terminModalDetail.line ? (
+                      <>
+                        <br />
+                        <span className="termin-staff-line">
+                          {terminModalDetail.line}
+                        </span>
+                      </>
+                    ) : null}
+                  </p>
+                  <p className="staff-modal-hint">
+                    Im OP-Kalender ist keine Mitarbeiterzuweisung nötig. Für
+                    Zuordnung und Wochenplan wechseln Sie in den Hauptkalender.
+                  </p>
+                  {terminModalDetail.currentStaff ? (
+                    <p className="termin-staff-current">
+                      Im Hauptkalender zugewiesen:{' '}
+                      {terminModalDetail.currentStaff}
+                    </p>
+                  ) : null}
+                  {terminModalDetail.musterLinkId ? (
+                    <div className="staff-modal-hint">
+                      <p className="staff-modal-label">Belegungsmuster</p>
+                      <p>
+                        {muster.find((x) => x.id === terminModalDetail.musterId)
+                          ?.label ??
+                          terminModalDetail.musterLabel ??
+                          'Verknüpftes Muster'}
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="staff-modal-hint">
+                      Ziehen Sie ein Belegungsmuster aus dem Panel auf diese
+                      Buchung: Der OP-Tag im Muster entspricht diesem Tag; die
+                      übrigen Muster-Tage werden im Hauptkalender im passenden
+                      Raum und zur passenden Zeit eingetragen.
+                    </p>
+                  )}
+                  <TerminModalNotizFields
+                    draft={terminNotizDraft}
+                    onDraftChange={setTerminNotizDraft}
+                    onSave={saveTerminNotizFromModal}
+                  />
+                  <div className="staff-modal-footer termin-staff-footer">
+                    {terminModalDetail.musterLinkId &&
+                    terminModalDetail.hasPatient ? (
+                      <button
+                        type="button"
+                        className="btn-edit-cancel"
+                        onClick={stripPatientFromOpMusterBundleFromModal}
+                      >
+                        Patient aus allen Terminen entfernen
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="btn-edit-cancel"
+                      onClick={exportTerminToIcs}
+                    >
+                      Als .ics exportieren
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-termin-clear"
+                      onClick={clearTerminBlockFromModal}
+                    >
+                      {terminModalDetail.musterLinkId
+                        ? 'Muster und Folgetermine entfernen'
+                        : 'Termin leeren'}
                     </button>
                     <button
                       type="button"
