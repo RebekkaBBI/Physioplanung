@@ -1,6 +1,7 @@
 import { fetchWorkspaceDocumentsAction } from '@/actions/workspace'
 import type { Json } from '@/database.types'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
+import { applyWorkspaceDocumentPatch } from '@/lib/workspacePatch'
 import type { WorkspaceDocType } from '@/cloud/workspaceDocTypes'
 import {
   checkRateLimit,
@@ -47,12 +48,16 @@ export async function GET(request: Request) {
     }
     return NextResponse.json({ error: res.error }, { status: 400 })
   }
-  return NextResponse.json(res.data)
+  return NextResponse.json({
+    ...res.data,
+    versions: res.versions,
+  })
 }
 
 /**
- * Workspace-Dokument speichern (gleiche RLS wie im Client).
- * Auth: Supabase-Session-Cookie. Kein Service-Role-Key.
+ * Workspace-Dokument speichern (RLS, Optimistic Lock).
+ * Auth: Supabase-Session-Cookie.
+ * JSON optional: `base_updated_at` — ISO-Zeitstempel von GET `versions[doc_type]`; null bei neuem Dokument.
  */
 export async function POST(request: Request) {
   const ip = getRequestClientKey(request)
@@ -79,7 +84,12 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Too many requests' }, { status: 429 })
   }
 
-  let json: { organization_id?: unknown; doc_type?: unknown; body?: unknown }
+  let json: {
+    organization_id?: unknown
+    doc_type?: unknown
+    body?: unknown
+    base_updated_at?: unknown
+  }
   try {
     json = (await request.json()) as typeof json
   } catch {
@@ -105,17 +115,30 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const { error } = await supabase.from('workspace_documents').upsert(
-    {
-      organization_id: organizationId,
-      doc_type: docType,
-      body: (json.body ?? {}) as Json,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: 'organization_id,doc_type' },
-  )
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 400 })
+  const baseRaw = json.base_updated_at
+  let baseUpdatedAt: string | null = null
+  if (typeof baseRaw === 'string') {
+    baseUpdatedAt = baseRaw
+  } else if (baseRaw !== undefined && baseRaw !== null) {
+    return NextResponse.json(
+      { error: 'base_updated_at must be string or null' },
+      { status: 400 },
+    )
   }
-  return NextResponse.json({ ok: true })
+
+  const patch = await applyWorkspaceDocumentPatch(
+    supabase,
+    organizationId,
+    docType,
+    (json.body ?? {}) as Json,
+    baseUpdatedAt,
+  )
+  if (!patch.ok) {
+    const conflict = patch.error.toLowerCase().includes('konflikt')
+    return NextResponse.json(
+      { error: patch.error },
+      { status: conflict ? 409 : 400 },
+    )
+  }
+  return NextResponse.json({ ok: true, updated_at: patch.updated_at })
 }

@@ -60,10 +60,11 @@ Die frühere SPA-`vercel.json` mit Rewrite auf `index.html` ist entfernt (würde
 - **Server Actions** (`src/actions/workspace.ts`): Lesen/Schreiben von `workspace_documents` mit `getUser()` + Prüfung `profiles.organization_id` (zusätzlich zu RLS).
 - **API (optional)**:
   - `GET /api/auth/session` — nur mit gültiger Session: `{ authenticated, userId, email }`, sonst 401.
-  - `GET /api/workspace?organization_id=<uuid>` — JSON mit `slots` / `panels` / `ui` (wie in der DB), sonst 401/403.
-  - `POST /api/workspace` — JSON `{ "organization_id", "doc_type": "slots"|"panels"|"ui", "body" }`, sonst 401/403. **Rate-Limit:** grob pro IP und pro User (In-Memory, auf Serverless nur pro Instanz).
+  - `GET /api/workspace?organization_id=<uuid>` — JSON mit `slots` / `panels` / `ui` plus **`versions`** (`updated_at` pro Dokument oder `null`, wenn keine Zeile). Sonst 401/403.
+  - `POST /api/workspace` — JSON `{ "organization_id", "doc_type", "body", "base_updated_at": "<iso>" | null }`. Optimistic Lock: `base_updated_at` muss zum letzten `GET versions[doc_type]` passen; bei Konflikt **409**. **Rate-Limit:** grob pro IP und pro User (In-Memory, auf Serverless nur pro Instanz).
+  - `POST /api/admin/workspace` — nur Server: Header **`x-workspace-admin-secret`** = `WORKSPACE_ADMIN_SECRET`, Body wie oben. Nutzt **`SUPABASE_SERVICE_ROLE_KEY`** (umgeht RLS) — nur für Reparatur/Import, Geheimnis streng schützen.
 
-Es wird **kein** `service_role`-Key im Browser oder in diesen Routen verwendet; Schutz über Session + RLS + Organisations-Check.
+Im Browser und in normalen Routen wird nur der **Anon/Publishable**-Key genutzt; Schutz über Session + RLS + Organisations-Check. **Service Role** ausschließlich in `SUPABASE_SERVICE_ROLE_KEY` (ohne `NEXT_PUBLIC_`) und nur für die Admin-Route.
 
 ## Supabase CLI & Migrationen (lokal)
 

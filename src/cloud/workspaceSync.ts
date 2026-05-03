@@ -7,6 +7,8 @@ export type { WorkspaceDocType } from './workspaceDocTypes'
 const SAVE_ERROR_EVENT = 'physio-workspace-save-error'
 
 const timers = new Map<string, ReturnType<typeof setTimeout>>()
+/** Letzter bekannter updated_at pro Org+Dokument (Optimistic Lock) */
+const workspaceDocVersions = new Map<string, string | null>()
 /** Letzter Stand pro Dokument — für Debounce und Flush beim Tab-Schließen */
 const pendingBodies = new Map<
   string,
@@ -29,14 +31,19 @@ async function runUpsert(
   docType: WorkspaceDocType,
   body: unknown,
 ): Promise<void> {
+  const key = `${organizationId}:${docType}`
+  const base = workspaceDocVersions.get(key) ?? null
   const result = await upsertWorkspaceDocumentAction(
     organizationId,
     docType,
     body,
+    base,
   )
   if (!result.ok) {
     dispatchSaveError(result.error)
+    return
   }
+  workspaceDocVersions.set(key, result.updated_at)
 }
 
 function runDebounced(
@@ -96,6 +103,9 @@ export async function fetchWorkspaceDocuments(
   if (!res.ok) {
     console.error('fetchWorkspaceDocuments', res.error)
     return {}
+  }
+  for (const t of ['slots', 'panels', 'ui'] as const) {
+    workspaceDocVersions.set(`${organizationId}:${t}`, res.versions[t])
   }
   return res.data
 }

@@ -1,9 +1,12 @@
 'use server'
 
 import type { SupabaseClient } from '@supabase/supabase-js'
-import type { Database, Json } from '@/database.types'
+import type { Database } from '@/database.types'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
+import { applyWorkspaceDocumentPatch } from '@/lib/workspacePatch'
 import type { WorkspaceDocType } from '@/cloud/workspaceDocTypes'
+
+export type WorkspaceVersions = Record<WorkspaceDocType, string | null>
 
 async function assertOrgForUser(
   supabase: SupabaseClient<Database>,
@@ -26,7 +29,10 @@ export async function upsertWorkspaceDocumentAction(
   organizationId: string,
   docType: WorkspaceDocType,
   body: unknown,
-): Promise<{ ok: true } | { ok: false; error: string }> {
+  expectedUpdatedAt: string | null,
+): Promise<
+  { ok: true; updated_at: string } | { ok: false; error: string }
+> {
   const supabase = await createSupabaseServerClient()
   const {
     data: { user },
@@ -38,23 +44,19 @@ export async function upsertWorkspaceDocumentAction(
   const gate = await assertOrgForUser(supabase, user.id, organizationId)
   if (!gate.ok) return gate
 
-  const { error } = await supabase.from('workspace_documents').upsert(
-    {
-      organization_id: organizationId,
-      doc_type: docType,
-      body: body as Json,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: 'organization_id,doc_type' },
+  return applyWorkspaceDocumentPatch(
+    supabase,
+    organizationId,
+    docType,
+    body,
+    expectedUpdatedAt,
   )
-  if (error) return { ok: false, error: error.message }
-  return { ok: true }
 }
 
 export async function fetchWorkspaceDocumentsAction(
   organizationId: string,
 ): Promise<
-  | { ok: true; data: Partial<Record<WorkspaceDocType, unknown>> }
+  | { ok: true; data: Partial<Record<WorkspaceDocType, unknown>>; versions: WorkspaceVersions }
   | { ok: false; error: string }
 > {
   const supabase = await createSupabaseServerClient()
@@ -70,15 +72,21 @@ export async function fetchWorkspaceDocumentsAction(
 
   const { data, error } = await supabase
     .from('workspace_documents')
-    .select('doc_type, body')
+    .select('doc_type, body, updated_at')
     .eq('organization_id', organizationId)
   if (error) return { ok: false, error: error.message }
   const out: Partial<Record<WorkspaceDocType, unknown>> = {}
+  const versions: WorkspaceVersions = {
+    slots: null,
+    panels: null,
+    ui: null,
+  }
   for (const row of data ?? []) {
     const t = row.doc_type as WorkspaceDocType
     if (t === 'slots' || t === 'panels' || t === 'ui') {
       out[t] = row.body
+      versions[t] = row.updated_at
     }
   }
-  return { ok: true, data: out }
+  return { ok: true, data: out, versions }
 }

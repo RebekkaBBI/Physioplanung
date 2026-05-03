@@ -84,7 +84,17 @@ export type Database = {
       }
     }
     Views: Record<string, never>
-    Functions: Record<string, never>
+    Functions: {
+      apply_workspace_document_patch: {
+        Args: {
+          p_organization_id: string
+          p_doc_type: string
+          p_body: Json
+          p_expected_updated_at: string | null
+        }
+        Returns: Json
+      }
+    }
     Enums: Record<string, never>
     CompositeTypes: Record<string, never>
   }
