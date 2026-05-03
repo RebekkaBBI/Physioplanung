@@ -1,10 +1,12 @@
 'use server'
 
+import type { SupabaseClient } from '@supabase/supabase-js'
+import type { Database, Json } from '@/database.types'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
 import type { WorkspaceDocType } from '@/cloud/workspaceDocTypes'
 
 async function assertOrgForUser(
-  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
+  supabase: SupabaseClient<Database>,
   userId: string,
   organizationId: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -40,7 +42,7 @@ export async function upsertWorkspaceDocumentAction(
     {
       organization_id: organizationId,
       doc_type: docType,
-      body: body as Record<string, unknown>,
+      body: body as Json,
       updated_at: new Date().toISOString(),
     },
     { onConflict: 'organization_id,doc_type' },

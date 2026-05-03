@@ -1,4 +1,5 @@
 import { fetchWorkspaceDocumentsAction } from '@/actions/workspace'
+import type { Json } from '@/database.types'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
 import type { WorkspaceDocType } from '@/cloud/workspaceDocTypes'
 import {
@@ -108,7 +109,7 @@ export async function POST(request: Request) {
     {
       organization_id: organizationId,
       doc_type: docType,
-      body: (json.body ?? {}) as Record<string, unknown>,
+      body: (json.body ?? {}) as Json,
       updated_at: new Date().toISOString(),
     },
     { onConflict: 'organization_id,doc_type' },
