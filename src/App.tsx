@@ -696,6 +696,58 @@ function findBlockBounds(
   return { start, end }
 }
 
+/**
+ * Gleiche Lage wie blockSignature, aber ohne Mitarbeiter — für Zuteilung per Drag/Dialog,
+ * wenn Slots durch frühere Teil-Updates unterschiedliche staff/staffId haben und sonst
+ * findBlockBounds nur noch einen Slot fände (fragmentierte Darstellung).
+ */
+function terminBlockSignatureIgnoringStaff(c: CellData | undefined): string {
+  if (!c || !isCellBooked(c)) return '__empty__'
+  const parts = [
+    c.patient ?? '',
+    c.patientCode ?? '',
+    c.artId ?? '',
+    c.art ?? '',
+    c.muster ?? '',
+    c.terminKollision ? '1' : '0',
+    c.notiz ?? '',
+  ]
+  if (c.teamStaffIds?.length) {
+    parts.push([...c.teamStaffIds].sort().join(','))
+  }
+  return parts.join('\x1f')
+}
+
+function findTerminBlockBoundsIgnoringStaff(
+  cells: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  slotIndex: number,
+): { start: number; end: number } {
+  const key = (s: number) => makeSlotKey(dk, room, s)
+  const cur = cells[key(slotIndex)]
+  if (!cur || !isCellBooked(cur)) {
+    return { start: slotIndex, end: slotIndex }
+  }
+  const sig = terminBlockSignatureIgnoringStaff(cur)
+  let start = slotIndex
+  while (
+    start > 0 &&
+    terminBlockSignatureIgnoringStaff(cells[key(start - 1)]) === sig
+  ) {
+    start--
+  }
+  const max = slotCount()
+  let end = slotIndex
+  while (
+    end + 1 < max &&
+    terminBlockSignatureIgnoringStaff(cells[key(end + 1)]) === sig
+  ) {
+    end++
+  }
+  return { start, end }
+}
+
 type DaySlotBlockSegment = 'single' | 'start' | 'middle' | 'end'
 
 /** Position innerhalb eines zusammenhängenden Termins in einer Raum-Spalte (Tagesansicht). */
@@ -5019,7 +5071,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         if (payload.kind === 'staff') {
           const s = staffById(payload.id)
           if (!s) return prev
-          const { start, end } = findBlockBounds(prev, dk, room, startSlot)
+          const { start, end } = findTerminBlockBoundsIgnoringStaff(
+            prev,
+            dk,
+            room,
+            startSlot,
+          )
           const startK = makeSlotKey(dk, room, start)
           if (!isCellBooked(prev[startK])) return prev
           const anchorCell = prev[startK]
@@ -5252,7 +5309,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     (artId: string) => {
       if (!terminPickerModal || terminPickerModal.kind !== 'art') return
       const { dk, room, anchorSlot } = terminPickerModal
-      const { start } = findBlockBounds(slotCells, dk, room, anchorSlot)
+      const { start } = findTerminBlockBoundsIgnoringStaff(
+        slotCells,
+        dk,
+        room,
+        anchorSlot,
+      )
       applyDrop(dk, room, start, { kind: 'art', id: artId })
       setTerminPickerModal(null)
     },
@@ -5266,7 +5328,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       const s = mitarbeiter.find((x) => x.id === staffId)
       if (!s) return
       setSlotCells((prev) => {
-        const { start, end } = findBlockBounds(prev, dk, room, anchorSlot)
+        const { start, end } = findTerminBlockBoundsIgnoringStaff(
+          prev,
+          dk,
+          room,
+          anchorSlot,
+        )
         const startK = makeSlotKey(dk, room, start)
         if (!isCellBooked(prev[startK])) return prev
         const wd = weekdayMon0FromDate(parseDateKey(dk))
@@ -5503,8 +5570,11 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       setTerminNotizDraft('')
       return
     }
-    const { dk, room, anchorSlot } = terminPickerModal
-    const { start } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const { kind, dk, room, anchorSlot } = terminPickerModal
+    const { start } =
+      kind === 'teamMeeting'
+        ? findBlockBounds(slotCells, dk, room, anchorSlot)
+        : findTerminBlockBoundsIgnoringStaff(slotCells, dk, room, anchorSlot)
     const sample = slotCells[makeSlotKey(dk, room, start)]
     setTerminNotizDraft(sample?.notiz?.trim() ?? '')
   }, [terminPickerModal, slotCells])
@@ -5530,10 +5600,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   const saveTerminNotizFromModal = useCallback(() => {
     if (!terminPickerModal) return
-    const { dk, room, anchorSlot } = terminPickerModal
+    const { kind, dk, room, anchorSlot } = terminPickerModal
     const trimmed = terminNotizDraft.trim()
     setSlotCells((prev) => {
-      const { start, end } = findBlockBounds(prev, dk, room, anchorSlot)
+      const { start, end } =
+        kind === 'teamMeeting'
+          ? findBlockBounds(prev, dk, room, anchorSlot)
+          : findTerminBlockBoundsIgnoringStaff(prev, dk, room, anchorSlot)
       const next = { ...prev }
       for (let sl = start; sl <= end; sl++) {
         const k = makeSlotKey(dk, room, sl)
@@ -5683,7 +5756,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const terminModalDetail = useMemo(() => {
     if (!terminPickerModal) return null
     const { kind, dk, room, anchorSlot } = terminPickerModal
-    const { start, end } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const { start, end } =
+      kind === 'teamMeeting'
+        ? findBlockBounds(slotCells, dk, room, anchorSlot)
+        : findTerminBlockBoundsIgnoringStaff(slotCells, dk, room, anchorSlot)
     const startK = makeSlotKey(dk, room, start)
     const sample = slotCells[startK]
     if (!sample || !isCellBooked(sample)) return null
@@ -5723,7 +5799,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const staffPickListForTerminModal = useMemo(() => {
     if (!terminPickerModal || terminPickerModal.kind !== 'staff') return null
     const { dk, room, anchorSlot } = terminPickerModal
-    const { start, end } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const { start, end } = findTerminBlockBoundsIgnoringStaff(
+      slotCells,
+      dk,
+      room,
+      anchorSlot,
+    )
     const startK = makeSlotKey(dk, room, start)
     const sample = slotCells[startK]
     if (!sample || !isCellBooked(sample)) return null
