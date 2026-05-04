@@ -100,6 +100,8 @@ const DAY_END_HOUR = 22
 const OP_TAB_VIEW_START_HOUR = 7
 const OP_TAB_VIEW_END_HOUR = 18
 const CALENDAR_TAB_OP = 'op' as const
+/** OP-Kalender: feste Übersicht (Spalten = Tage, Zeilen = Uhrzeiten). */
+const OP_OVERVIEW_DAY_COUNT = 12
 
 const MIME_PHYSIO = 'application/x-physio-planung+json'
 
@@ -5149,13 +5151,16 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     return startWeeklyBackupScheduler()
   }, [cloudSyncEnabled])
 
+  const opOverviewDays = useMemo(() => {
+    const start = calendarDate(anchorDate)
+    return Array.from({ length: OP_OVERVIEW_DAY_COUNT }, (_, i) =>
+      addDays(start, i),
+    )
+  }, [anchorDate])
+
   useEffect(() => {
-    if (
-      (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP) ||
-      viewMode !== 'day'
-    ) {
-      return
-    }
+    if (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP) return
+    if (calendarTabId === 'main' && viewMode !== 'day') return
     const terminSlot = pendingScrollToTerminSlotRef.current
     if (terminSlot !== null && Number.isFinite(terminSlot)) {
       pendingScrollToTerminSlotRef.current = null
@@ -5181,7 +5186,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     if (!pendingScrollToNow.current) return
     pendingScrollToNow.current = false
     const now = new Date()
-    if (dateKey(anchorDate) !== dateKey(now)) return
+    if (calendarTabId === CALENDAR_TAB_OP) {
+      if (
+        !opOverviewDays.some((d) => dateKey(d) === dateKey(now))
+      ) {
+        return
+      }
+    } else if (dateKey(anchorDate) !== dateKey(now)) {
+      return
+    }
     const mins =
       now.getHours() * 60 + now.getMinutes() - DAY_START_HOUR * 60
     if (mins < 0 || mins >= (DAY_END_HOUR - DAY_START_HOUR) * 60) return
@@ -5195,7 +5208,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         ?.querySelector(`[data-slot-row="${scrollRow}"]`)
         ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
     })
-  }, [calendarTabId, viewMode, anchorDate])
+  }, [calendarTabId, viewMode, anchorDate, opOverviewDays])
 
   const filteredPatients = useMemo(() => {
     const q = patientSearchQuery.trim().toLowerCase()
@@ -5675,7 +5688,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           const { start: blockStart } = findBlockBounds(prev, dk, room, startSlot)
           const anchorK = makeSlotKey(dk, room, blockStart)
           const anchor = prev[anchorK]
-          if (calendarTabId === CALENDAR_TAB_OP && viewMode === 'day') {
+          if (calendarTabId === CALENDAR_TAB_OP) {
             if (!anchor || !isCellBooked(anchor)) {
               alertOnce('Bitte auf eine bestehende OP-Buchung ziehen.')
               return prev
@@ -5808,7 +5821,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       muster,
       mitarbeiter,
       calendarTabId,
-      viewMode,
       setTerminPickerModal,
       setSlotCells,
     ],
@@ -6457,24 +6469,46 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   )
 
   const navPrev = () => {
-    if (viewMode === 'day') setAnchorDate((d) => addDays(d, -1))
-    else setAnchorDate((d) => addDays(d, -7))
+    if (calendarTabId === CALENDAR_TAB_OP) {
+      setAnchorDate((d) => addDays(d, -OP_OVERVIEW_DAY_COUNT))
+    } else if (viewMode === 'day') {
+      setAnchorDate((d) => addDays(d, -1))
+    } else {
+      setAnchorDate((d) => addDays(d, -7))
+    }
   }
 
   const navNext = () => {
-    if (viewMode === 'day') setAnchorDate((d) => addDays(d, 1))
-    else setAnchorDate((d) => addDays(d, 7))
+    if (calendarTabId === CALENDAR_TAB_OP) {
+      setAnchorDate((d) => addDays(d, OP_OVERVIEW_DAY_COUNT))
+    } else if (viewMode === 'day') {
+      setAnchorDate((d) => addDays(d, 1))
+    } else {
+      setAnchorDate((d) => addDays(d, 7))
+    }
   }
 
   const headerLabel =
-    viewMode === 'day'
-      ? anchorDate.toLocaleDateString('de-DE', {
-          weekday: 'long',
+    calendarTabId === CALENDAR_TAB_OP
+      ? `${opOverviewDays[0]!.toLocaleDateString('de-DE', {
           day: 'numeric',
-          month: 'long',
-          year: 'numeric',
-        })
-      : `KW ${getWeekNumber(weekStart)} · ${formatWeekRange(weekStart)}`
+          month: 'short',
+        })} – ${opOverviewDays[OP_OVERVIEW_DAY_COUNT - 1]!.toLocaleDateString(
+          'de-DE',
+          {
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric',
+          },
+        )}`
+      : viewMode === 'day'
+        ? anchorDate.toLocaleDateString('de-DE', {
+            weekday: 'long',
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric',
+          })
+        : `KW ${getWeekNumber(weekStart)} · ${formatWeekRange(weekStart)}`
 
   const slots = slotCount()
   const isOpDayCalendar =
@@ -6492,59 +6526,61 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   )
 
   const artDropPreview = useMemo(() => {
-    if (
-      !artDragHighlight ||
-      viewMode !== 'day' ||
-      (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP)
-    ) {
+    if (!artDragHighlight) return null
+    if (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP)
       return null
-    }
+    if (calendarTabId === 'main' && viewMode !== 'day') return null
     const a = arten.find((x) => x.id === artDragHighlight.artId)
     if (!a) return null
     const fullKeys = new Set<string>()
     const partialKeys = new Set<string>()
-    const dk = activeDayKey
-    const wd = weekdayMon0FromDate(parseDateKey(dk))
+    const dkList =
+      calendarTabId === CALENDAR_TAB_OP
+        ? opOverviewDays.map((d) => dateKey(d))
+        : [activeDayKey]
     const artSpanSlots = Math.max(1, a.slots)
     const isOpArt = calendarTabId === CALENDAR_TAB_OP
     const slotLoopN = isOpArt ? opViewSlotCount() : slots
-    for (const room of calendarRooms) {
-      for (let vi = 0; vi < slotLoopN; vi++) {
-        const sl = isOpArt ? opViewIndexToGlobalSlot(vi) : vi
-        if (sl === null) continue
-        const k = makeSlotKey(dk, room, sl)
-        if (
-          cellIsValidArtPanelDropPreview(
-            slotCells,
-            dk,
-            room,
-            sl,
-            a,
-            mitarbeiter,
-            isOpArt,
-          )
-        ) {
-          fullKeys.add(k)
-        } else if (
-          artSpanSlots > 1 &&
-          !slotIndexInCalendarLunchPause(sl) &&
-          (isTeamMeetingArt(a)
-            ? someStaffEligibleForTeamMeetingSlot(
-                mitarbeiter,
-                a.id,
-                dk,
-                wd,
-                sl,
-              )
-            : someStaffCanTreatArtAtSingleSlot(
-                mitarbeiter,
-                a.id,
-                dk,
-                wd,
-                sl,
-              ))
-        ) {
-          partialKeys.add(k)
+    for (const dk of dkList) {
+      const wd = weekdayMon0FromDate(parseDateKey(dk))
+      for (const room of calendarRooms) {
+        for (let vi = 0; vi < slotLoopN; vi++) {
+          const sl = isOpArt ? opViewIndexToGlobalSlot(vi) : vi
+          if (sl === null) continue
+          const k = makeSlotKey(dk, room, sl)
+          if (
+            cellIsValidArtPanelDropPreview(
+              slotCells,
+              dk,
+              room,
+              sl,
+              a,
+              mitarbeiter,
+              isOpArt,
+            )
+          ) {
+            fullKeys.add(k)
+          } else if (
+            artSpanSlots > 1 &&
+            !slotIndexInCalendarLunchPause(sl) &&
+            (isTeamMeetingArt(a)
+              ? someStaffEligibleForTeamMeetingSlot(
+                  mitarbeiter,
+                  a.id,
+                  dk,
+                  wd,
+                  sl,
+                )
+              : someStaffCanTreatArtAtSingleSlot(
+                  mitarbeiter,
+                  a.id,
+                  dk,
+                  wd,
+                  sl,
+                ))
+          ) {
+            partialKeys.add(k)
+          }
         }
       }
     }
@@ -6559,12 +6595,19 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     activeDayKey,
     slots,
     calendarRooms,
+    opOverviewDays,
   ])
 
   const now = new Date()
   const isToday = dateKey(anchorDate) === dateKey(now)
+  const opOverviewHasToday =
+    calendarTabId === CALENDAR_TAB_OP &&
+    opOverviewDays.some((d) => dateKey(d) === dateKey(now))
   const currentSlot =
-    isToday && viewMode === 'day'
+    ((isToday && viewMode === 'day') || opOverviewHasToday) &&
+    (now.getHours() * 60 + now.getMinutes() - DAY_START_HOUR * 60) >= 0 &&
+    (now.getHours() * 60 + now.getMinutes() - DAY_START_HOUR * 60) <
+      (DAY_END_HOUR - DAY_START_HOUR) * 60
       ? Math.floor(
           (now.getHours() * 60 + now.getMinutes() - DAY_START_HOUR * 60) /
             SLOT_MINUTES,
@@ -8249,14 +8292,17 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               className={viewMode === 'day' ? 'active' : ''}
               aria-pressed={viewMode === 'day'}
               disabled={
+                calendarTabId === CALENDAR_TAB_OP ||
                 (calendarTabId !== 'main' &&
                   calendarTabId !== CALENDAR_TAB_OP) ||
                 isViewer
               }
               title={
-                calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP
-                  ? 'Im Mitarbeiter-Kalender nur Wochenansicht Mo–So'
-                  : undefined
+                calendarTabId === CALENDAR_TAB_OP
+                  ? 'Im OP-Kalender: feste 12-Tage-Übersicht'
+                  : calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP
+                    ? 'Im Mitarbeiter-Kalender nur Wochenansicht Mo–So'
+                    : undefined
               }
               onClick={() => setViewMode('day')}
             >
@@ -8266,7 +8312,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               type="button"
               className={viewMode === 'week' ? 'active' : ''}
               aria-pressed={viewMode === 'week'}
-              disabled={isViewer}
+              disabled={calendarTabId === CALENDAR_TAB_OP || isViewer}
+              title={
+                calendarTabId === CALENDAR_TAB_OP
+                  ? 'Im OP-Kalender: feste 12-Tage-Übersicht'
+                  : undefined
+              }
               onClick={() => setViewMode('week')}
             >
               Wochenansicht
@@ -8785,6 +8836,488 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                   ))}
                 </div>
               </div>
+          ) : calendarTabId === CALENDAR_TAB_OP ? (
+            <div className="grid-wrap grid-wrap--op-12d" ref={dayGridRef}>
+              <div
+                className="plan-grid day-grid plan-grid--op-12d"
+                style={{
+                  gridTemplateColumns: `minmax(3rem, 3.5rem) repeat(${OP_OVERVIEW_DAY_COUNT}, minmax(4rem, 1fr))`,
+                  gridTemplateRows: `auto repeat(${opViewSlotCount()}, minmax(0, 1fr))`,
+                }}
+              >
+                <div
+                  className="corner"
+                  style={{ gridColumn: 1, gridRow: 1 }}
+                />
+                {opOverviewDays.map((dayDate, dayIdx) => {
+                  const dayDk = dateKey(dayDate)
+                  const isColToday = dayDk === dateKey(now)
+                  return (
+                    <div
+                      key={dayDk}
+                      className={`col-head ${isColToday ? 'is-today' : ''}`}
+                      style={{ gridColumn: dayIdx + 2, gridRow: 1 }}
+                    >
+                      <span className="wd">
+                        {dayDate.toLocaleDateString('de-DE', {
+                          weekday: 'short',
+                        })}
+                      </span>
+                      <span className="dm">
+                        {dayDate.toLocaleDateString('de-DE', {
+                          day: 'numeric',
+                          month: 'short',
+                        })}
+                      </span>
+                    </div>
+                  )
+                })}
+                {Array.from({ length: opViewSlotCount() }, (_, viewSlotIdx) => {
+                  const g = opViewIndexToGlobalSlot(viewSlotIdx)
+                  if (g === null) {
+                    return (
+                      <div
+                        key={`op12-pad-${viewSlotIdx}`}
+                        className="day-slot-row"
+                        data-slot-row={viewSlotIdx}
+                        style={{ display: 'contents' }}
+                      >
+                        <div
+                          className="time-label"
+                          style={{ gridColumn: 1, gridRow: viewSlotIdx + 2 }}
+                        >
+                          {opViewSlotIndexToLabel(viewSlotIdx)}
+                        </div>
+                        {opOverviewDays.map((dayDate, dayIdx) => (
+                          <div
+                            key={dateKey(dayDate)}
+                            className="slot-cell-shell slot-cell-shell--op-placeholder"
+                            style={{
+                              gridColumn: dayIdx + 2,
+                              gridRow: viewSlotIdx + 2,
+                            }}
+                            aria-hidden="true"
+                          />
+                        ))}
+                      </div>
+                    )
+                  }
+                  const slotIndex = g
+                  const lunchPauseRow =
+                    slotIndexInCalendarLunchPause(slotIndex)
+                  const slotRowNowLine =
+                    opOverviewHasToday &&
+                    slotIndex === currentSlot &&
+                    currentSlot >= 0
+                  const rowMergeNext = opOverviewDays.some((dayDate) => {
+                    const dk = dateKey(dayDate)
+                    const d =
+                      cellsForActiveCalendarView[
+                        makeSlotKey(dk, OP_TAB_ROOM, slotIndex)
+                      ]
+                    if (!isCellBooked(d)) return false
+                    const seg = daySlotBlockSegment(
+                      cellsForActiveCalendarView,
+                      dk,
+                      OP_TAB_ROOM,
+                      slotIndex,
+                      slots,
+                    )
+                    return seg === 'start' || seg === 'middle'
+                  })
+                  return (
+                    <div
+                      key={viewSlotIdx}
+                      className="day-slot-row"
+                      data-slot-row={viewSlotIdx}
+                      style={{ display: 'contents' }}
+                    >
+                      <div
+                        className={`time-label ${slotRowNowLine ? 'now-line' : ''} ${rowMergeNext ? 'time-label--merge-next' : ''} ${lunchPauseRow ? 'time-label--lunch-pause' : ''}`}
+                        style={{ gridColumn: 1, gridRow: viewSlotIdx + 2 }}
+                      >
+                        {opViewSlotIndexToLabel(viewSlotIdx)}
+                      </div>
+                      {opOverviewDays.map((dayDate, dayIdx) => {
+                        const dayDk = dateKey(dayDate)
+                        const gridCol = dayIdx + 2
+                        const room = OP_TAB_ROOM
+                        const kHere = makeSlotKey(dayDk, room, slotIndex)
+                        const dataHere = cellsForActiveCalendarView[kHere]
+                        const booked = isCellBooked(dataHere)
+                        const bounds = booked
+                          ? findBlockBounds(
+                              cellsForActiveCalendarView,
+                              dayDk,
+                              room,
+                              slotIndex,
+                            )
+                          : null
+                        const spanLen = bounds
+                          ? bounds.end - bounds.start + 1
+                          : 1
+                        const skipBecauseSpanned =
+                          booked &&
+                          bounds !== null &&
+                          spanLen > 1 &&
+                          viewSlotIdx !==
+                            opViewGridRowRangeFromGlobalBounds(
+                              bounds.start,
+                              bounds.end,
+                            ).v0
+                        if (skipBecauseSpanned) {
+                          return null
+                        }
+                        const slotIndicesForShell =
+                          booked && bounds
+                            ? Array.from(
+                                { length: spanLen },
+                                (_, i) => bounds.start + i,
+                              )
+                            : [slotIndex]
+                        const gridRow =
+                          booked && bounds
+                            ? (() => {
+                                const { v0, v1 } =
+                                  opViewGridRowRangeFromGlobalBounds(
+                                    bounds.start,
+                                    bounds.end,
+                                  )
+                                return `${v0 + 2} / ${v1 + 3}`
+                              })()
+                            : viewSlotIdx + 2
+                        const anchorSl = slotIndicesForShell[0]
+                        const anchorKey = makeSlotKey(
+                          dayDk,
+                          room,
+                          anchorSl,
+                        )
+                        const anchorData =
+                          cellsForActiveCalendarView[anchorKey]
+                        const line = cellDisplayLine(anchorData, mitarbeiter, {
+                          hideStaffAssignmentHint: true,
+                        })
+                        const terminParts = cellTerminLabelParts(
+                          anchorData,
+                          mitarbeiter,
+                        )
+                        const accent = cellAccentColor(anchorData)
+                        const blockSegFirst = daySlotBlockSegment(
+                          cellsForActiveCalendarView,
+                          dayDk,
+                          room,
+                          anchorSl,
+                          slots,
+                        )
+                        const lastSl =
+                          slotIndicesForShell[slotIndicesForShell.length - 1]
+                        const blockSegLast = daySlotBlockSegment(
+                          cellsForActiveCalendarView,
+                          dayDk,
+                          room,
+                          lastSl,
+                          slots,
+                        )
+                        const showBlockLabel =
+                          booked &&
+                          blockSegFirst !== null &&
+                          (blockSegFirst === 'single' ||
+                            blockSegFirst === 'start')
+                        const edgeStyle =
+                          booked
+                            ? ({
+                                '--block-edge': accent ?? 'var(--booked-edge)',
+                              } as CSSProperties)
+                            : undefined
+                        const showResizeTop =
+                          booked &&
+                          blockSegFirst !== null &&
+                          (blockSegFirst === 'start' ||
+                            blockSegFirst === 'single')
+                        const showResizeBottom =
+                          booked &&
+                          blockSegLast !== null &&
+                          (blockSegLast === 'end' ||
+                            blockSegLast === 'single')
+                        const shellBookedStyle =
+                          booked
+                            ? ({
+                                ...edgeStyle,
+                                gridColumn: gridCol,
+                                gridRow,
+                                ...(accent
+                                  ? {
+                                      background: `color-mix(in srgb, ${accent} 35%, var(--slot-free))`,
+                                    }
+                                  : { background: 'var(--booked)' }),
+                              } as CSSProperties)
+                            : ({
+                                gridColumn: gridCol,
+                                gridRow,
+                              } as CSSProperties)
+                        const shellDragActive = slotIndicesForShell.some(
+                          (sl) =>
+                            dragOverKey === makeSlotKey(dayDk, room, sl),
+                        )
+                        const mergeNextClass =
+                          booked &&
+                          spanLen === 1 &&
+                          blockSegFirst &&
+                          (blockSegFirst === 'start' ||
+                            blockSegFirst === 'middle')
+                        const terminKollisionClass =
+                          anchorData?.terminKollision
+                            ? 'slot-cell-shell--termin-kollision'
+                            : ''
+                        const lunchShell =
+                          slotIndicesForShell.some((ssi) =>
+                            slotIndexInCalendarLunchPause(ssi),
+                          )
+                        return (
+                          <div
+                            key={`${dayDk}-${anchorKey}`}
+                            className={[
+                              'slot-cell-shell',
+                              spanLen > 1
+                                ? 'slot-cell-shell--span-block'
+                                : '',
+                              shellDragActive ? 'drag-over' : '',
+                              mergeNextClass ? 'slot-shell--merge-next' : '',
+                              terminKollisionClass,
+                              lunchShell ? 'slot-cell-shell--lunch-pause' : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' ')}
+                            style={shellBookedStyle}
+                          >
+                            {showResizeTop ? (
+                              <div
+                                className="slot-resize-handle slot-resize-handle--top"
+                                draggable
+                                onDragStart={(e) => {
+                                  e.stopPropagation()
+                                  startResizeDrag(
+                                    e,
+                                    dayDk,
+                                    room,
+                                    'top',
+                                    anchorSl,
+                                  )
+                                }}
+                                onDragEnd={endPanelOrCellDrag}
+                                title="Termin am oberen Rand verlängern oder verkürzen"
+                                aria-label="Oberen Terminrand ziehen zum Verlängern oder Verkürzen"
+                              />
+                            ) : null}
+                            <div className="slot-cell-span-body">
+                              {slotIndicesForShell.map((sl) => {
+                                const k = makeSlotKey(dayDk, room, sl)
+                                const data = cellsForActiveCalendarView[k]
+                                const subBooked = isCellBooked(data)
+                                const subSeg = daySlotBlockSegment(
+                                  cellsForActiveCalendarView,
+                                  dayDk,
+                                  room,
+                                  sl,
+                                  slots,
+                                )
+                                const artPreviewFull =
+                                  artDropPreview?.fullKeys.has(k) ?? false
+                                const artPreviewPartial =
+                                  !artPreviewFull &&
+                                  (artDropPreview?.partialKeys.has(k) ??
+                                    false)
+                                const artPreviewHere =
+                                  artPreviewFull || artPreviewPartial
+                                const artTintStyle =
+                                  artPreviewHere && artDropPreview
+                                    ? ({
+                                        '--art-drop-tint':
+                                          artDropPreview.color,
+                                        '--art-drop-inset': `inset 0 0 0 999px color-mix(in srgb, ${artDropPreview.color} ${artPreviewFull ? 22 : 10}%, transparent)`,
+                                      } as CSSProperties)
+                                    : undefined
+                                const cellNowLine =
+                                  dayDk === dateKey(now) &&
+                                  sl === currentSlot &&
+                                  currentSlot >= 0
+                                return (
+                                  <button
+                                    key={k}
+                                    type="button"
+                                    className={`slot-cell slot-cell-main ${subBooked ? 'booked' : ''} ${subBooked && subSeg ? `slot-block--${subSeg}` : ''} ${cellNowLine ? 'now-line' : ''} ${data?.terminKollision ? 'slot-cell--termin-kollision' : ''} ${slotIndexInCalendarLunchPause(sl) ? 'slot-cell--lunch-pause' : ''} ${artPreviewHere ? 'slot-cell--art-drop-preview' : ''}`}
+                                    style={
+                                      subBooked
+                                        ? {
+                                            ...edgeStyle,
+                                            ...(accent
+                                              ? {
+                                                  background: `color-mix(in srgb, ${accent} 35%, var(--slot-free))`,
+                                                }
+                                              : {
+                                                  background: 'var(--booked)',
+                                                }),
+                                            ...artTintStyle,
+                                          }
+                                        : artTintStyle
+                                    }
+                                    draggable={subBooked}
+                                    title={
+                                      data?.terminKollision
+                                        ? 'Terminkollision'
+                                        : artPreviewPartial &&
+                                            draggedArtForPreview
+                                          ? `Nur dieses ${SLOT_MINUTES}-Minuten-Fenster: keine volle Dauer (${draggedArtForPreview.slots * SLOT_MINUTES} Min.) mit einem Mitarbeiter möglich.`
+                                          : undefined
+                                    }
+                                    onClick={() => {
+                                      if (
+                                        Date.now() -
+                                          suppressSlotClickAfterDrag.current <
+                                        450
+                                      ) {
+                                        return
+                                      }
+                                      if (subBooked) {
+                                        const { start: blockStart } =
+                                          findBlockBounds(
+                                            slotCells,
+                                            dayDk,
+                                            room,
+                                            sl,
+                                          )
+                                        const blockStartData =
+                                          slotCells[
+                                            makeSlotKey(
+                                              dayDk,
+                                              room,
+                                              blockStart,
+                                            )
+                                          ]
+                                        if (
+                                          findArtIdForCell(
+                                            blockStartData,
+                                            arten,
+                                          ) === TEAM_MEETING_ART_ID
+                                        ) {
+                                          setTerminPickerModal({
+                                            kind: 'teamMeeting',
+                                            dk: dayDk,
+                                            room,
+                                            anchorSlot: sl,
+                                          })
+                                        } else {
+                                          setTerminPickerModal({
+                                            kind: 'opTermin',
+                                            dk: dayDk,
+                                            room,
+                                            anchorSlot: sl,
+                                          })
+                                        }
+                                      } else {
+                                        toggleSlot(dayDk, room, sl)
+                                      }
+                                    }}
+                                    onDragStart={(e) => {
+                                      if (!subBooked) return
+                                      e.stopPropagation()
+                                      startCellMoveDrag(
+                                        e,
+                                        dayDk,
+                                        room,
+                                        sl,
+                                      )
+                                    }}
+                                    onDragEnd={() => {
+                                      endPanelOrCellDrag()
+                                      suppressSlotClickAfterDrag.current =
+                                        Date.now()
+                                    }}
+                                    onDragOver={(e) => {
+                                      e.preventDefault()
+                                      e.stopPropagation()
+                                      e.dataTransfer.dropEffect =
+                                        dragSourceRef.current === 'cell'
+                                          ? 'move'
+                                          : 'copy'
+                                      setDragOverKey(k)
+                                    }}
+                                    onDragLeave={() =>
+                                      setDragOverKey((key) =>
+                                        key === k ? null : key,
+                                      )
+                                    }
+                                    onDrop={(e) =>
+                                      handleDropOnSlot(
+                                        e,
+                                        dayDk,
+                                        room,
+                                        sl,
+                                      )
+                                    }
+                                    aria-label={
+                                      subBooked
+                                        ? `${room} ${slotIndexToLabel(sl)} ${cellDisplayLine(data, mitarbeiter)}, Klick für OP-Termin, oder ziehen`
+                                        : `${room} ${slotIndexToLabel(sl)} frei`
+                                    }
+                                  />
+                                )
+                              })}
+                            </div>
+                            {showResizeBottom ? (
+                              <div
+                                className="slot-resize-handle slot-resize-handle--bottom"
+                                draggable
+                                onDragStart={(e) => {
+                                  e.stopPropagation()
+                                  startResizeDrag(
+                                    e,
+                                    dayDk,
+                                    room,
+                                    'bottom',
+                                    lastSl,
+                                  )
+                                }}
+                                onDragEnd={endPanelOrCellDrag}
+                                title="Termin am unteren Rand verlängern oder verkürzen"
+                                aria-label="Unteren Terminrand ziehen zum Verlängern oder Verkürzen"
+                              />
+                            ) : null}
+                            {showBlockLabel ? (
+                              <div
+                                className="slot-cell-label slot-cell-termin-stack slot-cell-termin-span-overlay"
+                                title={line}
+                              >
+                                <span
+                                  className={`slot-cell-termin-line slot-cell-termin-patient ${terminParts.patient ? '' : 'slot-cell-termin-placeholder'}`}
+                                >
+                                  {terminParts.patient ?? '—'}
+                                </span>
+                                <span
+                                  className={`slot-cell-termin-line slot-cell-termin-art ${terminParts.art ? '' : 'slot-cell-termin-placeholder'}`}
+                                >
+                                  {terminParts.art ?? '—'}
+                                </span>
+                                <span
+                                  className={`slot-cell-termin-line ${terminParts.staffName ? 'slot-cell-termin-staff' : 'slot-cell-termin-placeholder'}`}
+                                >
+                                  {terminParts.staffName ?? '—'}
+                                </span>
+                                {terminParts.notiz ? (
+                                  <span className="slot-cell-termin-line slot-cell-termin-notiz">
+                                    {terminParts.notiz}
+                                  </span>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
           ) : viewMode === 'week' ? (
             <div className="grid-wrap">
               <div

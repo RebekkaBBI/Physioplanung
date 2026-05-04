@@ -1501,6 +1501,11 @@
   box-shadow: var(--shadow-sm);
 }
 
+/* OP: 12 Tage nebeneinander — breiteres Raster, bei schmalen Viewports horizontal scrollen */
+.grid-wrap--op-12d .plan-grid.plan-grid--op-12d {
+  min-width: max(100%, 58rem);
+}
+
 .plan-grid {
   display: grid;
   gap: 0;
