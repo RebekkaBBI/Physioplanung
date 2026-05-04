@@ -327,6 +327,16 @@ function opViewGridRowRangeFromGlobalBounds(
   return { v0, v1 }
 }
 
+/** Globale Slot-Indizes, die im OP-Kalender (07:00–18:00) sichtbar sind. */
+function opGlobalSlotIndicesInOpView(): number[] {
+  const out: number[] = []
+  for (let v = 0; v < opViewSlotCount(); v++) {
+    const g = opViewIndexToGlobalSlot(v)
+    if (g !== null) out.push(g)
+  }
+  return out
+}
+
 function makeSlotKey(dateKeyStr: string, room: string, slotIndex: number): string {
   return `${dateKeyStr}|${room}|${slotIndex}`
 }
@@ -1021,6 +1031,100 @@ function slotRangeOverlapsMusterPause(startSlot: number, span: number): boolean 
   const p0 = PAUSE_START_SLOT
   const p1 = PAUSE_START_SLOT + PAUSE_SLOT_COUNT - 1
   return startSlot <= p1 && end >= p0
+}
+
+/** OP-Dialog: zusammenhängenden Block auf neues Zeitfenster legen (gleicher Tag/Raum). */
+function replaceSingleRoomBlockTimeRange(
+  prev: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  oldStart: number,
+  oldEnd: number,
+  newStart: number,
+  newEnd: number,
+):
+  | { ok: true; next: Record<string, CellData> }
+  | { ok: false; message: string } {
+  if (newStart > newEnd) {
+    return {
+      ok: false,
+      message: 'Die Endzeit muss bei oder nach der Startzeit liegen.',
+    }
+  }
+  const span = newEnd - newStart + 1
+  if (slotRangeOverlapsMusterPause(newStart, span)) {
+    return {
+      ok: false,
+      message:
+        'Zwischen 12:00 und 13:30 ist Pause — hier kann keine OP-Belegung liegen.',
+    }
+  }
+  const key = (s: number) => makeSlotKey(dk, room, s)
+  const template = prev[key(oldStart)]
+  if (!template || !isCellBooked(template)) {
+    return { ok: false, message: 'Kein gültiger Termin gefunden.' }
+  }
+  const sig = terminBlockSignatureIgnoringStaff(template)
+  for (let s = oldStart; s <= oldEnd; s++) {
+    if (terminBlockSignatureIgnoringStaff(prev[key(s)]) !== sig) {
+      return {
+        ok: false,
+        message:
+          'Der Terminblock konnte nicht eindeutig erkannt werden (Dialog schließen und erneut öffnen).',
+      }
+    }
+  }
+  for (let s = newStart; s <= newEnd; s++) {
+    if (s >= oldStart && s <= oldEnd) continue
+    if (isCellBooked(prev[key(s)])) {
+      return {
+        ok: false,
+        message: 'Im gewählten Zeitfenster liegt bereits ein anderer Termin.',
+      }
+    }
+  }
+  const next = { ...prev }
+  for (let s = oldStart; s <= oldEnd; s++) delete next[key(s)]
+  for (let s = newStart; s <= newEnd; s++) {
+    next[key(s)] = { ...template }
+  }
+  return { ok: true, next }
+}
+
+function applyPatientToTerminBlockIgnoringStaff(
+  prev: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  anchorSlot: number,
+  patientName: string,
+  patientCode: string,
+  opts?: { stripNotiz?: boolean },
+): Record<string, CellData> {
+  const { start, end } = findTerminBlockBoundsIgnoringStaff(
+    prev,
+    dk,
+    room,
+    anchorSlot,
+  )
+  const next = { ...prev }
+  const nameT = patientName.trim()
+  const codeT = patientCode.trim()
+  for (let sl = start; sl <= end; sl++) {
+    const k = makeSlotKey(dk, room, sl)
+    const cur = next[k]
+    if (!cur || !isCellBooked(cur)) continue
+    const u: CellData = { ...cur }
+    if (nameT) {
+      u.patient = nameT
+      u.patientCode = codeT || undefined
+    } else {
+      delete u.patient
+      delete u.patientCode
+    }
+    if (opts?.stripNotiz) delete u.notiz
+    next[k] = u
+  }
+  return next
 }
 
 /** Hauptkalender: 12:00–13:30 — für automatische Muster-Buchungen gesperrt, manuell weiterhin nutzbar. */
@@ -3038,6 +3142,12 @@ function slotsRangeOverlap(
   return a0 <= b1 && b0 <= a1
 }
 
+/**
+ * Liefert die Muster-Tag-Indizes (0 … Wochen×7−1), an denen ein reiner OP-Block
+ * (Belegungsart „OP“) liegt. Das sind fortlaufende Tage ab MUSTER_TEMPLATE_MONDAY,
+ * nicht Kalender-Wochentage: Bei OP auf OP-Buchung zählt nur dieser Index relativ
+ * zum gewählten OP-Kalendertag (siehe tryApplyMusterFromOpBooking).
+ */
 function collectTemplateOpOnlyDayIndices(
   templateCells: Record<string, MusterTemplateCell>,
   artenList: BelegungsartItem[],
@@ -3109,8 +3219,14 @@ function stripPatientFromMusterLinkId(
 }
 
 /**
- * Belegungsmuster auf OP-Buchung: Kalendertag des Muster-OP-Tags = OP-Termin;
- * übrige Muster-Tage wie bei Patienten-Muster im Hauptkalender.
+ * Belegungsmuster auf OP-Buchung:
+ * - Der Tag im Muster, an dem die Belegungsart „OP“ steht (beliebiger Raum im
+ *   Muster-Editor), wird auf den OP-Kalendertag der Buchung gelegt; Wochentags-
+ *   Labels im Muster sind irrelevant, es zählt nur der Tag-Index im Muster-Raster.
+ * - `weekStart` ist so gewählt, dass Muster-Tag `opAnchorDayIndex` = `anchor.dk`
+ *   (addDays(weekStart, opAnchorDayIndex) === anchor-Datum).
+ * - Alle übrigen Muster-Tage werden relativ dazu auf echte Kalendertage abgebildet
+ *   und im Hauptkalender platziert (Mitarbeiter-Verfügbarkeit dort per echtem Wochentag).
  */
 function applyMusterFromOpBookingOnce(
   prev: Record<string, CellData>,
@@ -3141,7 +3257,6 @@ function applyMusterFromOpBookingOnce(
     const tDk = dateKey(addDays(weekStart, dayIndex))
     if (tDk !== anchor.dk) continue
     for (const room of ROOMS) {
-      if (room !== anchor.room) continue
       for (let sl = 0; sl < max; sl++) {
         const k = makeSlotKey(vdk, room, sl)
         const d = virt[k]
@@ -3359,6 +3474,13 @@ function applyMusterFromOpBookingOnce(
   return { next }
 }
 
+/**
+ * Ziehen eines Belegungsmusters auf eine OP-Buchung (gleicher Codepfad wie Panel →
+ * applyDrop): Der Muster-Tag mit Belegungsart „OP“ wird mit dem Kalendertag der
+ * Buchung ausgerichtet. Wochentage im Muster-Editor sind nur Anordnungshilfe; maßgeblich
+ * ist der Tag-Index im Muster (fortlaufende Tage). `weekStart = anchorDatum − Index(OP-Tag)`
+ * legt alle Folgetermine relativ dazu im Hauptkalender ab.
+ */
 function tryApplyMusterFromOpBooking(
   prev: Record<string, CellData>,
   templateCells: Record<string, MusterTemplateCell>,
@@ -4866,6 +4988,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   >([])
   const [teamMeetingRepeatWeeks, setTeamMeetingRepeatWeeks] = useState(1)
   const [terminNotizDraft, setTerminNotizDraft] = useState('')
+  const [opTerminPatientDraft, setOpTerminPatientDraft] = useState('')
+  const [opTerminPatientCodeDraft, setOpTerminPatientCodeDraft] = useState('')
+  const [opTerminRangeStart, setOpTerminRangeStart] = useState(0)
+  const [opTerminRangeEnd, setOpTerminRangeEnd] = useState(0)
+  const [opTerminMusterPickId, setOpTerminMusterPickId] = useState('')
+  const opTerminFormInitKeyRef = useRef<string | null>(null)
   const [dragOverKey, setDragOverKey] = useState<string | null>(null)
   /** Belegungsart vom Panel ziehen: Vorschau-Färbung gültiger Zielzellen */
   const [artDragHighlight, setArtDragHighlight] = useState<{
@@ -6394,12 +6522,39 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       return
     }
     const { kind, dk, room, anchorSlot } = terminPickerModal
+    if (kind === 'opTermin') {
+      setTerminNotizDraft('')
+      return
+    }
     const { start } =
       kind === 'teamMeeting'
         ? findBlockBounds(slotCells, dk, room, anchorSlot)
         : findTerminBlockBoundsIgnoringStaff(slotCells, dk, room, anchorSlot)
     const sample = slotCells[makeSlotKey(dk, room, start)]
     setTerminNotizDraft(sample?.notiz?.trim() ?? '')
+  }, [terminPickerModal, slotCells])
+
+  useEffect(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'opTermin') {
+      opTerminFormInitKeyRef.current = null
+      return
+    }
+    const { dk, room, anchorSlot } = terminPickerModal
+    const initKey = `${dk}|${room}|${anchorSlot}`
+    if (opTerminFormInitKeyRef.current === initKey) return
+    opTerminFormInitKeyRef.current = initKey
+    const { start, end } = findTerminBlockBoundsIgnoringStaff(
+      slotCells,
+      dk,
+      room,
+      anchorSlot,
+    )
+    const sample = slotCells[makeSlotKey(dk, room, start)]
+    setOpTerminPatientDraft(sample?.patient?.trim() ?? '')
+    setOpTerminPatientCodeDraft(sample?.patientCode?.trim() ?? '')
+    setOpTerminRangeStart(start)
+    setOpTerminRangeEnd(end)
+    setOpTerminMusterPickId('')
   }, [terminPickerModal, slotCells])
 
   useEffect(() => {
@@ -6423,6 +6578,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   const saveTerminNotizFromModal = useCallback(() => {
     if (!terminPickerModal) return
+    if (terminPickerModal.kind === 'opTermin') return
     const { kind, dk, room, anchorSlot } = terminPickerModal
     const trimmed = terminNotizDraft.trim()
     setSlotCells((prev) => {
@@ -6440,6 +6596,140 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       return next
     })
   }, [terminPickerModal, terminNotizDraft, setSlotCells])
+
+  const saveOpTerminDetailsFromModal = useCallback(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'opTermin') return
+    if (cloudSyncEnabled && !mayCalendarWrite) return
+    const { dk, room, anchorSlot } = terminPickerModal
+    if (opTerminRangeStart > opTerminRangeEnd) {
+      alertOnce('Die Endzeit muss bei oder nach der Startzeit liegen.')
+      return
+    }
+    setSlotCells((prev) => {
+      const { start, end } = findTerminBlockBoundsIgnoringStaff(
+        prev,
+        dk,
+        room,
+        anchorSlot,
+      )
+      let next = prev
+      if (start !== opTerminRangeStart || end !== opTerminRangeEnd) {
+        const r = replaceSingleRoomBlockTimeRange(
+          next,
+          dk,
+          room,
+          start,
+          end,
+          opTerminRangeStart,
+          opTerminRangeEnd,
+        )
+        if (!r.ok) {
+          alertOnce(r.message)
+          return prev
+        }
+        next = r.next
+      }
+      const anchorForPatient =
+        start !== opTerminRangeStart || end !== opTerminRangeEnd
+          ? opTerminRangeStart
+          : anchorSlot
+      return applyPatientToTerminBlockIgnoringStaff(
+        next,
+        dk,
+        room,
+        anchorForPatient,
+        opTerminPatientDraft,
+        opTerminPatientCodeDraft,
+        { stripNotiz: true },
+      )
+    })
+    setTerminPickerModal({
+      kind: 'opTermin',
+      dk,
+      room,
+      anchorSlot: opTerminRangeStart,
+    })
+  }, [
+    terminPickerModal,
+    opTerminRangeStart,
+    opTerminRangeEnd,
+    opTerminPatientDraft,
+    opTerminPatientCodeDraft,
+    setSlotCells,
+    cloudSyncEnabled,
+    mayCalendarWrite,
+  ])
+
+  const applyOpMusterFromModal = useCallback(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'opTermin') return
+    if (cloudSyncEnabled && !mayCalendarWrite) return
+    const { dk, room, anchorSlot } = terminPickerModal
+    if (!opTerminMusterPickId.trim()) {
+      alertOnce('Bitte ein Belegungsmuster aus der Liste wählen.')
+      return
+    }
+    const m = muster.find((x) => x.id === opTerminMusterPickId)
+    if (!m) {
+      alertOnce('Belegungsmuster nicht gefunden.')
+      return
+    }
+    setSlotCells((prev) => {
+      const { start } = findTerminBlockBoundsIgnoringStaff(
+        prev,
+        dk,
+        room,
+        anchorSlot,
+      )
+      const anchorK = makeSlotKey(dk, room, start)
+      const anchor = prev[anchorK]
+      if (!anchor || !isCellBooked(anchor)) return prev
+      if (anchor.musterLinkId) {
+        alertOnce(
+          'Es ist bereits ein Muster verknüpft. Zuerst „Muster und Folgetermine entfernen“ wählen.',
+        )
+        return prev
+      }
+      const patientN = opTerminPatientDraft.trim()
+      const patientC = opTerminPatientCodeDraft.trim()
+      const musterStamp: MusterApplyStamp = { label: m.label }
+      const res = tryApplyMusterFromOpBooking(
+        prev,
+        m.templateCells,
+        patientN,
+        patientC || undefined,
+        arten,
+        mitarbeiter,
+        { dk, room, slotIndex: start },
+        effectiveMusterTemplateWeekCount(m),
+        musterStamp,
+        m.id,
+      )
+      if ('error' in res) {
+        alertOnce(res.error)
+        return prev
+      }
+      queueMicrotask(() =>
+        setMusterUsageCountById((c) => ({
+          ...c,
+          [m.id]: (c[m.id] ?? 0) + 1,
+        })),
+      )
+      opTerminFormInitKeyRef.current = null
+      return res.next
+    })
+    setOpTerminMusterPickId('')
+  }, [
+    terminPickerModal,
+    opTerminMusterPickId,
+    opTerminPatientDraft,
+    opTerminPatientCodeDraft,
+    muster,
+    arten,
+    mitarbeiter,
+    setSlotCells,
+    cloudSyncEnabled,
+    mayCalendarWrite,
+  ])
 
   const saveStaffTerminNotizAt = useCallback(
     (blockIndex: number, text: string) => {
@@ -6622,6 +6912,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     minsNowClamped < (DAY_END_HOUR - DAY_START_HOUR) * 60
       ? Math.floor(minsNowClamped / SLOT_MINUTES)
       : -1
+
+  const opDialogGlobalSlots = useMemo(() => opGlobalSlotIndicesInOpView(), [])
 
   const terminModalDetail = useMemo(() => {
     if (!terminPickerModal) return null
@@ -10873,26 +11165,81 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               ) : terminPickerModal.kind === 'opTermin' ? (
                 <>
                   <p className="staff-modal-hint termin-staff-summary">
-                    {terminModalDetail.room} · {terminModalDetail.timeRange}
-                    {terminModalDetail.line ? (
-                      <>
-                        <br />
-                        <span className="termin-staff-line">
-                          {terminModalDetail.line}
-                        </span>
-                      </>
-                    ) : null}
+                    OP ·{' '}
+                    {parseDateKey(terminPickerModal.dk).toLocaleDateString(
+                      'de-DE',
+                      {
+                        weekday: 'long',
+                        day: 'numeric',
+                        month: 'long',
+                        year: 'numeric',
+                      },
+                    )}
                   </p>
-                  <p className="staff-modal-hint">
-                    Im OP-Kalender ist keine Mitarbeiterzuweisung nötig. Für
-                    Zuordnung und Wochenplan wechseln Sie in den Hauptkalender.
-                  </p>
-                  {terminModalDetail.currentStaff ? (
-                    <p className="termin-staff-current">
-                      Im Hauptkalender zugewiesen:{' '}
-                      {terminModalDetail.currentStaff}
-                    </p>
-                  ) : null}
+                  <label className="staff-modal-label" htmlFor="op-termin-patient">
+                    Patientenname
+                    <input
+                      id="op-termin-patient"
+                      type="text"
+                      className="staff-modal-name-input"
+                      value={opTerminPatientDraft}
+                      onChange={(e) => setOpTerminPatientDraft(e.target.value)}
+                      autoComplete="off"
+                      placeholder="Name"
+                    />
+                  </label>
+                  <label className="staff-modal-label" htmlFor="op-termin-patient-code">
+                    Patienten-ID
+                    <input
+                      id="op-termin-patient-code"
+                      type="text"
+                      className="staff-modal-name-input"
+                      value={opTerminPatientCodeDraft}
+                      onChange={(e) => setOpTerminPatientCodeDraft(e.target.value)}
+                      autoComplete="off"
+                      placeholder="z. B. Aktenzeichen"
+                    />
+                  </label>
+                  <div className="op-termin-time-row">
+                    <label className="staff-modal-label" htmlFor="op-termin-start">
+                      OP-Zeit Beginn
+                      <select
+                        id="op-termin-start"
+                        className="staff-modal-name-input"
+                        value={opTerminRangeStart}
+                        onChange={(e) => {
+                          const s = Number(e.target.value)
+                          setOpTerminRangeStart(s)
+                          setOpTerminRangeEnd((prev) => Math.max(prev, s))
+                        }}
+                      >
+                        {opDialogGlobalSlots.map((sl) => (
+                          <option key={sl} value={sl}>
+                            {slotIndexToLabel(sl)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="staff-modal-label" htmlFor="op-termin-end">
+                      OP-Zeit Ende
+                      <select
+                        id="op-termin-end"
+                        className="staff-modal-name-input"
+                        value={opTerminRangeEnd}
+                        onChange={(e) =>
+                          setOpTerminRangeEnd(Number(e.target.value))
+                        }
+                      >
+                        {opDialogGlobalSlots
+                          .filter((sl) => sl >= opTerminRangeStart)
+                          .map((sl) => (
+                            <option key={sl} value={sl}>
+                              {slotIndexToLabel(sl)} (bis einschl.)
+                            </option>
+                          ))}
+                      </select>
+                    </label>
+                  </div>
                   {terminModalDetail.musterLinkId ? (
                     <div className="staff-modal-hint">
                       <p className="staff-modal-label">Belegungsmuster</p>
@@ -10902,21 +11249,44 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           terminModalDetail.musterLabel ??
                           'Verknüpftes Muster'}
                       </p>
+                      <p className="muted op-termin-muster-hint">
+                        Zum Wechseln des Musters zuerst „Muster und Folgetermine
+                        entfernen“.
+                      </p>
                     </div>
                   ) : (
-                    <p className="staff-modal-hint">
-                      Ziehen Sie ein Belegungsmuster aus dem Panel auf diese
-                      Buchung (Tages- oder Wochenansicht): Der OP-Tag im Muster
-                      entspricht diesem Tag; die übrigen Muster-Tage werden im
-                      Hauptkalender im passenden Raum und zur passenden Zeit
-                      eingetragen.
-                    </p>
+                    <div className="op-termin-muster-row">
+                      <label className="staff-modal-label" htmlFor="op-termin-muster">
+                        Belegungsmuster
+                        <select
+                          id="op-termin-muster"
+                          className="staff-modal-name-input"
+                          value={opTerminMusterPickId}
+                          onChange={(e) => setOpTerminMusterPickId(e.target.value)}
+                        >
+                          <option value="">— Muster wählen —</option>
+                          {muster.map((mu) => (
+                            <option key={mu.id} value={mu.id}>
+                              {mu.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        type="button"
+                        className="btn-edit-save"
+                        onClick={applyOpMusterFromModal}
+                      >
+                        Muster anwenden
+                      </button>
+                    </div>
                   )}
-                  <TerminModalNotizFields
-                    draft={terminNotizDraft}
-                    onDraftChange={setTerminNotizDraft}
-                    onSave={saveTerminNotizFromModal}
-                  />
+                  {terminModalDetail.currentStaff ? (
+                    <p className="termin-staff-current">
+                      Im Hauptkalender zugewiesen:{' '}
+                      {terminModalDetail.currentStaff}
+                    </p>
+                  ) : null}
                   <div className="staff-modal-footer termin-staff-footer">
                     {terminModalDetail.musterLinkId &&
                     terminModalDetail.hasPatient ? (
@@ -10928,6 +11298,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                         Patient aus allen Terminen entfernen
                       </button>
                     ) : null}
+                    <button
+                      type="button"
+                      className="btn-edit-save"
+                      onClick={saveOpTerminDetailsFromModal}
+                    >
+                      Patient und OP-Zeiten speichern
+                    </button>
                     <button
                       type="button"
                       className="btn-edit-cancel"
