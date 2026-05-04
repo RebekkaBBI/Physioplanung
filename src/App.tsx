@@ -4611,6 +4611,7 @@ function listKollisionPanelItems(
     if (!data?.terminKollision) continue
     const p = parseSlotCellKey(key)
     if (!p) continue
+    if (p.room === OP_TAB_ROOM) continue
     const { start } = findBlockBounds(cells, p.dk, p.room, p.slot)
     const anchorKey = makeSlotKey(p.dk, p.room, start)
     if (seen.has(anchorKey)) continue
@@ -4625,6 +4626,7 @@ function listKollisionPanelItems(
     if (!data?.patient?.trim() || !isCellBooked(data)) continue
     const p = parseSlotCellKey(key)
     if (!p) continue
+    if (p.room === OP_TAB_ROOM) continue
     const { start } = findBlockBounds(cells, p.dk, p.room, p.slot)
     const anchorKey = makeSlotKey(p.dk, p.room, start)
     if (seen.has(anchorKey)) continue
@@ -4648,6 +4650,7 @@ function listKollisionPanelItems(
     if (!isCellBooked(data)) continue
     const p = parseSlotCellKey(key)
     if (!p) continue
+    if (p.room === OP_TAB_ROOM) continue
     const { start } = findBlockBounds(cells, p.dk, p.room, p.slot)
     const anchorKey = makeSlotKey(p.dk, p.room, start)
     if (seen.has(anchorKey)) continue
