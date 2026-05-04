@@ -4714,8 +4714,7 @@ function listKollisionPanelItems(
 }
 
 type TerminPickerModalState =
-  | { kind: 'art'; dk: string; room: Room; anchorSlot: number }
-  | { kind: 'staff'; dk: string; room: Room; anchorSlot: number }
+  | { kind: 'mainTermin'; dk: string; room: Room; anchorSlot: number }
   | { kind: 'opTermin'; dk: string; room: Room; anchorSlot: number }
   | { kind: 'teamMeeting'; dk: string; room: Room; anchorSlot: number }
 
@@ -4728,7 +4727,12 @@ function terminPickerStateFromBookedAnchor(
   calendarTabIsOp: boolean,
   artenList: BelegungsartItem[],
 ): TerminPickerModalState | null {
-  const { start } = findBlockBounds(cells, dk, room, slotInBlock)
+  const { start } = findTerminBlockBoundsIgnoringStaff(
+    cells,
+    dk,
+    room,
+    slotInBlock,
+  )
   const blockStartData = cells[makeSlotKey(dk, room, start)]
   if (!isCellBooked(blockStartData)) return null
   if (findArtIdForCell(blockStartData, artenList) === TEAM_MEETING_ART_ID) {
@@ -4740,13 +4744,10 @@ function terminPickerStateFromBookedAnchor(
   ) {
     return { kind: 'opTermin', dk, room, anchorSlot: start }
   }
-  if (patientTerminNeedsArtChoice(blockStartData, artenList)) {
-    return { kind: 'art', dk, room, anchorSlot: start }
-  }
   if (calendarTabIsOp) {
     return { kind: 'opTermin', dk, room, anchorSlot: start }
   }
-  return { kind: 'staff', dk, room, anchorSlot: start }
+  return { kind: 'mainTermin', dk, room, anchorSlot: start }
 }
 
 function cellAccentColor(data: CellData | undefined): string | undefined {
@@ -5298,6 +5299,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const [staffDraftArtIds, setStaffDraftArtIds] = useState<string[]>([])
   const [terminPickerModal, setTerminPickerModal] =
     useState<TerminPickerModalState | null>(null)
+  const mainTerminPickInitKeyRef = useRef<string | null>(null)
+  const [mainTerminEditArt, setMainTerminEditArt] = useState(false)
+  const [mainTerminEditStaff, setMainTerminEditStaff] = useState(false)
   const [teamMeetingSelectedIds, setTeamMeetingSelectedIds] = useState<
     string[]
   >([])
@@ -6568,7 +6572,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   const assignArtToTerminFromModal = useCallback(
     (artId: string) => {
-      if (!terminPickerModal || terminPickerModal.kind !== 'art') return
+      if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') return
       const { dk, room, anchorSlot } = terminPickerModal
       const { start } = findTerminBlockBoundsIgnoringStaff(
         slotCells,
@@ -6577,14 +6581,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         anchorSlot,
       )
       applyDrop(dk, room, start, { kind: 'art', id: artId })
-      setTerminPickerModal(null)
+      setMainTerminEditArt(false)
     },
     [terminPickerModal, slotCells, applyDrop],
   )
 
   const assignStaffToTerminBlock = useCallback(
     (staffId: string) => {
-      if (!terminPickerModal || terminPickerModal.kind !== 'staff') return
+      if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') return
       const { dk, room, anchorSlot } = terminPickerModal
       const s = mitarbeiter.find((x) => x.id === staffId)
       if (!s) return
@@ -6629,16 +6633,21 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         }
         return next
       })
-      setTerminPickerModal(null)
+      setMainTerminEditStaff(false)
     },
-    [terminPickerModal, mitarbeiter, arten, setSlotCells, setTerminPickerModal],
+    [terminPickerModal, mitarbeiter, arten, setSlotCells],
   )
 
   const removeStaffFromTerminBlock = useCallback(() => {
-    if (!terminPickerModal || terminPickerModal.kind !== 'staff') return
+    if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') return
     const { dk, room, anchorSlot } = terminPickerModal
     setSlotCells((prev) => {
-      const { start, end } = findBlockBounds(prev, dk, room, anchorSlot)
+      const { start, end } = findTerminBlockBoundsIgnoringStaff(
+        prev,
+        dk,
+        room,
+        anchorSlot,
+      )
       const next = { ...prev }
       for (let sl = start; sl <= end; sl++) {
         const k = makeSlotKey(dk, room, sl)
@@ -6650,8 +6659,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       }
       return next
     })
-    setTerminPickerModal(null)
-  }, [terminPickerModal, setSlotCells, setTerminPickerModal])
+    setMainTerminEditStaff(true)
+  }, [terminPickerModal, setSlotCells])
 
   const removeTeamParticipantsFromModal = useCallback(() => {
     if (!terminPickerModal || terminPickerModal.kind !== 'teamMeeting') return
@@ -6784,7 +6793,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const clearTerminBlockFromModal = useCallback(() => {
     if (!terminPickerModal) return
     const { dk, room, anchorSlot, kind } = terminPickerModal
-    const { start } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const { start } =
+      kind === 'teamMeeting'
+        ? findBlockBounds(slotCells, dk, room, anchorSlot)
+        : findTerminBlockBoundsIgnoringStaff(slotCells, dk, room, anchorSlot)
     const link = slotCells[makeSlotKey(dk, room, start)]?.musterLinkId
     if (kind === 'opTermin' && link) {
       if (
@@ -6807,7 +6819,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         )
         return removeMusterLinkKeepOpBooking(prev, link, dk, room, opS, opE)
       }
-      const { start: s0, end } = findBlockBounds(prev, dk, room, anchorSlot)
+      const { start: s0, end } =
+        kind === 'teamMeeting'
+          ? findBlockBounds(prev, dk, room, anchorSlot)
+          : findTerminBlockBoundsIgnoringStaff(prev, dk, room, anchorSlot)
       const next = { ...prev }
       for (let sl = s0; sl <= end; sl++) {
         delete next[makeSlotKey(dk, room, sl)]
@@ -6880,7 +6895,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         if (!k.startsWith(prefix) || !k.endsWith(suffix)) continue
         const p = parseSlotCellKey(k)
         if (!p) continue
-        const { start } = findBlockBounds(slotCells, p.dk, p.room, p.slot)
+        const { start } = findTerminBlockBoundsIgnoringStaff(
+          slotCells,
+          p.dk,
+          p.room,
+          p.slot,
+        )
         const modal = terminPickerStateFromBookedAnchor(
           slotCells,
           p.dk,
@@ -6927,6 +6947,33 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     const sample = slotCells[makeSlotKey(dk, room, start)]
     setTerminNotizDraft(sample?.notiz?.trim() ?? '')
   }, [terminPickerModal, slotCells])
+
+  useEffect(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') {
+      mainTerminPickInitKeyRef.current = null
+      setMainTerminEditArt(false)
+      setMainTerminEditStaff(false)
+      return
+    }
+    const key = `${terminPickerModal.dk}|${terminPickerModal.room}|${terminPickerModal.anchorSlot}`
+    if (mainTerminPickInitKeyRef.current !== key) {
+      mainTerminPickInitKeyRef.current = key
+      const { dk, room, anchorSlot } = terminPickerModal
+      const { start } = findTerminBlockBoundsIgnoringStaff(
+        slotCells,
+        dk,
+        room,
+        anchorSlot,
+      )
+      const sample = slotCells[makeSlotKey(dk, room, start)]
+      setMainTerminEditArt(
+        sample ? patientTerminNeedsArtChoice(sample, arten) : false,
+      )
+      setMainTerminEditStaff(
+        sample ? !findStaffForCell(sample, mitarbeiter) : true,
+      )
+    }
+  }, [terminPickerModal, slotCells, arten, mitarbeiter])
 
   useEffect(() => {
     if (!terminPickerModal || terminPickerModal.kind !== 'opTermin') {
@@ -7335,8 +7382,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     const startK = makeSlotKey(dk, room, start)
     const sample = slotCells[startK]
     if (!sample || !isCellBooked(sample)) return null
+    const artId = findArtIdForCell(sample, arten)
     const line = cellDisplayLine(sample, mitarbeiter, {
-      hideStaffAssignmentHint: kind === 'opTermin',
+      hideStaffAssignmentHint: kind === 'opTermin' || kind === 'mainTermin',
     })
     const timeRange =
       start === end
@@ -7349,7 +7397,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       timeRange,
       currentStaff: sample.staff,
       currentStaffId: sample.staffId,
-      blockArtId: findArtIdForCell(sample, arten),
+      blockArtId: artId,
+      blockArtLabel: artId
+        ? arten.find((a) => a.id === artId)?.label ??
+          sample.art?.trim() ??
+          null
+        : null,
       musterLinkId: sample.musterLinkId,
       musterId: sample.musterId,
       musterLabel: sample.muster?.trim() ?? null,
@@ -7375,7 +7428,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   /** Hauptkalender · Mitarbeiter-Zuordnung: nur MA mit Freigabe für die Art und Verfügbarkeit auf jedem Slot des Blocks */
   const staffPickListForTerminModal = useMemo(() => {
-    if (!terminPickerModal || terminPickerModal.kind !== 'staff') return null
+    if (
+      !terminPickerModal ||
+      terminPickerModal.kind !== 'mainTermin' ||
+      !mainTerminEditStaff
+    ) {
+      return null
+    }
     const { dk, room, anchorSlot } = terminPickerModal
     const { start, end } = findTerminBlockBoundsIgnoringStaff(
       slotCells,
@@ -7405,7 +7464,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       }
       return true
     })
-  }, [terminPickerModal, slotCells, mitarbeiter, arten])
+  }, [terminPickerModal, mainTerminEditStaff, slotCells, mitarbeiter, arten])
 
   const endPanelOrCellDrag = useCallback(() => {
     dragSourceRef.current = null
@@ -10419,73 +10478,16 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                                       return
                                     }
                                     if (subBooked) {
-                                      const { start: blockStart } =
-                                        findBlockBounds(
+                                      const modal =
+                                        terminPickerStateFromBookedAnchor(
                                           slotCells,
                                           activeDayKey,
                                           room,
                                           sl,
-                                        )
-                                      const blockStartData =
-                                        slotCells[
-                                          makeSlotKey(
-                                            activeDayKey,
-                                            room,
-                                            blockStart,
-                                          )
-                                        ]
-                                      if (
-                                        findArtIdForCell(
-                                          blockStartData,
-                                          arten,
-                                        ) === TEAM_MEETING_ART_ID
-                                      ) {
-                                        setTerminPickerModal({
-                                          kind: 'teamMeeting',
-                                          dk: activeDayKey,
-                                          room,
-                                          anchorSlot: sl,
-                                        })
-                                      } else if (
-                                        calendarTabId === CALENDAR_TAB_OP &&
-                                        patientTerminNeedsArtChoice(
-                                          blockStartData,
+                                          isOpDayCalendar,
                                           arten,
                                         )
-                                      ) {
-                                        setTerminPickerModal({
-                                          kind: 'opTermin',
-                                          dk: activeDayKey,
-                                          room,
-                                          anchorSlot: sl,
-                                        })
-                                      } else if (
-                                        patientTerminNeedsArtChoice(
-                                          blockStartData,
-                                          arten,
-                                        )
-                                      ) {
-                                        setTerminPickerModal({
-                                          kind: 'art',
-                                          dk: activeDayKey,
-                                          room,
-                                          anchorSlot: sl,
-                                        })
-                                      } else if (isOpDayCalendar) {
-                                        setTerminPickerModal({
-                                          kind: 'opTermin',
-                                          dk: activeDayKey,
-                                          room,
-                                          anchorSlot: sl,
-                                        })
-                                      } else {
-                                        setTerminPickerModal({
-                                          kind: 'staff',
-                                          dk: activeDayKey,
-                                          room,
-                                          anchorSlot: sl,
-                                        })
-                                      }
+                                      if (modal) setTerminPickerModal(modal)
                                     } else {
                                       toggleSlot(activeDayKey, room, sl)
                                     }
@@ -11368,16 +11370,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             onClick={(e) => e.stopPropagation()}
           >
             <h2 id="termin-picker-title" className="staff-modal-title">
-              {terminPickerModal.kind === 'art'
-                ? 'Belegungsart wählen'
+              {terminPickerModal.kind === 'mainTermin'
+                ? 'Termin'
                 : terminPickerModal.kind === 'teamMeeting'
                   ? 'Teammeeting · Teilnehmer'
-                  : terminPickerModal.kind === 'opTermin'
-                    ? 'Termin (OP)'
-                    : 'Mitarbeiter zuordnen'}
+                  : 'Termin (OP)'}
             </h2>
             {terminModalDetail ? (
-              terminPickerModal.kind === 'art' ? (
+              terminPickerModal.kind === 'mainTermin' ? (
                 <>
                   <p className="staff-modal-hint termin-staff-summary">
                     {terminModalDetail.room} · {terminModalDetail.timeRange}
@@ -11390,43 +11390,133 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                       </>
                     ) : null}
                   </p>
-                  <p className="staff-modal-hint">
-                    Wählen Sie die Art für diesen Patiententermin (Dauer und
-                    Farbe wie in den Belegungsarten unten).
-                  </p>
-                  <ul className="termin-staff-pick-list">
-                    {arten.length === 0 ? (
-                      <li className="muted">Keine Belegungsarten angelegt.</li>
+                  <div className="termin-main-section">
+                    <p className="staff-modal-label">Belegungsart</p>
+                    {mainTerminEditArt ? (
+                      <>
+                        <p className="staff-modal-hint">
+                          Art wählen (Dauer und Farbe wie in den Belegungsarten).
+                        </p>
+                        <ul className="termin-staff-pick-list">
+                          {arten.length === 0 ? (
+                            <li className="muted">
+                              Keine Belegungsarten angelegt.
+                            </li>
+                          ) : (
+                            arten.map((a) => (
+                              <li key={a.id}>
+                                <button
+                                  type="button"
+                                  className="termin-art-pick-btn"
+                                  onClick={() =>
+                                    assignArtToTerminFromModal(a.id)
+                                  }
+                                >
+                                  <span
+                                    className="termin-art-pick-dot"
+                                    style={{ background: a.color }}
+                                    aria-hidden
+                                  />
+                                  <span className="termin-art-pick-label">
+                                    {a.label}
+                                  </span>
+                                  <span className="termin-art-pick-meta">
+                                    {a.slots * SLOT_MINUTES} Min
+                                  </span>
+                                </button>
+                              </li>
+                            ))
+                          )}
+                        </ul>
+                      </>
                     ) : (
-                      arten.map((a) => (
-                        <li key={a.id}>
-                          <button
-                            type="button"
-                            className="termin-art-pick-btn"
-                            onClick={() => assignArtToTerminFromModal(a.id)}
-                          >
-                            <span
-                              className="termin-art-pick-dot"
-                              style={{ background: a.color }}
-                              aria-hidden
-                            />
-                            <span className="termin-art-pick-label">
-                              {a.label}
-                            </span>
-                            <span className="termin-art-pick-meta">
-                              {a.slots * SLOT_MINUTES} Min
-                            </span>
-                          </button>
-                        </li>
-                      ))
+                      <div className="termin-main-assigned-row">
+                        <p className="termin-staff-current">
+                          {terminModalDetail.blockArtLabel?.trim()
+                            ? terminModalDetail.blockArtLabel
+                            : 'Keine Belegungsart zugewiesen'}
+                        </p>
+                        <button
+                          type="button"
+                          className="btn-edit-cancel"
+                          onClick={() => setMainTerminEditArt(true)}
+                        >
+                          Belegungsart ändern
+                        </button>
+                      </div>
                     )}
-                  </ul>
+                  </div>
+                  <div className="termin-main-section">
+                    <p className="staff-modal-label">Mitarbeiter</p>
+                    {mainTerminEditStaff ? (
+                      <>
+                        <p className="staff-modal-hint">
+                          Es erscheinen nur Mitarbeiter, die im gesamten Termin
+                          verfügbar sind
+                          {terminModalDetail.blockArtId
+                            ? ' und für die gewählte Belegungsart freigeschaltet sind.'
+                            : '.'}
+                        </p>
+                        <ul className="termin-staff-pick-list">
+                          {mitarbeiter.length === 0 ? (
+                            <li className="muted">Keine Mitarbeiter angelegt.</li>
+                          ) : staffPickListForTerminModal === null ? (
+                            <li className="muted">Termin nicht gefunden.</li>
+                          ) : staffPickListForTerminModal.length === 0 ? (
+                            <li className="muted">
+                              {terminModalDetail.blockArtId
+                                ? 'Kein Mitarbeiter erfüllt Verfügbarkeit und Freigabe für diese Belegungsart im gesamten Zeitraum.'
+                                : 'Kein Mitarbeiter ist im gesamten Zeitraum verfügbar.'}
+                            </li>
+                          ) : (
+                            staffPickListForTerminModal.map((st) => (
+                              <li key={st.id}>
+                                <button
+                                  type="button"
+                                  className="termin-staff-pick-btn"
+                                  onClick={() =>
+                                    assignStaffToTerminBlock(st.id)
+                                  }
+                                >
+                                  {st.name}
+                                </button>
+                              </li>
+                            ))
+                          )}
+                        </ul>
+                      </>
+                    ) : (
+                      <div className="termin-main-assigned-row">
+                        <p className="termin-staff-current">
+                          {terminModalDetail.currentStaff?.trim()
+                            ? terminModalDetail.currentStaff
+                            : 'Kein Mitarbeiter zugewiesen'}
+                        </p>
+                        <button
+                          type="button"
+                          className="btn-edit-cancel"
+                          onClick={() => setMainTerminEditStaff(true)}
+                        >
+                          Mitarbeiter ändern
+                        </button>
+                      </div>
+                    )}
+                  </div>
                   <TerminModalNotizFields
                     draft={terminNotizDraft}
                     onDraftChange={setTerminNotizDraft}
                     onSave={saveTerminNotizFromModal}
                   />
                   <div className="staff-modal-footer termin-staff-footer">
+                    {terminModalDetail.currentStaffId ? (
+                      <button
+                        type="button"
+                        className="btn-edit-cancel"
+                        onClick={removeStaffFromTerminBlock}
+                      >
+                        Mitarbeiter-Zuordnung entfernen
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       className="btn-edit-cancel"
@@ -11743,95 +11833,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                     </button>
                   </div>
                 </>
-              ) : (
-                <>
-                  <p className="staff-modal-hint termin-staff-summary">
-                    {terminModalDetail.room} · {terminModalDetail.timeRange}
-                    {terminModalDetail.line ? (
-                      <>
-                        <br />
-                        <span className="termin-staff-line">
-                          {terminModalDetail.line}
-                        </span>
-                      </>
-                    ) : null}
-                  </p>
-                  {terminModalDetail.currentStaff ? (
-                    <p className="termin-staff-current">
-                      Aktuell: {terminModalDetail.currentStaff}
-                    </p>
-                  ) : null}
-                  <p className="staff-modal-hint">
-                    Es erscheinen nur Mitarbeiter, die im gesamten Termin
-                    verfügbar sind
-                    {terminModalDetail.blockArtId
-                      ? ' und für die gewählte Belegungsart freigeschaltet sind.'
-                      : '.'}
-                  </p>
-                  <ul className="termin-staff-pick-list">
-                    {mitarbeiter.length === 0 ? (
-                      <li className="muted">Keine Mitarbeiter angelegt.</li>
-                    ) : staffPickListForTerminModal === null ? (
-                      <li className="muted">Termin nicht gefunden.</li>
-                    ) : staffPickListForTerminModal.length === 0 ? (
-                      <li className="muted">
-                        {terminModalDetail.blockArtId
-                          ? 'Kein Mitarbeiter erfüllt Verfügbarkeit und Freigabe für diese Belegungsart im gesamten Zeitraum.'
-                          : 'Kein Mitarbeiter ist im gesamten Zeitraum verfügbar.'}
-                      </li>
-                    ) : (
-                      staffPickListForTerminModal.map((st) => (
-                        <li key={st.id}>
-                          <button
-                            type="button"
-                            className="termin-staff-pick-btn"
-                            onClick={() => assignStaffToTerminBlock(st.id)}
-                          >
-                            {st.name}
-                          </button>
-                        </li>
-                      ))
-                    )}
-                  </ul>
-                  <TerminModalNotizFields
-                    draft={terminNotizDraft}
-                    onDraftChange={setTerminNotizDraft}
-                    onSave={saveTerminNotizFromModal}
-                  />
-                  <div className="staff-modal-footer termin-staff-footer">
-                    {terminModalDetail.currentStaffId ? (
-                      <button
-                        type="button"
-                        className="btn-edit-cancel"
-                        onClick={removeStaffFromTerminBlock}
-                      >
-                        Zuordnung entfernen
-                      </button>
-                    ) : null}
-                    <button
-                      type="button"
-                      className="btn-edit-cancel"
-                      onClick={exportTerminToIcs}
-                    >
-                      Als .ics exportieren
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-termin-clear"
-                      onClick={clearTerminBlockFromModal}
-                    >
-                      Termin leeren
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-edit-save"
-                      onClick={closeTerminPickerModal}
-                    >
-                      Schließen
-                    </button>
-                  </div>
-                </>
-              )
+              ) : null
             ) : (
               <>
                 <p className="staff-modal-hint">

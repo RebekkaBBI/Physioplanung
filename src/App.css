@@ -2739,6 +2739,24 @@
   max-width: 22rem;
 }
 
+.termin-main-section {
+  margin: 0.65rem 0 0.35rem;
+}
+
+.termin-main-assigned-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.termin-main-assigned-row .termin-staff-current {
+  margin: 0;
+  flex: 1;
+  min-width: 8rem;
+  color: var(--text-h);
+}
+
 .termin-staff-summary {
   margin-bottom: 0.35rem;
 }
