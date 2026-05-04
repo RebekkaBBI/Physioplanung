@@ -4669,6 +4669,42 @@ function listKollisionPanelItems(
   return out
 }
 
+type TerminPickerModalState =
+  | { kind: 'art'; dk: string; room: Room; anchorSlot: number }
+  | { kind: 'staff'; dk: string; room: Room; anchorSlot: number }
+  | { kind: 'opTermin'; dk: string; room: Room; anchorSlot: number }
+  | { kind: 'teamMeeting'; dk: string; room: Room; anchorSlot: number }
+
+/** Gleiche Modal-Wahl wie beim Klick auf eine gebuchte Zelle (Hauptkalender- vs. OP-Tab). */
+function terminPickerStateFromBookedAnchor(
+  cells: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  slotInBlock: number,
+  calendarTabIsOp: boolean,
+  artenList: BelegungsartItem[],
+): TerminPickerModalState | null {
+  const { start } = findBlockBounds(cells, dk, room, slotInBlock)
+  const blockStartData = cells[makeSlotKey(dk, room, start)]
+  if (!isCellBooked(blockStartData)) return null
+  if (findArtIdForCell(blockStartData, artenList) === TEAM_MEETING_ART_ID) {
+    return { kind: 'teamMeeting', dk, room, anchorSlot: start }
+  }
+  if (
+    calendarTabIsOp &&
+    patientTerminNeedsArtChoice(blockStartData, artenList)
+  ) {
+    return { kind: 'opTermin', dk, room, anchorSlot: start }
+  }
+  if (patientTerminNeedsArtChoice(blockStartData, artenList)) {
+    return { kind: 'art', dk, room, anchorSlot: start }
+  }
+  if (calendarTabIsOp) {
+    return { kind: 'opTermin', dk, room, anchorSlot: start }
+  }
+  return { kind: 'staff', dk, room, anchorSlot: start }
+}
+
 function cellAccentColor(data: CellData | undefined): string | undefined {
   if (!data) return undefined
   if (data.terminKollision) return '#b91c1c'
@@ -5216,13 +5252,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   >(() => emptyStaffAvailability(slotCount()))
   const [staffDraftAlternating, setStaffDraftAlternating] = useState(false)
   const [staffDraftArtIds, setStaffDraftArtIds] = useState<string[]>([])
-  const [terminPickerModal, setTerminPickerModal] = useState<
-    | null
-    | { kind: 'art'; dk: string; room: Room; anchorSlot: number }
-    | { kind: 'staff'; dk: string; room: Room; anchorSlot: number }
-    | { kind: 'opTermin'; dk: string; room: Room; anchorSlot: number }
-    | { kind: 'teamMeeting'; dk: string; room: Room; anchorSlot: number }
-  >(null)
+  const [terminPickerModal, setTerminPickerModal] =
+    useState<TerminPickerModalState | null>(null)
   const [teamMeetingSelectedIds, setTeamMeetingSelectedIds] = useState<
     string[]
   >([])
@@ -6747,14 +6778,61 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   }, [])
 
   const goToKollisionTermin = useCallback(
-    (anchorKey: string) => {
-      const pos = parseKollisionAnchorKey(anchorKey)
-      if (!pos) return
+    (
+      anchorKey: string,
+      options?: { openModal?: boolean },
+    ) => {
+      const openModal = options?.openModal !== false
+      const full = parseSlotCellKey(anchorKey)
+      if (full) {
+        const { dk, room, slot } = full
+        const tabIsOp = room === OP_TAB_ROOM
+        if (tabIsOp) {
+          setCalendarTabId(CALENDAR_TAB_OP)
+        } else {
+          setCalendarTabId('main')
+        }
+        pendingScrollToTerminSlotRef.current = slot
+        openDayForCell(parseDateKey(dk))
+        if (openModal) {
+          const modal = terminPickerStateFromBookedAnchor(
+            slotCells,
+            dk,
+            room,
+            slot,
+            tabIsOp,
+            arten,
+          )
+          if (modal) setTerminPickerModal(modal)
+        }
+        return
+      }
+      const loose = parseKollisionAnchorKey(anchorKey)
+      if (!loose) return
       setCalendarTabId('main')
-      pendingScrollToTerminSlotRef.current = pos.slot
-      openDayForCell(parseDateKey(pos.dk))
+      pendingScrollToTerminSlotRef.current = loose.slot
+      openDayForCell(parseDateKey(loose.dk))
+      if (!openModal) return
+      const prefix = `${loose.dk}|`
+      const suffix = `|${loose.slot}`
+      for (const k of Object.keys(slotCells)) {
+        if (!k.startsWith(prefix) || !k.endsWith(suffix)) continue
+        const p = parseSlotCellKey(k)
+        if (!p) continue
+        const { start } = findBlockBounds(slotCells, p.dk, p.room, p.slot)
+        const modal = terminPickerStateFromBookedAnchor(
+          slotCells,
+          p.dk,
+          p.room,
+          start,
+          p.room === OP_TAB_ROOM,
+          arten,
+        )
+        if (modal) setTerminPickerModal(modal)
+        break
+      }
     },
-    [openDayForCell],
+    [openDayForCell, slotCells, arten],
   )
 
   const closeStaffTerminDetailModal = useCallback(() => {
@@ -6768,7 +6846,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     const { room, anchorSlot } = blocks[0]!
     const { start } = findBlockBounds(slotCells, dk, room, anchorSlot)
     setStaffTerminDetailModal(null)
-    goToKollisionTermin(makeSlotKey(dk, room, start))
+    goToKollisionTermin(makeSlotKey(dk, room, start), { openModal: false })
   }, [staffTerminDetailModal, slotCells, goToKollisionTermin])
 
   useEffect(() => {
