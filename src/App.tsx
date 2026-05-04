@@ -4598,6 +4598,47 @@ function kollisionPanelKindOrder(
   return 3
 }
 
+function removeTerminKollisionAppointmentsBefore(
+  cells: Record<string, CellData>,
+  cutoffDk: string,
+): {
+  next: Record<string, CellData>
+  removedBlocks: number
+  removedSlots: number
+} {
+  const seenAnchors = new Set<string>()
+  const blocks: { dk: string; room: Room; start: number; end: number }[] = []
+
+  for (const [key, data] of Object.entries(cells)) {
+    if (!data?.terminKollision) continue
+    const p = parseSlotCellKey(key)
+    if (!p) continue
+    if (p.dk >= cutoffDk) continue
+    const { start, end } = findBlockBounds(cells, p.dk, p.room, p.slot)
+    const anchorKey = makeSlotKey(p.dk, p.room, start)
+    if (seenAnchors.has(anchorKey)) continue
+    seenAnchors.add(anchorKey)
+    blocks.push({ dk: p.dk, room: p.room, start, end })
+  }
+
+  if (blocks.length === 0) {
+    return { next: cells, removedBlocks: 0, removedSlots: 0 }
+  }
+
+  const next = { ...cells }
+  let removedSlots = 0
+  for (const block of blocks) {
+    for (let sl = block.start; sl <= block.end; sl++) {
+      const k = makeSlotKey(block.dk, block.room, sl)
+      if (next[k]) {
+        delete next[k]
+        removedSlots++
+      }
+    }
+  }
+  return { next, removedBlocks: blocks.length, removedSlots }
+}
+
 /** Terminkollisionen (Muster) sowie Patiententermine ohne Mitarbeiter (inkl. „Mitarbeiter zuteilen“). */
 function listKollisionPanelItems(
   cells: Record<string, CellData>,
@@ -5305,6 +5346,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const pendingScrollToNow = useRef(false)
   /** Nach Klick im Kollisions-Panel: Tagesansicht auf diesen Slot scrollen */
   const pendingScrollToTerminSlotRef = useRef<number | null>(null)
+  const deletedOldKollisionenRef = useRef(false)
   const dragSourceRef = useRef<'panel' | 'cell' | 'resize' | null>(null)
   const suppressSlotClickAfterDrag = useRef(0)
   /** Hauptkalender-Tab oder Mitarbeiter-ID — MA-Ansicht ist schreibgeschützte gefilterte Kopie */
@@ -5326,6 +5368,22 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const [adminOrgProfilesError, setAdminOrgProfilesError] = useState<
     string | null
   >(null)
+
+  useEffect(() => {
+    if (deletedOldKollisionenRef.current) return
+    deletedOldKollisionenRef.current = true
+    const cutoffDk = '2026-06-01'
+    setSlotCells((prev) => {
+      const cleaned = removeTerminKollisionAppointmentsBefore(prev, cutoffDk)
+      if (cleaned.removedBlocks === 0) return prev
+      queueMicrotask(() =>
+        alertOnce(
+          `${cleaned.removedBlocks} kollidierende Termine vor ${cutoffDk} wurden gelöscht.`,
+        ),
+      )
+      return cleaned.next
+    })
+  }, [setSlotCells])
 
   useEffect(() => {
     if (!cloudSyncEnabled) return
