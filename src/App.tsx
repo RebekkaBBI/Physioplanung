@@ -2541,16 +2541,42 @@ function parseMusterTemplateKey(
   return null
 }
 
+/**
+ * Pro Slot im Muster: art/artId aus dem Katalog angleichen. Sonst unterscheidet sich
+ * blockSignature zwischen benachbarten Slots (z. B. nur Label vs. artId) und
+ * findBlockBounds liefert Span 1 — im Hauptkalender wird dann nur eine Zelle gebucht.
+ */
+function normalizeMusterTemplateCellForIdentity(
+  cell: MusterTemplateCell,
+  artenList: BelegungsartItem[],
+): MusterTemplateCell {
+  if (!cell.art?.trim() && !cell.artId) return { ...cell }
+  let id = cell.artId
+  if (!id && cell.art?.trim()) {
+    const t = cell.art.trim()
+    id = artenList.find((a) => a.label.trim() === t)?.id
+  }
+  if (!id) return { ...cell }
+  if (id === OP_BELEGUNGSART_ID || id === MUSTER_PAUSE_ART_ID) return { ...cell }
+  const cat = artenList.find((a) => a.id === id)
+  if (!cat) return { ...cell, artId: id }
+  return { art: cat.label, artId: cat.id, artColor: cat.color }
+}
+
 function musterTemplateToVirtual(
   tpl: Record<string, MusterTemplateCell>,
+  artenList?: BelegungsartItem[],
 ): Record<string, CellData> {
   const out: Record<string, CellData> = {}
+  const arten = artenList?.length ? artenList : null
   for (const [key, cell] of Object.entries(tpl)) {
     const p = parseMusterTemplateKey(key)
     if (!p) continue
     const dayIndex = p.weekIndex * 7 + p.wd
     const dk = templateDkForDayIndex(dayIndex)
-    out[makeSlotKey(dk, p.room, p.slot)] = { ...cell }
+    out[makeSlotKey(dk, p.room, p.slot)] = arten
+      ? normalizeMusterTemplateCellForIdentity(cell, arten)
+      : { ...cell }
   }
   return out
 }
@@ -2634,7 +2660,7 @@ function tryApplyMusterWeekToSlots(
   templateWeekCount: number,
   musterStamp: MusterApplyStamp | null,
 ): { next: Record<string, CellData> } | { error: string } {
-  const virt = musterTemplateToVirtual(templateCells)
+  const virt = musterTemplateToVirtual(templateCells, artenList)
   const seen = new Set<string>()
   type Op = { targetKeys: string[]; cells: CellData[] }
   const ops: Op[] = []
@@ -2986,7 +3012,7 @@ function applyMusterWithPatientWeek(
   templateWeekCount: number,
   musterStamp: MusterApplyStamp | null,
 ): Record<string, CellData> {
-  const virt = musterTemplateToVirtual(templateCells)
+  const virt = musterTemplateToVirtual(templateCells, artenList)
   const seen = new Set<string>()
   type Op = {
     tDk: string
@@ -3195,7 +3221,7 @@ function collectTemplateOpOnlyDayIndices(
   artenList: BelegungsartItem[],
   templateWeekCount: number,
 ): number[] {
-  const virt = musterTemplateToVirtual(templateCells)
+  const virt = musterTemplateToVirtual(templateCells, artenList)
   const seen = new Set<string>()
   const out = new Set<number>()
   const max = slotCount()
@@ -3719,7 +3745,7 @@ function tryApplyMusterFromOpBooking(
     }
   }
 
-  const virt = musterTemplateToVirtual(templateCells)
+  const virt = musterTemplateToVirtual(templateCells, artenList)
   const anchorBounds = findBlockBounds(
     prev,
     anchor.dk,
@@ -7919,10 +7945,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     const tw = m.templateWeekCount === 1 ? 1 : 3
     setMusterHighlightArtId(null)
     setMusterDraftCells(
-      injectMusterPauseSlots(musterTemplateToVirtual(m.templateCells), tw),
+      injectMusterPauseSlots(
+        musterTemplateToVirtual(m.templateCells, arten),
+        tw,
+      ),
     )
     setMusterModal({ mode: 'edit', id: m.id, templateWeekCount: tw })
-  }, [cloudSyncEnabled, mayMusterWrite])
+  }, [cloudSyncEnabled, mayMusterWrite, arten])
 
   const saveMusterModal = useCallback(() => {
     if (cloudSyncEnabled && !mayMusterWrite) return
