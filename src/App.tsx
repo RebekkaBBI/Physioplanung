@@ -86,10 +86,12 @@ const ROOMS = [
   'Patientenzimmer',
 ] as const
 
-type Room = (typeof ROOMS)[number]
+/** Eigener logischer Raum für den OP-Kalender — keine gemeinsamen Slot-Keys mit ROOMS. */
+const OP_TAB_ROOM = 'OP-Saal' as const
 
-/** OP-Kalender: nur ein Raum (Wochenübersicht sinnvoll). */
-const OP_TAB_ROOM: Room = ROOMS[0]
+type Room = (typeof ROOMS)[number] | typeof OP_TAB_ROOM
+
+/** OP-Kalender: genau dieser Raum (nicht in ROOMS / Hauptkalender). */
 type ViewMode = 'day' | 'week'
 
 const SLOT_MINUTES = 30
@@ -2473,7 +2475,10 @@ function formatWeekRange(weekStart: Date): string {
 }
 
 function isRoomString(x: unknown): x is Room {
-  return typeof x === 'string' && (ROOMS as readonly string[]).includes(x)
+  return (
+    typeof x === 'string' &&
+    ((ROOMS as readonly string[]).includes(x) || x === OP_TAB_ROOM)
+  )
 }
 
 /** Fiktiver Start (1970) für Muster-Editor: aufeinanderfolgende Tage wie im Plan */
@@ -3192,13 +3197,35 @@ function newMusterLinkId(): string {
   return `muster-link-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
 }
 
-function removeCellsByMusterLinkId(
+/** OP: Muster + Hauptkalender-Termine entfernen, OP-Zeitblock ohne Muster-Verknüpfung behalten. */
+function removeMusterLinkKeepOpBooking(
   prev: Record<string, CellData>,
   linkId: string,
+  opDk: string,
+  opRoom: Room,
+  opStart: number,
+  opEnd: number,
 ): Record<string, CellData> {
   const next = { ...prev }
-  for (const k of Object.keys(next)) {
-    if (next[k]?.musterLinkId === linkId) delete next[k]
+  const opKeys = new Set<string>()
+  for (let sl = opStart; sl <= opEnd; sl++) {
+    opKeys.add(makeSlotKey(opDk, opRoom, sl))
+  }
+  const keys = Object.keys(next)
+  for (const k of keys) {
+    const c = next[k]
+    if (c?.musterLinkId !== linkId) continue
+    if (opKeys.has(k)) {
+      const u: CellData = { ...c }
+      delete u.musterLinkId
+      delete u.musterId
+      delete u.muster
+      delete u.musterColor
+      if (!isCellBooked(u)) delete next[k]
+      else next[k] = u
+    } else {
+      delete next[k]
+    }
   }
   return next
 }
@@ -3218,6 +3245,88 @@ function stripPatientFromMusterLinkId(
   return next
 }
 
+/** Gleicher Patient (oder leer) auf alle Termine einer Muster-Verknüpfung (OP + Hauptkalender). */
+function propagatePatientToMusterLinkId(
+  prev: Record<string, CellData>,
+  linkId: string,
+  patientName: string,
+  patientCode: string | undefined,
+): Record<string, CellData> {
+  const next = { ...prev }
+  const nameT = patientName.trim()
+  const codeT = (patientCode ?? '').trim()
+  for (const [k, c] of Object.entries(next)) {
+    if (c?.musterLinkId !== linkId) continue
+    if (!isCellBooked(c)) continue
+    const u: CellData = { ...c }
+    if (nameT) {
+      u.patient = nameT
+      u.patientCode = codeT || undefined
+    } else {
+      delete u.patient
+      delete u.patientCode
+    }
+    next[k] = u
+  }
+  return next
+}
+
+/**
+ * Folgetermine aus OP-Muster dürfen nicht im OP-Tab-Raum landen (derselbe Raum
+ * wie der OP-Anker), sonst erscheinen sie im OP-Kalender statt nur im Hauptkalender.
+ */
+function relocateNonOpMusterOutOfOpTabRoom(
+  ghosted: Record<string, CellData>,
+  tDk: string,
+  anchorRoom: Room,
+  idealStart: number,
+  span: number,
+  chosenRoom: Room,
+  chosenStart: number,
+  collision: boolean,
+): { chosenRoom: Room; chosenStart: number; collision: boolean } {
+  if (chosenRoom !== anchorRoom) {
+    return { chosenRoom, chosenStart, collision }
+  }
+  const alts = ROOMS.filter((r) => r !== anchorRoom)
+  if (alts.length === 0) {
+    return { chosenRoom, chosenStart, collision }
+  }
+  for (const alt of alts) {
+    if (rangeFullyFree(ghosted, tDk, alt, idealStart, span, true)) {
+      return { chosenRoom: alt, chosenStart: idealStart, collision: false }
+    }
+    const b = findSlotBesideConflict(
+      ghosted,
+      tDk,
+      alt,
+      span,
+      idealStart,
+      true,
+    )
+    if (b !== null) {
+      return { chosenRoom: alt, chosenStart: b, collision: false }
+    }
+    const w = findFreeSpanWaveSameRoom(
+      ghosted,
+      tDk,
+      alt,
+      span,
+      idealStart,
+      true,
+    )
+    if (w !== null) {
+      return { chosenRoom: alt, chosenStart: w, collision: false }
+    }
+  }
+  const ar = findFreeSpanAnyRoom(ghosted, tDk, span, alts[0]!, true)
+  if (ar && ar.room !== anchorRoom) {
+    const free = rangeFullyFree(ghosted, tDk, ar.room, ar.start, span, true)
+    return { chosenRoom: ar.room, chosenStart: ar.start, collision: !free }
+  }
+  return { chosenRoom, chosenStart, collision }
+}
+
 /**
  * Belegungsmuster auf OP-Buchung:
  * - Der Tag im Muster, an dem die Belegungsart „OP“ steht (beliebiger Raum im
@@ -3227,6 +3336,8 @@ function stripPatientFromMusterLinkId(
  *   (addDays(weekStart, opAnchorDayIndex) === anchor-Datum).
  * - Alle übrigen Muster-Tage werden relativ dazu auf echte Kalendertage abgebildet
  *   und im Hauptkalender platziert (Mitarbeiter-Verfügbarkeit dort per echtem Wochentag).
+ * - Folgetermine werden nie im OP-Tab-Raum (Anker-Raum) gespeichert, damit sie nicht
+ *   im OP-Kalender erscheinen.
  */
 function applyMusterFromOpBookingOnce(
   prev: Record<string, CellData>,
@@ -3344,7 +3455,11 @@ function applyMusterFromOpBookingOnce(
 
   for (const op of ops) {
     const span = op.cells.length
-    const { tDk, wd, templateRoom: tr, idealStart } = op
+    const { tDk, wd, templateRoom: trRaw, idealStart } = op
+    const tr =
+      trRaw === anchor.room
+        ? (ROOMS.find((r) => r !== anchor.room) ?? trRaw)
+        : trRaw
 
     let chosenRoom: Room = tr
     let chosenStart: number
@@ -3422,6 +3537,30 @@ function applyMusterFromOpBookingOnce(
       chosenRoom = col.room
       chosenStart = col.start
       collision = true
+    }
+
+    const rel = relocateNonOpMusterOutOfOpTabRoom(
+      ghosted,
+      tDk,
+      anchor.room,
+      idealStart,
+      span,
+      chosenRoom,
+      chosenStart,
+      collision,
+    )
+    chosenRoom = rel.chosenRoom
+    chosenStart = rel.chosenStart
+    collision = rel.collision
+
+    if (
+      chosenRoom === anchor.room &&
+      ROOMS.some((r) => r !== anchor.room)
+    ) {
+      return {
+        error:
+          'Folgetermin kann nicht außerhalb des OP-Raums gebucht werden: in keinem anderen Raum ist eine passende freie Lage verfügbar. Bitte Zeiten im Hauptkalender freihalten.',
+      }
     }
 
     for (let i = 0; i < span; i++) {
@@ -5730,6 +5869,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                 patientCode: p.patientCode,
               }
             }
+            const link = next[anchorK]?.musterLinkId
+            if (link) {
+              return propagatePatientToMusterLinkId(
+                next,
+                link,
+                p.name,
+                p.patientCode,
+              )
+            }
             return next
           }
 
@@ -6448,7 +6596,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     if (kind === 'opTermin' && link) {
       if (
         !window.confirm(
-          'Das gesamte Belegungsmuster inklusive aller Hauptkalender-Termine dieser Verknüpfung wird entfernt. Fortfahren?',
+          'Das Belegungsmuster und alle zugehörigen Hauptkalender-Termine werden gelöscht. Die OP-Buchung bleibt bestehen (ohne Muster-Verknüpfung). Fortfahren?',
         )
       ) {
         return
@@ -6458,7 +6606,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     }
     setSlotCells((prev) => {
       if (kind === 'opTermin' && link) {
-        return removeCellsByMusterLinkId(prev, link)
+        const { start: opS, end: opE } = findTerminBlockBoundsIgnoringStaff(
+          prev,
+          dk,
+          room,
+          anchorSlot,
+        )
+        return removeMusterLinkKeepOpBooking(prev, link, dk, room, opS, opE)
       }
       const { start: s0, end } = findBlockBounds(prev, dk, room, anchorSlot)
       const next = { ...prev }
@@ -6633,7 +6787,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         start !== opTerminRangeStart || end !== opTerminRangeEnd
           ? opTerminRangeStart
           : anchorSlot
-      return applyPatientToTerminBlockIgnoringStaff(
+      let out = applyPatientToTerminBlockIgnoringStaff(
         next,
         dk,
         room,
@@ -6642,6 +6796,22 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         opTerminPatientCodeDraft,
         { stripNotiz: true },
       )
+      const { start: blockStart } = findTerminBlockBoundsIgnoringStaff(
+        out,
+        dk,
+        room,
+        anchorForPatient,
+      )
+      const link = out[makeSlotKey(dk, room, blockStart)]?.musterLinkId
+      if (link) {
+        out = propagatePatientToMusterLinkId(
+          out,
+          link,
+          opTerminPatientDraft,
+          opTerminPatientCodeDraft,
+        )
+      }
+      return out
     })
     setTerminPickerModal({
       kind: 'opTermin',
@@ -6685,7 +6855,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       if (!anchor || !isCellBooked(anchor)) return prev
       if (anchor.musterLinkId) {
         alertOnce(
-          'Es ist bereits ein Muster verknüpft. Zuerst „Muster und Folgetermine entfernen“ wählen.',
+          'Es ist bereits ein Muster verknüpft. Zuerst „Belegungsmuster löschen“ wählen.',
         )
         return prev
       }
@@ -9549,8 +9719,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                                     }
                                     aria-label={
                                       subBooked
-                                        ? `${room} ${slotIndexToLabel(sl)} ${cellDisplayLine(data, mitarbeiter)}, Klick für OP-Termin, oder ziehen`
-                                        : `${room} ${slotIndexToLabel(sl)} frei`
+                                        ? `${room === OP_TAB_ROOM ? 'OP' : room} ${slotIndexToLabel(sl)} ${cellDisplayLine(data, mitarbeiter)}, Klick für OP-Termin, oder ziehen`
+                                        : `${room === OP_TAB_ROOM ? 'OP' : room} ${slotIndexToLabel(sl)} frei`
                                     }
                                   />
                                 )
@@ -9622,7 +9792,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                 <div className="corner" />
                 {calendarRooms.map((r) => (
                   <div key={r} className="col-head">
-                    {calendarTabId === CALENDAR_TAB_OP ? `OP · ${r}` : r}
+                    {calendarTabId === CALENDAR_TAB_OP ? 'OP' : r}
                   </div>
                 ))}
                 {weekDays.map((d) => {
@@ -9704,7 +9874,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                     className="col-head"
                     style={{ gridColumn: ri + 2, gridRow: 1 }}
                   >
-                    {calendarTabId === CALENDAR_TAB_OP ? `OP · ${r}` : r}
+                    {calendarTabId === CALENDAR_TAB_OP ? 'OP' : r}
                   </div>
                 ))}
                 {Array.from({ length: dayGridRowCount }, (_, viewSlotIdx) => {
@@ -11250,8 +11420,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           'Verknüpftes Muster'}
                       </p>
                       <p className="muted op-termin-muster-hint">
-                        Zum Wechseln des Musters zuerst „Muster und Folgetermine
-                        entfernen“.
+                        Zum Wechseln des Musters zuerst „Belegungsmuster löschen“
+                        wählen.
                       </p>
                     </div>
                   ) : (
@@ -11318,7 +11488,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                       onClick={clearTerminBlockFromModal}
                     >
                       {terminModalDetail.musterLinkId
-                        ? 'Muster und Folgetermine entfernen'
+                        ? 'Belegungsmuster löschen'
                         : 'Termin leeren'}
                     </button>
                     <button
