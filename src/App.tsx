@@ -3038,6 +3038,17 @@ function applyMusterWithPatientWeek(
     delete next[makeSlotKey(clearAnchor.dk, clearAnchor.room, s)]
   }
 
+  const sim: Record<string, CellData> = { ...next }
+  type WeekPlacement = {
+    tDk: string
+    chosenRoom: Room
+    chosenStart: number
+    span: number
+    cells: CellData[]
+    collision: boolean
+  }
+  const weekPlacements: WeekPlacement[] = []
+
   for (const op of ops) {
     const span = op.cells.length
     const { tDk, wd, templateRoom: tr, idealStart } = op
@@ -3046,12 +3057,12 @@ function applyMusterWithPatientWeek(
     let chosenStart: number
     let collision: boolean
 
-    if (rangeFullyFree(next, tDk, tr, idealStart, span, true)) {
+    if (rangeFullyFree(sim, tDk, tr, idealStart, span, true)) {
       chosenStart = idealStart
       collision = false
     } else {
       const beside = findSlotBesideConflict(
-        next,
+        sim,
         tDk,
         tr,
         span,
@@ -3063,7 +3074,7 @@ function applyMusterWithPatientWeek(
         collision = false
       } else {
         const wave = findFreeSpanWaveSameRoom(
-          next,
+          sim,
           tDk,
           tr,
           span,
@@ -3074,14 +3085,14 @@ function applyMusterWithPatientWeek(
           chosenStart = wave
           collision = false
         } else {
-          const anyR = findFreeSpanAnyRoom(next, tDk, span, tr, true)
+          const anyR = findFreeSpanAnyRoom(sim, tDk, span, tr, true)
           if (anyR) {
             chosenRoom = anyR.room
             chosenStart = anyR.start
             collision = false
           } else {
             const col = pickCollisionPlacement(
-              next,
+              sim,
               tDk,
               tr,
               span,
@@ -3108,7 +3119,7 @@ function applyMusterWithPatientWeek(
       )
     ) {
       const col = pickCollisionPlacement(
-        next,
+        sim,
         tDk,
         tr,
         span,
@@ -3120,16 +3131,42 @@ function applyMusterWithPatientWeek(
       collision = true
     }
 
+    weekPlacements.push({
+      tDk,
+      chosenRoom,
+      chosenStart,
+      span,
+      cells: op.cells,
+      collision,
+    })
     for (let i = 0; i < span; i++) {
-      delete next[makeSlotKey(tDk, chosenRoom, chosenStart + i)]
+      const gk = makeSlotKey(tDk, chosenRoom, chosenStart + i)
+      sim[gk] = mergePatientIntoMusterCell(
+        op.cells[i]!,
+        patientName,
+        patientCode,
+        collision,
+        musterStamp,
+      )
     }
-    for (let i = 0; i < span; i++) {
-      next[makeSlotKey(tDk, chosenRoom, chosenStart + i)] =
+  }
+
+  const weekBatchCollision =
+    weekPlacements.length > 0 && weekPlacements.some((p) => p.collision)
+
+  for (const p of weekPlacements) {
+    for (let i = 0; i < p.span; i++) {
+      delete next[makeSlotKey(p.tDk, p.chosenRoom, p.chosenStart + i)]
+    }
+  }
+  for (const p of weekPlacements) {
+    for (let i = 0; i < p.span; i++) {
+      next[makeSlotKey(p.tDk, p.chosenRoom, p.chosenStart + i)] =
         mergePatientIntoMusterCell(
-          op.cells[i]!,
+          p.cells[i]!,
           patientName,
           patientCode,
-          collision,
+          weekBatchCollision,
           musterStamp,
         )
     }
@@ -3453,6 +3490,16 @@ function applyMusterFromOpBookingOnce(
     ghosted[rk] = ghostHold
   }
 
+  type OpPlacement = {
+    tDk: string
+    chosenRoom: Room
+    chosenStart: number
+    span: number
+    cells: CellData[]
+    collision: boolean
+  }
+  const placements: OpPlacement[] = []
+
   for (const op of ops) {
     const span = op.cells.length
     const { tDk, wd, templateRoom: trRaw, idealStart } = op
@@ -3573,24 +3620,52 @@ function applyMusterFromOpBookingOnce(
       }
     }
 
+    placements.push({
+      tDk,
+      chosenRoom,
+      chosenStart,
+      span,
+      cells: op.cells,
+      collision,
+    })
     for (let i = 0; i < span; i++) {
-      delete next[makeSlotKey(tDk, chosenRoom, chosenStart + i)]
+      const gk = makeSlotKey(tDk, chosenRoom, chosenStart + i)
+      ghosted[gk] = {
+        ...mergePatientIntoMusterCell(
+          op.cells[i]!,
+          patientName,
+          patientCode,
+          collision,
+          musterStamp,
+        ),
+        musterLinkId,
+        musterId: musterCatalogId,
+      }
     }
-    for (let i = 0; i < span; i++) {
-      const mk = makeSlotKey(tDk, chosenRoom, chosenStart + i)
-      const merged = mergePatientIntoMusterCell(
-        op.cells[i]!,
-        patientName,
-        patientCode,
-        collision,
-        musterStamp,
-      )
-      next[mk] = { ...merged, musterLinkId, musterId: musterCatalogId }
+  }
+
+  const batchCollision =
+    placements.length > 0 && placements.some((p) => p.collision)
+
+  for (const p of placements) {
+    for (let i = 0; i < p.span; i++) {
+      delete next[makeSlotKey(p.tDk, p.chosenRoom, p.chosenStart + i)]
     }
-    for (let i = 0; i < span; i++) {
-      ghosted[makeSlotKey(tDk, chosenRoom, chosenStart + i)] = next[
-        makeSlotKey(tDk, chosenRoom, chosenStart + i)
-      ]!
+  }
+  for (const p of placements) {
+    for (let i = 0; i < p.span; i++) {
+      const mk = makeSlotKey(p.tDk, p.chosenRoom, p.chosenStart + i)
+      next[mk] = {
+        ...mergePatientIntoMusterCell(
+          p.cells[i]!,
+          patientName,
+          patientCode,
+          batchCollision,
+          musterStamp,
+        ),
+        musterLinkId,
+        musterId: musterCatalogId,
+      }
     }
   }
 
@@ -3604,7 +3679,7 @@ function applyMusterFromOpBookingOnce(
       base,
       patientName,
       patientCode,
-      false,
+      batchCollision,
       musterStamp,
     )
     next[k] = { ...merged, musterLinkId, musterId: musterCatalogId }
