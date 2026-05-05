@@ -4610,40 +4610,62 @@ function stripMusterLinkAndCollisionFromCell(c: CellData): CellData {
 }
 
 /**
- * Kollisionstermine vor cutoffDk löschen; bei musterLinkId alle zugehörigen Slots
- * vor dem Stichtag mitentfernen. Termine derselben Verknüpfung ab cutoffDk nur
- * entkoppeln (Muster/Kollision entfernen). Verbleibende Kollisionen ohne Link
- * als ganze Blöcke löschen.
+ * Alles, was im Panel „Kollision“ erscheinen würde, vor cutoffDk löschen:
+ * Terminkollision, unvollständige Patiententermine, „Ohne Patient“-Blöcke.
+ * Zusätzlich Muster-Verknüpfungen (musterLinkId) wie bei Kollisionen: vor Stichtag
+ * alle verknüpften Zellen, danach nur entkoppeln. Zuletzt verbleibende
+ * terminKollision (z. B. OP-Tab) vor dem Stichtag als Blöcke entfernen.
  */
-function removeTerminKollisionAndLinkedAppointmentsBefore(
+function removeKollisionPanelItemsBeforeCutoff(
   cells: Record<string, CellData>,
   cutoffDk: string,
+  artenList: BelegungsartItem[],
+  staffList: MitarbeiterItem[],
 ): {
   next: Record<string, CellData>
-  removedLinkGroups: number
-  removedStandaloneBlocks: number
+  removedPanelAnchors: number
+  touchedMusterLinkGroups: number
+  removedOrphanKollisionBlocks: number
   removedSlots: number
   strippedAfterCutoff: number
 } {
-  const linkIds = new Set<string>()
-  for (const [key, data] of Object.entries(cells)) {
-    if (!data?.terminKollision || !data.musterLinkId) continue
-    const p = parseSlotCellKey(key)
-    if (!p || p.dk >= cutoffDk) continue
-    linkIds.add(data.musterLinkId)
-  }
-
   const next: Record<string, CellData> = { ...cells }
   let removedSlots = 0
+  let removedPanelAnchors = 0
+
+  const items = listKollisionPanelItems(next, artenList, staffList)
+  const linkIds = new Set<string>()
+
+  for (const item of items) {
+    const p = parseSlotCellKey(item.anchorKey)
+    if (!p || p.dk >= cutoffDk) continue
+    const { start, end } = findTerminBlockBoundsIgnoringStaff(
+      next,
+      p.dk,
+      p.room,
+      p.slot,
+    )
+    removedPanelAnchors++
+    for (let sl = start; sl <= end; sl++) {
+      const k = makeSlotKey(p.dk, p.room, sl)
+      const cell = next[k]
+      if (!cell) continue
+      if (cell.musterLinkId) linkIds.add(cell.musterLinkId)
+      delete next[k]
+      removedSlots++
+    }
+  }
+
+  const touchedMusterLinkGroups = linkIds.size
   let strippedAfterCutoff = 0
 
   if (linkIds.size > 0) {
     for (const key of Object.keys(next)) {
       const data = next[key]
       if (!data?.musterLinkId || !linkIds.has(data.musterLinkId)) continue
-      const p = parseSlotCellKey(key)
-      if (!p) continue
-      if (p.dk < cutoffDk) {
+      const pk = parseSlotCellKey(key)
+      if (!pk) continue
+      if (pk.dk < cutoffDk) {
         delete next[key]
         removedSlots++
       } else {
@@ -4660,7 +4682,8 @@ function removeTerminKollisionAndLinkedAppointmentsBefore(
   }
 
   const seenAnchors = new Set<string>()
-  const blocks: { dk: string; room: Room; start: number; end: number }[] = []
+  const orphanBlocks: { dk: string; room: Room; start: number; end: number }[] =
+    []
   for (const [key, data] of Object.entries(next)) {
     if (!data?.terminKollision) continue
     const p = parseSlotCellKey(key)
@@ -4674,10 +4697,10 @@ function removeTerminKollisionAndLinkedAppointmentsBefore(
     const anchorKey = makeSlotKey(p.dk, p.room, start)
     if (seenAnchors.has(anchorKey)) continue
     seenAnchors.add(anchorKey)
-    blocks.push({ dk: p.dk, room: p.room, start, end })
+    orphanBlocks.push({ dk: p.dk, room: p.room, start, end })
   }
 
-  for (const block of blocks) {
+  for (const block of orphanBlocks) {
     for (let sl = block.start; sl <= block.end; sl++) {
       const k = makeSlotKey(block.dk, block.room, sl)
       if (next[k]) {
@@ -4689,8 +4712,9 @@ function removeTerminKollisionAndLinkedAppointmentsBefore(
 
   return {
     next,
-    removedLinkGroups: linkIds.size,
-    removedStandaloneBlocks: blocks.length,
+    removedPanelAnchors,
+    touchedMusterLinkGroups,
+    removedOrphanKollisionBlocks: orphanBlocks.length,
     removedSlots,
     strippedAfterCutoff,
   }
@@ -5204,6 +5228,15 @@ function cloneSlotMap(c: Record<string, CellData>): Record<string, CellData> {
   }
 }
 
+/**
+ * Einmalige Bereinigung „Kollision“-Panel vor 2026-06-01: verhindert Doppel-Läufe
+ * (z. B. React StrictMode), unabhängig von localStorage-Timing.
+ */
+const kollisionJun2026PanelCleanupMigration = { started: false }
+const KOLLISION_PANEL_CLEANUP_CUTOFF_DK = '2026-06-01'
+const KOLLISION_PANEL_CLEANUP_MIGRATION_LS =
+  'physio:migration:kollision_panel_cleanup_2026-06-01:v4'
+
 export type AppProps = { cloudSyncEnabled?: boolean }
 
 export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
@@ -5407,7 +5440,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const pendingScrollToNow = useRef(false)
   /** Nach Klick im Kollisions-Panel: Tagesansicht auf diesen Slot scrollen */
   const pendingScrollToTerminSlotRef = useRef<number | null>(null)
-  const deletedOldKollisionenV2Ref = useRef(false)
   const dragSourceRef = useRef<'panel' | 'cell' | 'resize' | null>(null)
   const suppressSlotClickAfterDrag = useRef(0)
   /** Hauptkalender-Tab oder Mitarbeiter-ID — MA-Ansicht ist schreibgeschützte gefilterte Kopie */
@@ -5431,44 +5463,65 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   >(null)
 
   useEffect(() => {
-    if (deletedOldKollisionenV2Ref.current) return
-    // In Cloud-Mode erst nach dem Laden bereinigen, sonst läuft die Migration gegen {}.
     if (cloudSyncEnabled && !cloudHydrated) return
-    deletedOldKollisionenV2Ref.current = true
-
-    const MIGRATION_KEY = 'physio:migration:kollision_cleanup_2026-06-01:v2'
-    if (typeof window !== 'undefined') {
-      try {
-        if (window.localStorage.getItem(MIGRATION_KEY) === '1') return
-        window.localStorage.setItem(MIGRATION_KEY, '1')
-      } catch {
-        // ignore localStorage errors (private mode etc.)
-      }
-    }
-
-    const cutoffDk = '2026-06-01'
-    setSlotCells((prev) => {
-      const cleaned = removeTerminKollisionAndLinkedAppointmentsBefore(prev, cutoffDk)
+    try {
       if (
-        cleaned.removedSlots === 0 &&
-        cleaned.strippedAfterCutoff === 0 &&
-        cleaned.removedStandaloneBlocks === 0 &&
-        cleaned.removedLinkGroups === 0
+        typeof window !== 'undefined' &&
+        window.localStorage.getItem(KOLLISION_PANEL_CLEANUP_MIGRATION_LS) === '1'
       ) {
+        return
+      }
+    } catch {
+      // ignore
+    }
+    // Gleiche Session / StrictMode: nicht zweimal schedulen.
+    if (kollisionJun2026PanelCleanupMigration.started) return
+    kollisionJun2026PanelCleanupMigration.started = true
+
+    const cutoffDk = KOLLISION_PANEL_CLEANUP_CUTOFF_DK
+    setSlotCellsBase((prev) => {
+      const cleaned = removeKollisionPanelItemsBeforeCutoff(
+        prev,
+        cutoffDk,
+        arten,
+        mitarbeiter,
+      )
+      const changed =
+        cleaned.removedSlots > 0 ||
+        cleaned.strippedAfterCutoff > 0 ||
+        cleaned.removedPanelAnchors > 0 ||
+        cleaned.removedOrphanKollisionBlocks > 0
+
+      const markDone = () => {
+        try {
+          if (typeof window !== 'undefined') {
+            window.localStorage.setItem(KOLLISION_PANEL_CLEANUP_MIGRATION_LS, '1')
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (!changed) {
+        queueMicrotask(markDone)
         return prev
       }
-      queueMicrotask(() =>
+
+      slotUndoStackRef.current = []
+      setCanUndoSlots(false)
+      queueMicrotask(() => {
+        markDone()
         alertOnce(
-          `Kollisionen vor ${cutoffDk}: ${cleaned.removedSlots} Zelle(n) gelöscht${
+          `Kollisions-Panel vor ${cutoffDk}: ${cleaned.removedSlots} Zelle(n) gelöscht${
             cleaned.strippedAfterCutoff
               ? `, ${cleaned.strippedAfterCutoff} Folgetermin(e) ab ${cutoffDk} von Muster/Kollision befreit`
               : ''
-          } (${cleaned.removedLinkGroups} Muster-Verknüpfung(en), ${cleaned.removedStandaloneBlocks} einzelne Kollision(en) ohne Verknüpfung).`,
-        ),
-      )
+          } (${cleaned.removedPanelAnchors} Panel-Termin(e), ${cleaned.touchedMusterLinkGroups} Muster-Verknüpfung(en), ${cleaned.removedOrphanKollisionBlocks} weitere Kollision(en) außerhalb des Panels).`,
+        )
+      })
       return cleaned.next
     })
-  }, [cloudSyncEnabled, cloudHydrated, setSlotCells])
+  }, [cloudSyncEnabled, cloudHydrated, arten, mitarbeiter])
 
   useEffect(() => {
     if (!cloudSyncEnabled) return
