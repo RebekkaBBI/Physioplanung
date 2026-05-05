@@ -5407,7 +5407,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const pendingScrollToNow = useRef(false)
   /** Nach Klick im Kollisions-Panel: Tagesansicht auf diesen Slot scrollen */
   const pendingScrollToTerminSlotRef = useRef<number | null>(null)
-  const deletedOldKollisionenRef = useRef(false)
+  const deletedOldKollisionenV2Ref = useRef(false)
   const dragSourceRef = useRef<'panel' | 'cell' | 'resize' | null>(null)
   const suppressSlotClickAfterDrag = useRef(0)
   /** Hauptkalender-Tab oder Mitarbeiter-ID — MA-Ansicht ist schreibgeschützte gefilterte Kopie */
@@ -5431,14 +5431,24 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   >(null)
 
   useEffect(() => {
-    if (deletedOldKollisionenRef.current) return
-    deletedOldKollisionenRef.current = true
+    if (deletedOldKollisionenV2Ref.current) return
+    // In Cloud-Mode erst nach dem Laden bereinigen, sonst läuft die Migration gegen {}.
+    if (cloudSyncEnabled && !cloudHydrated) return
+    deletedOldKollisionenV2Ref.current = true
+
+    const MIGRATION_KEY = 'physio:migration:kollision_cleanup_2026-06-01:v2'
+    if (typeof window !== 'undefined') {
+      try {
+        if (window.localStorage.getItem(MIGRATION_KEY) === '1') return
+        window.localStorage.setItem(MIGRATION_KEY, '1')
+      } catch {
+        // ignore localStorage errors (private mode etc.)
+      }
+    }
+
     const cutoffDk = '2026-06-01'
     setSlotCells((prev) => {
-      const cleaned = removeTerminKollisionAndLinkedAppointmentsBefore(
-        prev,
-        cutoffDk,
-      )
+      const cleaned = removeTerminKollisionAndLinkedAppointmentsBefore(prev, cutoffDk)
       if (
         cleaned.removedSlots === 0 &&
         cleaned.strippedAfterCutoff === 0 &&
@@ -5449,12 +5459,16 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       }
       queueMicrotask(() =>
         alertOnce(
-          `Kollisionen vor ${cutoffDk}: ${cleaned.removedSlots} Zelle(n) gelöscht${cleaned.strippedAfterCutoff ? `, ${cleaned.strippedAfterCutoff} Folgetermin(e) ab ${cutoffDk} von Muster/Kollision befreit` : ''} (${cleaned.removedLinkGroups} Muster-Verknüpfung(en), ${cleaned.removedStandaloneBlocks} einzelne Kollision(en) ohne Verknüpfung).`,
+          `Kollisionen vor ${cutoffDk}: ${cleaned.removedSlots} Zelle(n) gelöscht${
+            cleaned.strippedAfterCutoff
+              ? `, ${cleaned.strippedAfterCutoff} Folgetermin(e) ab ${cutoffDk} von Muster/Kollision befreit`
+              : ''
+          } (${cleaned.removedLinkGroups} Muster-Verknüpfung(en), ${cleaned.removedStandaloneBlocks} einzelne Kollision(en) ohne Verknüpfung).`,
         ),
       )
       return cleaned.next
     })
-  }, [setSlotCells])
+  }, [cloudSyncEnabled, cloudHydrated, setSlotCells])
 
   useEffect(() => {
     if (!cloudSyncEnabled) return
