@@ -978,12 +978,13 @@ function migrateMitarbeiter(
   }
 }
 
-function ensureTeamMeetingArtInCatalog(
+/** Fehlende Einträge aus DEFAULT_ARTEN anhängen (Migration neuer Katalog-Arten). */
+function ensureDefaultArtenMigratedIntoCatalog(
   list: BelegungsartItem[],
 ): BelegungsartItem[] {
-  if (list.some((a) => a.id === TEAM_MEETING_ART_ID)) return list
-  const tm = DEFAULT_ARTEN.find((a) => a.id === TEAM_MEETING_ART_ID)
-  return tm ? [...list, tm] : list
+  const ids = new Set(list.map((a) => a.id))
+  const extra = DEFAULT_ARTEN.filter((a) => !ids.has(a.id))
+  return extra.length ? [...list, ...extra] : list
 }
 
 function isCellBooked(data: CellData | undefined): boolean {
@@ -1003,10 +1004,48 @@ const STORAGE_PANELS = 'physio-planung-panels-v1'
 /** Ansicht & Kalenderdatum (Auto-Save bei jeder Änderung) */
 const STORAGE_UI = 'physio-planung-ui-v1'
 /** Erhöhen, wenn sich die feste Belegungsarten-Liste ändert (Migration aus localStorage). */
-const ARTEN_CATALOG_VERSION = 4
+const ARTEN_CATALOG_VERSION = 5
 
 const OP_BELEGUNGSART_ID = 'art-op'
 const TEAM_MEETING_ART_ID = 'art-team-meeting'
+
+/** Hauptkalender: Belegungsarten, die im Termindialog als wöchentliche Reihe (gleiche Uhrzeit) angelegt werden können. */
+const WEEKLY_SERIES_MAIN_CALENDAR_ART_IDS: ReadonlySet<string> = new Set([
+  'art-clicking',
+  'art-orga',
+  'art-teamleiter-besprechung',
+])
+
+function mainCalendarArtSupportsWeeklySeries(
+  artId: string | null | undefined,
+): boolean {
+  return !!artId && WEEKLY_SERIES_MAIN_CALENDAR_ART_IDS.has(artId)
+}
+
+const STAFF_AUTO_ALLOWED_ART_IDS: string[] = [
+  TEAM_MEETING_ART_ID,
+  ...Array.from(WEEKLY_SERIES_MAIN_CALENDAR_ART_IDS),
+]
+
+/** Teambesprechung: MAs mit Art-Freigabe, im ganzen Block nicht abwesend und auf jedem Slot verfügbar. */
+function eligibleTeamMeetingStaffForBlock(
+  cells: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  anchorSlot: number,
+  staffList: MitarbeiterItem[],
+): MitarbeiterItem[] {
+  const { start, end } = findBlockBounds(cells, dk, room, anchorSlot)
+  const wd = weekdayMon0FromDate(parseDateKey(dk))
+  return staffList.filter((st) => {
+    if (!staffHasArtAllowed(st, TEAM_MEETING_ART_ID)) return false
+    for (let sl = start; sl <= end; sl++) {
+      if (isStaffAbsentAtSlot(st, dk, sl)) return false
+      if (!isStaffSlotAvailableForDate(st, dk, wd, sl)) return false
+    }
+    return true
+  })
+}
 
 /** Mittagspause im Muster-Editor — keine echte Belegungsart, wird nicht in den Hauptkalender übernommen. */
 const MUSTER_PAUSE_ART_ID = '__muster_pause__'
@@ -1306,6 +1345,13 @@ const DEFAULT_ARTEN: BelegungsartItem[] = [
   { id: 'art-op', label: 'OP', color: '#991b1b', slots: 1 },
   { id: 'art-hbot', label: 'HBOT', color: '#0891b2', slots: 2 },
   { id: 'art-clicking', label: 'Clicking', color: '#a855f7', slots: 4 },
+  { id: 'art-orga', label: 'Orga', color: '#64748b', slots: 2 },
+  {
+    id: 'art-teamleiter-besprechung',
+    label: 'Teamleiterbesprechung',
+    color: '#0f766e',
+    slots: 2,
+  },
   { id: 'art-stretching-1', label: 'Stretching 1', color: '#ea580c', slots: 2 },
   { id: 'art-stretching-2', label: 'Stretching 2', color: '#059669', slots: 2 },
   { id: 'art-stretching-3', label: 'Stretching 3', color: '#c026d3', slots: 2 },
@@ -1469,7 +1515,7 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
     (o.artenCatalogVersion ?? 0) >= ARTEN_CATALOG_VERSION &&
     Array.isArray(o.arten) &&
     o.arten.length > 0
-  const resolvedArten = ensureTeamMeetingArtInCatalog(
+  const resolvedArten = ensureDefaultArtenMigratedIntoCatalog(
     catalogOk ? o.arten! : DEFAULT_ARTEN,
   )
   const artIdsForMigrate = resolvedArten.map((a) => a.id)
@@ -5598,17 +5644,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   )
   // Katalog-Migration auch nach Hot-Reload / bestehendem State erzwingen
   useEffect(() => {
-    const has = arten.some((a) => a.id === TEAM_MEETING_ART_ID)
-    if (!has) {
-      const tm = DEFAULT_ARTEN.find((a) => a.id === TEAM_MEETING_ART_ID)
-      if (tm) setArten((prev) => (prev.some((a) => a.id === tm.id) ? prev : [...prev, tm]))
-    }
+    setArten((prev) => ensureDefaultArtenMigratedIntoCatalog(prev))
     setMitarbeiter((prev) =>
-      prev.map((s) =>
-        s.allowedArtIds.includes(TEAM_MEETING_ART_ID)
-          ? s
-          : { ...s, allowedArtIds: [...s.allowedArtIds, TEAM_MEETING_ART_ID] },
-      ),
+      prev.map((s) => {
+        const add = STAFF_AUTO_ALLOWED_ART_IDS.filter(
+          (id) => !s.allowedArtIds.includes(id),
+        )
+        if (add.length === 0) return s
+        return { ...s, allowedArtIds: [...s.allowedArtIds, ...add] }
+      }),
     )
   }, [arten])
   const [staffModal, setStaffModal] = useState<
@@ -5632,6 +5676,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     string[]
   >([])
   const [teamMeetingRepeatWeeks, setTeamMeetingRepeatWeeks] = useState(1)
+  const [mainTerminRepeatWeeks, setMainTerminRepeatWeeks] = useState(1)
+  const teamMeetingModalInitKeyRef = useRef<string | null>(null)
   const [terminNotizDraft, setTerminNotizDraft] = useState('')
   const [opTerminPatientDraft, setOpTerminPatientDraft] = useState('')
   const [opTerminPatientCodeDraft, setOpTerminPatientCodeDraft] = useState('')
@@ -6706,17 +6752,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     ],
   )
 
-  useEffect(() => {
-    if (terminPickerModal?.kind !== 'teamMeeting') return
-    const { dk, room, anchorSlot } = terminPickerModal
-    const { start } = findBlockBounds(slotCells, dk, room, anchorSlot)
-    const anchor = slotCells[makeSlotKey(dk, room, start)]
-    setTeamMeetingSelectedIds(
-      anchor?.teamStaffIds?.length ? [...anchor.teamStaffIds] : [],
-    )
-    setTeamMeetingRepeatWeeks(1)
-  }, [terminPickerModal, slotCells])
-
   const handleDropOnSlot = useCallback(
     (e: React.DragEvent, dk: string, room: Room, slotIndex: number) => {
       e.preventDefault()
@@ -7125,6 +7160,42 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     [arten, mitarbeiter, setSlotCells],
   )
 
+  useEffect(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'teamMeeting') {
+      teamMeetingModalInitKeyRef.current = null
+      return
+    }
+    const { dk, room, anchorSlot } = terminPickerModal
+    const { start } = findBlockBounds(slotCells, dk, room, anchorSlot)
+    const initKey = `${dk}|${room}|${start}`
+    if (teamMeetingModalInitKeyRef.current === initKey) return
+    teamMeetingModalInitKeyRef.current = initKey
+
+    const eligible = eligibleTeamMeetingStaffForBlock(
+      slotCells,
+      dk,
+      room,
+      anchorSlot,
+      mitarbeiter,
+    )
+    const eligibleIds = new Set(eligible.map((s) => s.id))
+    const anchor = slotCells[makeSlotKey(dk, room, start)]
+    let initial: string[]
+    if (anchor?.teamStaffIds?.length) {
+      initial = anchor.teamStaffIds.filter((id) => eligibleIds.has(id))
+    } else {
+      initial = eligible.map((s) => s.id)
+    }
+    setTeamMeetingSelectedIds(initial)
+    setTeamMeetingRepeatWeeks(1)
+    applyTeamMeetingParticipantsToSingleOccurrence(dk, room, anchorSlot, initial)
+  }, [
+    terminPickerModal,
+    slotCells,
+    mitarbeiter,
+    applyTeamMeetingParticipantsToSingleOccurrence,
+  ])
+
   const saveTeamMeetingFromModal = useCallback(() => {
     if (!terminPickerModal || terminPickerModal.kind !== 'teamMeeting') return
     const { dk, room, anchorSlot } = terminPickerModal
@@ -7380,6 +7451,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       setMainTerminEditStaff(
         sample ? !findStaffForCell(sample, mitarbeiter) : true,
       )
+      setMainTerminRepeatWeeks(1)
     }
   }, [terminPickerModal, slotCells, arten, mitarbeiter])
 
@@ -7445,6 +7517,143 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       return next
     })
   }, [terminPickerModal, terminNotizDraft, setSlotCells])
+
+  const saveMainTerminWeeklySeriesFromModal = useCallback(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') return
+    if (cloudSyncEnabled && !mayCalendarWrite) return
+    const { dk, room, anchorSlot } = terminPickerModal
+    const repeatWeeks = Math.max(1, Math.min(52, mainTerminRepeatWeeks))
+    const trimmedNotiz = terminNotizDraft.trim()
+
+    const { start: preStart } = findTerminBlockBoundsIgnoringStaff(
+      slotCells,
+      dk,
+      room,
+      anchorSlot,
+    )
+    const preSample = slotCells[makeSlotKey(dk, room, preStart)]
+    if (!preSample || !isCellBooked(preSample)) {
+      alertOnce('Termin nicht gefunden.')
+      return
+    }
+    const preArtId = findArtIdForCell(preSample, arten)
+    if (!mainCalendarArtSupportsWeeklySeries(preArtId)) {
+      alertOnce('Reihentermine sind für diese Belegungsart nicht vorgesehen.')
+      return
+    }
+    if (preSample.patient?.trim()) {
+      alertOnce('Reihentermine sind nur ohne Patient möglich.')
+      return
+    }
+    if (preSample.musterLinkId) {
+      alertOnce(
+        'Mit Belegungsmuster verknüpfte Termine können nicht als Reihe übernommen werden.',
+      )
+      return
+    }
+    const preArtItem = arten.find((a) => a.id === preArtId)
+    if (!preArtItem) {
+      alertOnce('Belegungsart nicht im Katalog.')
+      return
+    }
+
+    setSlotCells((prev) => {
+      const next = { ...prev }
+      const { start, end } = findTerminBlockBoundsIgnoringStaff(
+        next,
+        dk,
+        room,
+        anchorSlot,
+      )
+      const span = end - start + 1
+      const startK = makeSlotKey(dk, room, start)
+      const anchorSample = next[startK]
+      if (!anchorSample || !isCellBooked(anchorSample)) return prev
+
+      const artId = findArtIdForCell(anchorSample, arten)
+      if (!mainCalendarArtSupportsWeeklySeries(artId)) return prev
+      if (anchorSample.patient?.trim()) return prev
+      if (anchorSample.musterLinkId) return prev
+
+      const artItem = arten.find((a) => a.id === artId)
+      if (!artItem) return prev
+
+      for (let sl = start; sl <= end; sl++) {
+        const k = makeSlotKey(dk, room, sl)
+        const cur = next[k]
+        if (!cur || !isCellBooked(cur)) continue
+        next[k] = { ...cur, notiz: trimmedNotiz || undefined }
+      }
+
+      const templateSlots: CellData[] = []
+      for (let i = 0; i < span; i++) {
+        const k = makeSlotKey(dk, room, start + i)
+        templateSlots.push({ ...(next[k] ?? {}) })
+      }
+      const staffOnTemplate = findStaffForCell(templateSlots[0]!, mitarbeiter)
+
+      for (let w = 0; w < repeatWeeks; w++) {
+        const d = addDays(parseDateKey(dk), w * 7)
+        const dkW = dateKey(d)
+        const wdW = weekdayMon0FromDate(parseDateKey(dkW))
+
+        if (w > 0) {
+          const blocked = artFromPanelBlockedReason(
+            next,
+            dkW,
+            room,
+            start,
+            artItem,
+            mitarbeiter,
+            false,
+          )
+          if (blocked) continue
+        }
+
+        if (staffOnTemplate) {
+          if (!staffHasArtAllowed(staffOnTemplate, artItem.id)) continue
+          let staffOk = true
+          for (let sl = start; sl <= end; sl++) {
+            if (
+              isStaffAbsentAtSlot(staffOnTemplate, dkW, sl) ||
+              !isStaffSlotAvailable(staffOnTemplate, wdW, sl, dkW)
+            ) {
+              staffOk = false
+              break
+            }
+          }
+          if (!staffOk) continue
+        }
+
+        for (let i = 0; i < span; i++) {
+          const sl = start + i
+          const k = makeSlotKey(dkW, room, sl)
+          const tpl = templateSlots[i]!
+          next[k] = {
+            art: tpl.art,
+            artId: tpl.artId,
+            artColor: tpl.artColor,
+            staff: tpl.staff,
+            staffId: tpl.staffId,
+            notiz: trimmedNotiz || undefined,
+          }
+        }
+      }
+      return next
+    })
+    setTerminPickerModal(null)
+  }, [
+    terminPickerModal,
+    slotCells,
+    arten,
+    mitarbeiter,
+    mainTerminRepeatWeeks,
+    terminNotizDraft,
+    setSlotCells,
+    setTerminPickerModal,
+    cloudSyncEnabled,
+    mayCalendarWrite,
+  ])
 
   const saveOpTerminDetailsFromModal = useCallback(() => {
     if (!terminPickerModal || terminPickerModal.kind !== 'opTermin') return
@@ -7818,20 +8027,26 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     }
   }, [terminPickerModal, slotCells, arten, mitarbeiter])
 
+  const mainTerminWeeklySeriesEligible = useMemo(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') return false
+    if (!terminModalDetail) return false
+    return (
+      mainCalendarArtSupportsWeeklySeries(terminModalDetail.blockArtId) &&
+      !terminModalDetail.hasPatient &&
+      !terminModalDetail.musterLinkId
+    )
+  }, [terminPickerModal, terminModalDetail])
+
   const teamMeetingEligibleStaffForModal = useMemo(() => {
     if (!terminPickerModal || terminPickerModal.kind !== 'teamMeeting') return null
     const { dk, room, anchorSlot } = terminPickerModal
-    const { start, end } = findBlockBounds(slotCells, dk, room, anchorSlot)
-    const wd = weekdayMon0FromDate(parseDateKey(dk))
-    return mitarbeiter
-      .filter((st) => staffHasArtAllowed(st, TEAM_MEETING_ART_ID))
-      .filter((st) => {
-        for (let sl = start; sl <= end; sl++) {
-          if (isStaffAbsentAtSlot(st, dk, sl)) return false
-          if (!isStaffSlotAvailableForDate(st, dk, wd, sl)) return false
-        }
-        return true
-      })
+    return eligibleTeamMeetingStaffForBlock(
+      slotCells,
+      dk,
+      room,
+      anchorSlot,
+      mitarbeiter,
+    )
   }, [terminPickerModal, slotCells, mitarbeiter])
 
   /** Hauptkalender · Mitarbeiter-Zuordnung: nur MA mit Freigabe für die Art und Verfügbarkeit auf jedem Slot des Blocks */
@@ -11910,6 +12125,37 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                       </div>
                     )}
                   </div>
+                  {mainTerminWeeklySeriesEligible ? (
+                    <>
+                      <p className="staff-modal-hint">
+                        Wöchentliche Wiederholung: der Termin wird an den
+                        Folgetagen derselben Wochenzeit eingetragen, sofern der
+                        Raum frei ist und der zugewiesene Mitarbeiter (falls
+                        vorhanden) nicht abwesend ist und im Wochenplan frei
+                        ist — andernfalls wird die jeweilige Woche
+                        übersprungen.
+                      </p>
+                      <label className="staff-modal-label">
+                        Reihentermin (Anzahl Wochen)
+                        <input
+                          type="number"
+                          className="staff-modal-name-input"
+                          min={1}
+                          max={52}
+                          value={mainTerminRepeatWeeks}
+                          onChange={(e) =>
+                            setMainTerminRepeatWeeks(
+                              Math.max(
+                                1,
+                                Math.min(52, Number(e.target.value) || 1),
+                              ),
+                            )
+                          }
+                          aria-label="Reihentermin Wochenanzahl Hauptkalender"
+                        />
+                      </label>
+                    </>
+                  ) : null}
                   <TerminModalNotizFields
                     draft={terminNotizDraft}
                     onDraftChange={setTerminNotizDraft}
@@ -11939,6 +12185,16 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                     >
                       Termin leeren
                     </button>
+                    {mainTerminWeeklySeriesEligible ? (
+                      <button
+                        type="button"
+                        className="btn-edit-save"
+                        disabled={cloudSyncEnabled && !mayCalendarWrite}
+                        onClick={saveMainTerminWeeklySeriesFromModal}
+                      >
+                        Reihentermin speichern
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       className="btn-edit-save"
