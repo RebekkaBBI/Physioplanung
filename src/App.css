@@ -326,14 +326,17 @@
   flex: 1 1 auto;
 }
 
-/* Einheitliche Höhe/Breite: Hauptkalender und Mitarbeiter-Wochenansicht gleicher Kasten */
+/*
+ * Hauptkalender-Kasten: wächst unter den Tabs bis zur Unterkante der Spalte
+ * (gleiche Höhe wie Patientenpanel). Mindesthöhe bleibt wie zuvor.
+ */
 .main-column--calendar > .grid-wrap {
-  flex: 0 0 auto;
+  flex: 1 1 auto;
   align-self: stretch;
   width: 100%;
   min-width: 0;
   min-height: var(--calendar-grid-block-height);
-  max-height: var(--calendar-grid-block-height);
+  max-height: none;
   overflow: auto;
   display: flex;
   flex-direction: column;
