@@ -4598,35 +4598,85 @@ function kollisionPanelKindOrder(
   return 3
 }
 
-function removeTerminKollisionAppointmentsBefore(
+/** Muster-Verknüpfung von Zelle lösen (Folgetermine nach Stichtag ohne rote Kollision / ohne Muster-Kopplung). */
+function stripMusterLinkAndCollisionFromCell(c: CellData): CellData {
+  const u: CellData = { ...c }
+  delete u.musterLinkId
+  delete u.musterId
+  delete u.muster
+  delete u.musterColor
+  delete u.terminKollision
+  return u
+}
+
+/**
+ * Kollisionstermine vor cutoffDk löschen; bei musterLinkId alle zugehörigen Slots
+ * vor dem Stichtag mitentfernen. Termine derselben Verknüpfung ab cutoffDk nur
+ * entkoppeln (Muster/Kollision entfernen). Verbleibende Kollisionen ohne Link
+ * als ganze Blöcke löschen.
+ */
+function removeTerminKollisionAndLinkedAppointmentsBefore(
   cells: Record<string, CellData>,
   cutoffDk: string,
 ): {
   next: Record<string, CellData>
-  removedBlocks: number
+  removedLinkGroups: number
+  removedStandaloneBlocks: number
   removedSlots: number
+  strippedAfterCutoff: number
 } {
+  const linkIds = new Set<string>()
+  for (const [key, data] of Object.entries(cells)) {
+    if (!data?.terminKollision || !data.musterLinkId) continue
+    const p = parseSlotCellKey(key)
+    if (!p || p.dk >= cutoffDk) continue
+    linkIds.add(data.musterLinkId)
+  }
+
+  const next: Record<string, CellData> = { ...cells }
+  let removedSlots = 0
+  let strippedAfterCutoff = 0
+
+  if (linkIds.size > 0) {
+    for (const key of Object.keys(next)) {
+      const data = next[key]
+      if (!data?.musterLinkId || !linkIds.has(data.musterLinkId)) continue
+      const p = parseSlotCellKey(key)
+      if (!p) continue
+      if (p.dk < cutoffDk) {
+        delete next[key]
+        removedSlots++
+      } else {
+        const merged = stripMusterLinkAndCollisionFromCell(data)
+        if (!isCellBooked(merged)) {
+          delete next[key]
+          removedSlots++
+        } else {
+          next[key] = merged
+          strippedAfterCutoff++
+        }
+      }
+    }
+  }
+
   const seenAnchors = new Set<string>()
   const blocks: { dk: string; room: Room; start: number; end: number }[] = []
-
-  for (const [key, data] of Object.entries(cells)) {
+  for (const [key, data] of Object.entries(next)) {
     if (!data?.terminKollision) continue
     const p = parseSlotCellKey(key)
-    if (!p) continue
-    if (p.dk >= cutoffDk) continue
-    const { start, end } = findBlockBounds(cells, p.dk, p.room, p.slot)
+    if (!p || p.dk >= cutoffDk) continue
+    const { start, end } = findTerminBlockBoundsIgnoringStaff(
+      next,
+      p.dk,
+      p.room,
+      p.slot,
+    )
     const anchorKey = makeSlotKey(p.dk, p.room, start)
     if (seenAnchors.has(anchorKey)) continue
     seenAnchors.add(anchorKey)
     blocks.push({ dk: p.dk, room: p.room, start, end })
   }
 
-  if (blocks.length === 0) {
-    return { next: cells, removedBlocks: 0, removedSlots: 0 }
-  }
-
-  const next = { ...cells }
-  let removedSlots = 0
   for (const block of blocks) {
     for (let sl = block.start; sl <= block.end; sl++) {
       const k = makeSlotKey(block.dk, block.room, sl)
@@ -4636,7 +4686,14 @@ function removeTerminKollisionAppointmentsBefore(
       }
     }
   }
-  return { next, removedBlocks: blocks.length, removedSlots }
+
+  return {
+    next,
+    removedLinkGroups: linkIds.size,
+    removedStandaloneBlocks: blocks.length,
+    removedSlots,
+    strippedAfterCutoff,
+  }
 }
 
 /** Terminkollisionen (Muster) sowie Patiententermine ohne Mitarbeiter (inkl. „Mitarbeiter zuteilen“). */
@@ -5378,11 +5435,21 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     deletedOldKollisionenRef.current = true
     const cutoffDk = '2026-06-01'
     setSlotCells((prev) => {
-      const cleaned = removeTerminKollisionAppointmentsBefore(prev, cutoffDk)
-      if (cleaned.removedBlocks === 0) return prev
+      const cleaned = removeTerminKollisionAndLinkedAppointmentsBefore(
+        prev,
+        cutoffDk,
+      )
+      if (
+        cleaned.removedSlots === 0 &&
+        cleaned.strippedAfterCutoff === 0 &&
+        cleaned.removedStandaloneBlocks === 0 &&
+        cleaned.removedLinkGroups === 0
+      ) {
+        return prev
+      }
       queueMicrotask(() =>
         alertOnce(
-          `${cleaned.removedBlocks} kollidierende Termine vor ${cutoffDk} wurden gelöscht.`,
+          `Kollisionen vor ${cutoffDk}: ${cleaned.removedSlots} Zelle(n) gelöscht${cleaned.strippedAfterCutoff ? `, ${cleaned.strippedAfterCutoff} Folgetermin(e) ab ${cutoffDk} von Muster/Kollision befreit` : ''} (${cleaned.removedLinkGroups} Muster-Verknüpfung(en), ${cleaned.removedStandaloneBlocks} einzelne Kollision(en) ohne Verknüpfung).`,
         ),
       )
       return cleaned.next
