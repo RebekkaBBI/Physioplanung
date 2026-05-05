@@ -7,11 +7,6 @@
   margin: 0 auto;
   /* Gleiche Höhe wie Hauptkalender-Raster (.grid-wrap) */
   --calendar-grid-block-height: min(70vh, 720px);
-  /*
-   * Platz für .calendar-view-tabs (eine bis mehrere Zeilen bei vielen Mitarbeiter-Tabs),
-   * damit die Patientenkarte insgesamt nicht über Kalender + Tabs hinauswächst.
-   */
-  --calendar-tabs-vertical-reserve: clamp(3rem, 10vh, 11rem);
   /* Mindesthöhe der Karten wie mit 14rem-Listenbereich (Titel + Liste + Fuß/Button) */
   --panel-below-calendar-card-min-height: 23.25rem;
   /* Früher fester Listenbereich — bleibt Mindesthöhe des Scrollblocks */
@@ -29,8 +24,7 @@
   display: grid;
   grid-template-columns: minmax(13rem, 15.5rem) 1fr;
   gap: 1.25rem;
-  /* Patientenspalte soll die Zeilenhöhe nicht über Kalender+Tabs hinaus aufblasen */
-  align-items: start;
+  align-items: stretch;
   min-width: 0;
 }
 
@@ -260,19 +254,19 @@
 }
 
 .side-panels--calendar {
+  /* Grid-Zeile folgt der Kalenderspalte; Inhalt scrollt, kein Aufblasen der Zeile */
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  max-height: calc(
-    var(--calendar-grid-block-height) + var(--calendar-tabs-vertical-reserve)
-  );
   width: 100%;
+  overflow: hidden;
 }
 
 .side-panels--calendar .panel-patients {
   flex: 1 1 auto;
   min-height: 0;
-  max-height: 100%;
+  max-height: none;
   display: flex;
   flex-direction: column;
   overflow: hidden;
