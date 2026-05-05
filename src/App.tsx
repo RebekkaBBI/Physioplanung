@@ -1475,12 +1475,13 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
   const artIdsForMigrate = resolvedArten.map((a) => a.id)
   return {
     patients: Array.isArray(o.patients)
-      ? o.patients.map((p: PatientItem) => ({
-          ...p,
-          patientCode:
-            typeof p.patientCode === 'string' ? p.patientCode : '',
-        }))
-      : DEFAULT_PATIENTS,
+      ? normalizePatientsUniqueIds(
+          o.patients.map((p: PatientItem) => ({
+            ...p,
+            patientCode: typeof p.patientCode === 'string' ? p.patientCode : '',
+          })),
+        )
+      : normalizePatientsUniqueIds(DEFAULT_PATIENTS),
     arten: resolvedArten,
     muster: ensureVerlaengerungswocheMusterPreset(
       ensureOberschenkelOpMusterPreset(
@@ -1528,6 +1529,7 @@ function savePanelsState(p: {
     STORAGE_PANELS,
     JSON.stringify({
       ...p,
+      patients: normalizePatientsUniqueIds(p.patients),
       artenCatalogVersion: ARTEN_CATALOG_VERSION,
     }),
   )
@@ -3422,6 +3424,30 @@ function newMusterLinkId(): string {
     return crypto.randomUUID()
   }
   return `muster-link-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
+}
+
+function newPatientId(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return `p-${crypto.randomUUID()}`
+  }
+  return `p-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
+}
+
+function normalizePatientsUniqueIds(raw: PatientItem[]): PatientItem[] {
+  const seen = new Set<string>()
+  const out: PatientItem[] = []
+  for (const p of raw) {
+    const baseId = typeof p.id === 'string' ? p.id.trim() : ''
+    let id = baseId
+    if (!id || seen.has(id)) id = newPatientId()
+    seen.add(id)
+    out.push({
+      id,
+      name: typeof p.name === 'string' ? p.name : '',
+      patientCode: typeof p.patientCode === 'string' ? p.patientCode : '',
+    })
+  }
+  return out
 }
 
 /** OP: Muster + Hauptkalender-Termine entfernen, OP-Zeitblock ohne Muster-Verknüpfung behalten. */
@@ -7918,7 +7944,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     if (!name || !patientCode) return
     setPatients((p) => [
       ...p,
-      { id: `p-${Date.now()}`, name, patientCode },
+      { id: newPatientId(), name, patientCode },
     ])
     setNewPatientName('')
     setNewPatientCode('')
