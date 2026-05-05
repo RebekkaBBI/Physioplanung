@@ -1035,6 +1035,129 @@ function slotRangeOverlapsMusterPause(startSlot: number, span: number): boolean 
   return startSlot <= p1 && end >= p0
 }
 
+function pickAutoStaffAlphabetical(
+  candidates: MitarbeiterItem[],
+): MitarbeiterItem | undefined {
+  if (candidates.length === 0) return undefined
+  return [...candidates].sort((a, b) =>
+    a.name.localeCompare(b.name, 'de', { sensitivity: 'base' }),
+  )[0]
+}
+
+/**
+ * Einen Mitarbeiter für einen zusammenhängenden Termin wählen: Art freigeschaltet,
+ * alle Slots verfügbar und nicht abwesend. Bereits gesetzter MA bleibt, wenn gültig.
+ */
+function resolveStaffForBookedSpan(
+  anchorCell: CellData | undefined,
+  staffList: MitarbeiterItem[],
+  artenList: BelegungsartItem[],
+  dk: string,
+  wd: number,
+  startSlot: number,
+  span: number,
+): MitarbeiterItem | undefined {
+  if (!anchorCell || span < 1) return undefined
+  const artId = findArtIdForCell(anchorCell, artenList)
+  if (
+    !artId ||
+    artId === TEAM_MEETING_ART_ID ||
+    artId === MUSTER_PAUSE_ART_ID ||
+    artId === '__muster_anchor_hold__'
+  ) {
+    return undefined
+  }
+
+  const existing = findStaffForCell(anchorCell, staffList)
+  if (existing && staffHasArtAllowed(existing, artId)) {
+    let ok = true
+    for (let i = 0; i < span; i++) {
+      if (!isStaffSlotAvailableForDate(existing, dk, wd, startSlot + i)) {
+        ok = false
+        break
+      }
+    }
+    if (ok) return existing
+  }
+
+  const candidates = staffWhoCanPerformArtOnWholeSpan(
+    staffList,
+    artId,
+    dk,
+    wd,
+    startSlot,
+    span,
+  )
+  return pickAutoStaffAlphabetical(candidates)
+}
+
+function applyStaffToCellData(c: CellData, s: MitarbeiterItem): CellData {
+  return { ...c, staff: s.name, staffId: s.id }
+}
+
+function applyAutoStaffToBlockInMap(
+  next: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  blockStart: number,
+  blockEnd: number,
+  staffList: MitarbeiterItem[],
+  artenList: BelegungsartItem[],
+): Record<string, CellData> {
+  const anchorK = makeSlotKey(dk, room, blockStart)
+  const anchorCell = next[anchorK]
+  const wd = weekdayMon0FromDate(parseDateKey(dk))
+  const span = blockEnd - blockStart + 1
+  const pick = resolveStaffForBookedSpan(
+    anchorCell,
+    staffList,
+    artenList,
+    dk,
+    wd,
+    blockStart,
+    span,
+  )
+  if (!pick) return next
+  const out = { ...next }
+  for (let sl = blockStart; sl <= blockEnd; sl++) {
+    const kk = makeSlotKey(dk, room, sl)
+    const c = out[kk]
+    if (c) out[kk] = applyStaffToCellData(c, pick)
+  }
+  return out
+}
+
+/** Alle Terminblöcke einer Muster-Verknüpfung (OP + Hauptkalender) mit MA füllen. */
+function assignAutoStaffAllMusterLinkedBlocks(
+  next: Record<string, CellData>,
+  linkId: string,
+  staffList: MitarbeiterItem[],
+  artenList: BelegungsartItem[],
+): Record<string, CellData> {
+  let out = { ...next }
+  const touchedAnchors = new Set<string>()
+  for (const k of Object.keys(out)) {
+    const c = out[k]
+    if (!c || c.musterLinkId !== linkId || !isCellBooked(c)) continue
+    const p = parseSlotCellKey(k)
+    if (!p) continue
+    const { start, end } = findBlockBounds(out, p.dk, p.room, p.slot)
+    const anch = makeSlotKey(p.dk, p.room, start)
+    if (touchedAnchors.has(anch)) continue
+    touchedAnchors.add(anch)
+    out = applyAutoStaffToBlockInMap(
+      out,
+      p.dk,
+      p.room,
+      start,
+      end,
+      staffList,
+      artenList,
+    )
+  }
+  return out
+}
+
 /** OP-Dialog: zusammenhängenden Block auf neues Zeitfenster legen (gleicher Tag/Raum). */
 function replaceSingleRoomBlockTimeRange(
   prev: Record<string, CellData>,
@@ -2657,6 +2780,7 @@ function tryApplyMusterWeekToSlots(
   weekStart: Date,
   templateCells: Record<string, MusterTemplateCell>,
   artenList: BelegungsartItem[],
+  staffList: MitarbeiterItem[],
   templateWeekCount: number,
   musterStamp: MusterApplyStamp | null,
 ): { next: Record<string, CellData> } | { error: string } {
@@ -2749,6 +2873,28 @@ function tryApplyMusterWeekToSlots(
         if (ac) placed.musterColor = ac
       }
       next[op.targetKeys[i]] = placed
+    }
+  }
+  for (const op of remappedOps) {
+    const firstK = op.targetKeys[0]!
+    const p = parseSlotCellKey(firstK)
+    if (!p) continue
+    const wd = weekdayMon0FromDate(parseDateKey(p.dk))
+    const span = op.targetKeys.length
+    const anchorCell = next[firstK]
+    const pick = resolveStaffForBookedSpan(
+      anchorCell,
+      staffList,
+      artenList,
+      p.dk,
+      wd,
+      p.slot,
+      span,
+    )
+    if (!pick) continue
+    for (const tk of op.targetKeys) {
+      const c = next[tk]
+      if (c) next[tk] = applyStaffToCellData(c, pick)
     }
   }
   return { next }
@@ -3186,15 +3332,33 @@ function applyMusterWithPatientWeek(
     }
   }
   for (const p of weekPlacements) {
+    const wd = weekdayMon0FromDate(parseDateKey(p.tDk))
+    const merged0 = mergePatientIntoMusterCell(
+      p.cells[0]!,
+      patientName,
+      patientCode,
+      weekBatchCollision,
+      musterStamp,
+    )
+    const pick = resolveStaffForBookedSpan(
+      merged0,
+      staffList,
+      artenList,
+      p.tDk,
+      wd,
+      p.chosenStart,
+      p.span,
+    )
     for (let i = 0; i < p.span; i++) {
-      next[makeSlotKey(p.tDk, p.chosenRoom, p.chosenStart + i)] =
-        mergePatientIntoMusterCell(
-          p.cells[i]!,
-          patientName,
-          patientCode,
-          weekBatchCollision,
-          musterStamp,
-        )
+      let cell = mergePatientIntoMusterCell(
+        p.cells[i]!,
+        patientName,
+        patientCode,
+        weekBatchCollision,
+        musterStamp,
+      )
+      if (pick) cell = applyStaffToCellData(cell, pick)
+      next[makeSlotKey(p.tDk, p.chosenRoom, p.chosenStart + i)] = cell
     }
   }
 
@@ -3679,9 +3843,26 @@ function applyMusterFromOpBookingOnce(
     }
   }
   for (const p of placements) {
+    const wd = weekdayMon0FromDate(parseDateKey(p.tDk))
+    const merged0 = mergePatientIntoMusterCell(
+      p.cells[0]!,
+      patientName,
+      patientCode,
+      batchCollision,
+      musterStamp,
+    )
+    const pick = resolveStaffForBookedSpan(
+      merged0,
+      staffList,
+      artenList,
+      p.tDk,
+      wd,
+      p.chosenStart,
+      p.span,
+    )
     for (let i = 0; i < p.span; i++) {
       const mk = makeSlotKey(p.tDk, p.chosenRoom, p.chosenStart + i)
-      next[mk] = {
+      let cell: CellData = {
         ...mergePatientIntoMusterCell(
           p.cells[i]!,
           patientName,
@@ -3692,9 +3873,33 @@ function applyMusterFromOpBookingOnce(
         musterLinkId,
         musterId: musterCatalogId,
       }
+      if (pick) cell = applyStaffToCellData(cell, pick)
+      next[mk] = cell
     }
   }
 
+  const anchorWd = weekdayMon0FromDate(parseDateKey(anchor.dk))
+  const anchorSpan = anchorBounds.end - anchorBounds.start + 1
+  const anchorBase0 = next[anchorStartK]
+  if (!anchorBase0 || !isCellBooked(anchorBase0)) {
+    return { error: 'OP-Termin nicht gefunden.' }
+  }
+  const mergedAnchor0 = mergePatientIntoMusterCell(
+    anchorBase0,
+    patientName,
+    patientCode,
+    batchCollision,
+    musterStamp,
+  )
+  const anchorPick = resolveStaffForBookedSpan(
+    mergedAnchor0,
+    staffList,
+    artenList,
+    anchor.dk,
+    anchorWd,
+    anchorBounds.start,
+    anchorSpan,
+  )
   for (let s = anchorBounds.start; s <= anchorBounds.end; s++) {
     const k = makeSlotKey(anchor.dk, anchor.room, s)
     const base = next[k]
@@ -3708,7 +3913,12 @@ function applyMusterFromOpBookingOnce(
       batchCollision,
       musterStamp,
     )
-    next[k] = { ...merged, musterLinkId, musterId: musterCatalogId }
+    const withLink: CellData = {
+      ...(anchorPick ? applyStaffToCellData(merged, anchorPick) : merged),
+      musterLinkId,
+      musterId: musterCatalogId,
+    }
+    next[k] = withLink
   }
 
   return { next }
@@ -6173,10 +6383,20 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
           if (!isCellBooked(prev[k])) {
             const cur = { ...(prev[k] ?? {}) }
-            return {
+            const next: Record<string, CellData> = {
               ...prev,
               [k]: { ...cur, patient: p.name, patientCode: p.patientCode },
             }
+            const { start: bs, end: be } = findBlockBounds(next, dk, room, startSlot)
+            return applyAutoStaffToBlockInMap(
+              next,
+              dk,
+              room,
+              bs,
+              be,
+              mitarbeiter,
+              arten,
+            )
           }
 
           if (!anchorCell?.patient?.trim()) {
@@ -6202,14 +6422,28 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             }
             const link = next[anchorK]?.musterLinkId
             if (link) {
-              return propagatePatientToMusterLinkId(
+              const propagated = propagatePatientToMusterLinkId(
                 next,
                 link,
                 p.name,
                 p.patientCode,
               )
+              return assignAutoStaffAllMusterLinkedBlocks(
+                propagated,
+                link,
+                mitarbeiter,
+                arten,
+              )
             }
-            return next
+            return applyAutoStaffToBlockInMap(
+              next,
+              dk,
+              room,
+              start,
+              end,
+              mitarbeiter,
+              arten,
+            )
           }
 
           alertOnce(
@@ -6283,6 +6517,16 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                 room,
                 anchorSlot: startSlot,
               }),
+            )
+          } else {
+            return applyAutoStaffToBlockInMap(
+              next,
+              dk,
+              room,
+              startSlot,
+              startSlot + span - 1,
+              mitarbeiter,
+              arten,
             )
           }
           return next
@@ -6626,6 +6870,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             weekStart,
             m.templateCells,
             arten,
+            mitarbeiter,
             effectiveMusterTemplateWeekCount(m),
             musterStamp,
           )
