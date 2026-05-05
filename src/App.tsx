@@ -6048,12 +6048,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     const q = patientSearchQuery.trim().toLowerCase()
     let list =
       q === ''
-        ? patients
+        ? [...patients]
         : patients.filter(
             (p) =>
               p.name.toLowerCase().includes(q) ||
               p.patientCode.toLowerCase().includes(q),
           )
+    list.sort((a, b) =>
+      a.name.localeCompare(b.name, 'de', { sensitivity: 'base' }),
+    )
     if (editingPatientId) {
       const ed = patients.find((p) => p.id === editingPatientId)
       if (ed && !list.some((p) => p.id === editingPatientId)) {
