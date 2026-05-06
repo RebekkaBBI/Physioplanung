@@ -116,6 +116,7 @@ const PHYSIO_VIDEOCALL_ART_ID = 'art-physio-videocall'
 
 type PtZoomPerformance = 'green' | 'yellow' | 'red'
 type PtZoomTrafficLight = PtZoomPerformance | 'done'
+type PtZoomPerfSubmode = 'colors' | 'abschluss'
 
 function ptZoomPerformanceFromStatus(
   s: PtZoomTrafficLight | undefined,
@@ -1543,6 +1544,8 @@ type LoadedPanels = {
   ptZoomKommentar?: Record<string, string>
   /** PT-Zoom: Abschluss-Notiz (Performance-Spalte). */
   ptZoomAbschluss?: Record<string, string>
+  /** PT-Zoom: Umschalter Performance — Farben vs. Abschluss. */
+  ptZoomPerfSubmode?: Record<string, PtZoomPerfSubmode>
 }
 
 function normalizePtZoomPatientStatus(
@@ -1629,6 +1632,17 @@ function normalizePtZoomAbschluss(raw: unknown): Record<string, string> {
   return out
 }
 
+function normalizePtZoomPerfSubmode(
+  raw: unknown,
+): Record<string, PtZoomPerfSubmode> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, PtZoomPerfSubmode> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (v === 'colors' || v === 'abschluss') out[k] = v
+  }
+  return out
+}
+
 function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
   if (!parsed || typeof parsed !== 'object') return null
   const o = parsed as {
@@ -1643,6 +1657,7 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
     ptZoomTerminBestaetigt?: unknown
     ptZoomKommentar?: unknown
     ptZoomAbschluss?: unknown
+    ptZoomPerfSubmode?: unknown
   }
   const catalogOk =
     (o.artenCatalogVersion ?? 0) >= ARTEN_CATALOG_VERSION &&
@@ -1693,6 +1708,7 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
     ),
     ptZoomKommentar: normalizePtZoomKommentar(o.ptZoomKommentar),
     ptZoomAbschluss: normalizePtZoomAbschluss(o.ptZoomAbschluss),
+    ptZoomPerfSubmode: normalizePtZoomPerfSubmode(o.ptZoomPerfSubmode),
   }
 }
 
@@ -1717,6 +1733,7 @@ function savePanelsState(p: {
   ptZoomTerminBestaetigt: Record<string, boolean>
   ptZoomKommentar: Record<string, string>
   ptZoomAbschluss: Record<string, string>
+  ptZoomPerfSubmode: Record<string, PtZoomPerfSubmode>
 }) {
   localStorage.setItem(
     STORAGE_PANELS,
@@ -4894,6 +4911,117 @@ function findLastPhysioBlockForPatient(
   return best
 }
 
+type PtZoomNextPhysioBlock = {
+  dk: string
+  room: Room
+  start: number
+  end: number
+  anchor: CellData
+}
+
+type PtZoomNextTerminRow =
+  | { kind: 'booked'; block: PtZoomNextPhysioBlock }
+  | {
+      kind: 'planned'
+      targetDk: string
+      weeks: number
+      idealStartSlot: number
+      idealEndSlot: number
+    }
+
+function ptZoomPerformanceWeeks(mode: PtZoomPerformance): number {
+  if (mode === 'green') return 3
+  if (mode === 'yellow') return 2
+  return 1
+}
+
+/** Idealer Start-Slot für PT-Zoom-Videocall (wie tryPlacePtZoomVideocallBlock). */
+function ptZoomIdealVideocallStartSlot(
+  lastStartSlot: number,
+  mezDeviationHours: number,
+  spanNeed: number,
+): number {
+  const max = slotCount()
+  const span = Math.max(1, spanNeed)
+  const slotDelta = Math.round(
+    (clampPtZoomMezHours(mezDeviationHours) * 60) / SLOT_MINUTES,
+  )
+  const startSlot = lastStartSlot + slotDelta
+  return Math.max(0, Math.min(max - span, startSlot))
+}
+
+function findVideocallBlockForPatientOnDate(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+  dk: string,
+  videocallArtId: string,
+): PtZoomNextPhysioBlock | null {
+  const seen = new Set<string>()
+  for (const room of ROOMS) {
+    const r = room as Room
+    for (let sl = 0; sl < slotCount(); sl++) {
+      const d = cells[makeSlotKey(dk, r, sl)]
+      if (!isCellBooked(d)) continue
+      const { start, end } = findBlockBounds(cells, dk, r, sl)
+      if (sl !== start) continue
+      const canon = `${dk}|${r}|${start}`
+      if (seen.has(canon)) continue
+      seen.add(canon)
+      const anchor = cells[makeSlotKey(dk, r, start)]!
+      if (anchor?.artId !== videocallArtId) continue
+      if (!cellMatchesPatientRecord(anchor, patient)) continue
+      return { dk, room: r, start, end, anchor }
+    }
+  }
+  return null
+}
+
+/**
+ * Nächster PT-Zoom-Termin abhängig von Performance (3/2/1 Woche ab letztem PT)
+ * bzw. kein Folgetermin im Modus „Abschluss“.
+ */
+function resolvePtZoomNextTermin(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+  artenList: BelegungsartItem[],
+  lastBlock: { dk: string; start: number } | null,
+  perfSubmode: PtZoomPerfSubmode,
+  performance: PtZoomPerformance,
+  mezHours: number,
+): PtZoomNextTerminRow | null {
+  if (perfSubmode === 'abschluss') return null
+  if (!lastBlock) return null
+  const weeks = ptZoomPerformanceWeeks(performance)
+  const targetDk = dateKey(
+    addDays(parseDateKey(lastBlock.dk), weeks * 7),
+  )
+  const videocallArt = artenList.find((a) => a.id === PHYSIO_VIDEOCALL_ART_ID)
+  const spanNeed = Math.max(1, videocallArt?.slots ?? 1)
+  const booked = findVideocallBlockForPatientOnDate(
+    cells,
+    patient,
+    targetDk,
+    PHYSIO_VIDEOCALL_ART_ID,
+  )
+  if (booked) return { kind: 'booked', block: booked }
+  const idealStartSlot = ptZoomIdealVideocallStartSlot(
+    lastBlock.start,
+    mezHours,
+    spanNeed,
+  )
+  const idealEndSlot = Math.min(
+    slotCount() - 1,
+    idealStartSlot + spanNeed - 1,
+  )
+  return {
+    kind: 'planned',
+    targetDk,
+    weeks,
+    idealStartSlot,
+    idealEndSlot,
+  }
+}
+
 function patientHasVideocallOnDate(
   cells: Record<string, CellData>,
   patient: PatientItem,
@@ -5971,6 +6099,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const [ptZoomAbschluss, setPtZoomAbschluss] = useState<Record<string, string>>(
     () => initialPanels?.ptZoomAbschluss ?? {},
   )
+  const [ptZoomPerfSubmode, setPtZoomPerfSubmode] = useState<
+    Record<string, PtZoomPerfSubmode>
+  >(() => initialPanels?.ptZoomPerfSubmode ?? {})
   const [musterModal, setMusterModal] = useState<
     | null
     | { mode: 'create'; templateWeekCount: 1 | 3 }
@@ -6221,6 +6352,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             setPtZoomTerminBestaetigt(parsed.ptZoomTerminBestaetigt ?? {})
             setPtZoomKommentar(parsed.ptZoomKommentar ?? {})
             setPtZoomAbschluss(parsed.ptZoomAbschluss ?? {})
+            setPtZoomPerfSubmode(parsed.ptZoomPerfSubmode ?? {})
           }
         }
         if (byType.ui !== undefined) {
@@ -6353,6 +6485,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         ptZoomTerminBestaetigt,
         ptZoomKommentar,
         ptZoomAbschluss,
+        ptZoomPerfSubmode,
         artenCatalogVersion: ARTEN_CATALOG_VERSION,
       })
       return
@@ -6368,6 +6501,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       ptZoomTerminBestaetigt,
       ptZoomKommentar,
       ptZoomAbschluss,
+      ptZoomPerfSubmode,
     })
   }, [
     patients,
@@ -6380,6 +6514,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     ptZoomTerminBestaetigt,
     ptZoomKommentar,
     ptZoomAbschluss,
+    ptZoomPerfSubmode,
     cloudSyncEnabled,
     cloudHydrated,
     organizationId,
@@ -7784,6 +7919,24 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     [openDayForCell, slotCells, arten],
   )
 
+  const openPtZoomPlannedTermin = useCallback(
+    (dk: string, room: Room, blockStart: number) => {
+      goToKollisionTermin(makeSlotKey(dk, room, blockStart), {
+        openModal: true,
+      })
+    },
+    [goToKollisionTermin],
+  )
+
+  const openPtZoomPlannedDaySlot = useCallback(
+    (targetDk: string, idealStartSlot: number) => {
+      setCalendarTabId('main')
+      pendingScrollToTerminSlotRef.current = idealStartSlot
+      openDayForCell(parseDateKey(targetDk))
+    },
+    [openDayForCell],
+  )
+
   const closeStaffTerminDetailModal = useCallback(() => {
     setStaffTerminDetailModal(null)
   }, [])
@@ -8287,6 +8440,16 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         const terminOk = ptZoomTerminBestaetigt[p.id] === true
         const kommentar = ptZoomKommentar[p.id] ?? ''
         const abschluss = ptZoomAbschluss[p.id] ?? ''
+        const perfSubmode = ptZoomPerfSubmode[p.id] ?? 'colors'
+        const nextTermin = resolvePtZoomNextTermin(
+          slotCells,
+          p,
+          arten,
+          last ? { dk: last.dk, start: last.start } : null,
+          perfSubmode,
+          performance,
+          mezH,
+        )
         return {
           patient: p,
           last,
@@ -8295,6 +8458,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           terminOk,
           kommentar,
           abschluss,
+          perfSubmode,
+          nextTermin,
         }
       })
       .sort((a, b) =>
@@ -8311,6 +8476,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     ptZoomTerminBestaetigt,
     ptZoomKommentar,
     ptZoomAbschluss,
+    ptZoomPerfSubmode,
   ])
 
   const applyPtZoomVideocallBooking = useCallback(
@@ -8463,6 +8629,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       if (cloudSyncEnabled && !mayCalendarWrite) return
       const next = text.slice(0, PT_ZOOM_ABSCHLUSS_MAX_LEN)
       setPtZoomAbschluss((prev) => ({ ...prev, [patientId]: next }))
+    },
+    [cloudSyncEnabled, mayCalendarWrite],
+  )
+
+  const handlePtZoomPerfSubmodeChange = useCallback(
+    (patientId: string, mode: PtZoomPerfSubmode) => {
+      if (cloudSyncEnabled && !mayCalendarWrite) return
+      setPtZoomPerfSubmode((prev) => ({ ...prev, [patientId]: mode }))
     },
     [cloudSyncEnabled, mayCalendarWrite],
   )
@@ -10845,6 +11019,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           Δ zu MEZ (h)
                         </th>
                         <th scope="col">Performance</th>
+                        <th scope="col">Nächster Termin</th>
                         <th scope="col">Termin bestätigt</th>
                         <th scope="col">Kommentar</th>
                       </tr>
@@ -10852,7 +11027,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                     <tbody>
                       {ptZoomRows.length === 0 ? (
                         <tr>
-                          <td colSpan={6} className="pt-zoom-empty">
+                          <td colSpan={7} className="pt-zoom-empty">
                             Keine passenden Patienten (aktive Nachsorge mit OP im
                             OP-Saal, oder noch kein OP eingetragen).
                           </td>
@@ -10867,6 +11042,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                             terminOk,
                             kommentar,
                             abschluss,
+                            perfSubmode,
+                            nextTermin,
                           }) => {
                           const lastCell =
                             last != null ? (
@@ -10933,86 +11110,233 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                               </td>
                               <td className="pt-zoom-performance-cell">
                                 <div
-                                  className="pt-zoom-perf-swatches"
-                                  role="radiogroup"
-                                  aria-label={`Performance / Nachsorge-Intervall für ${p.name}`}
+                                  className="pt-zoom-perf-mode-switch"
+                                  role="group"
+                                  aria-label={`Performance: Farben oder Abschluss für ${p.name}`}
                                 >
-                                  {PT_ZOOM_PERF_LEVELS.map((level) => (
-                                    <button
-                                      key={level}
-                                      type="button"
-                                      role="radio"
-                                      aria-checked={performance === level}
-                                      aria-label={
-                                        level === 'green'
-                                          ? 'Grün: nächster Videocall in 3 Wochen'
-                                          : level === 'yellow'
-                                            ? 'Gelb: nächster Videocall in 2 Wochen'
-                                            : 'Rot: nächster Videocall in 1 Woche'
-                                      }
-                                      title={
-                                        level === 'green'
-                                          ? 'Grün: nächster Videocall in 3 Wochen'
-                                          : level === 'yellow'
-                                            ? 'Gelb: in 2 Wochen'
-                                            : 'Rot: in 1 Woche'
-                                      }
-                                      className={`pt-zoom-perf-swatch pt-zoom-perf-swatch--${level}${performance === level ? ' is-selected' : ''}`}
-                                      disabled={isViewer || !mayCalendarWrite}
-                                      onClick={() =>
-                                        handlePtZoomPerformanceChange(
-                                          p.id,
-                                          level,
-                                        )
-                                      }
-                                    />
-                                  ))}
-                                </div>
-                                <label className="pt-zoom-abschluss-field">
-                                  <span className="pt-zoom-abschluss-label">
-                                    Abschluss
-                                  </span>
-                                  <input
-                                    type="text"
-                                    className="pt-zoom-abschluss-input"
-                                    value={abschluss}
-                                    maxLength={PT_ZOOM_ABSCHLUSS_MAX_LEN}
+                                  <button
+                                    type="button"
+                                    className={
+                                      perfSubmode === 'colors'
+                                        ? 'pt-zoom-perf-mode-btn is-active'
+                                        : 'pt-zoom-perf-mode-btn'
+                                    }
                                     disabled={isViewer || !mayCalendarWrite}
-                                    autoComplete="off"
-                                    aria-label={`Abschluss PT-Zoom für ${p.name}`}
-                                    placeholder="…"
-                                    onChange={(e) =>
-                                      handlePtZoomAbschlussChange(
+                                    aria-pressed={perfSubmode === 'colors'}
+                                    onClick={() =>
+                                      handlePtZoomPerfSubmodeChange(
                                         p.id,
-                                        e.target.value,
+                                        'colors',
                                       )
                                     }
-                                  />
-                                </label>
-                                <button
-                                  type="button"
-                                  className="pt-zoom-nachsorge-beenden"
-                                  disabled={isViewer || !mayCalendarWrite}
-                                  onClick={() =>
-                                    handlePtZoomNachsorgeBeenden(p.id)
-                                  }
-                                >
-                                  Nachsorge beenden
-                                </button>
+                                  >
+                                    Farben
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className={
+                                      perfSubmode === 'abschluss'
+                                        ? 'pt-zoom-perf-mode-btn is-active'
+                                        : 'pt-zoom-perf-mode-btn'
+                                    }
+                                    disabled={isViewer || !mayCalendarWrite}
+                                    aria-pressed={perfSubmode === 'abschluss'}
+                                    onClick={() =>
+                                      handlePtZoomPerfSubmodeChange(
+                                        p.id,
+                                        'abschluss',
+                                      )
+                                    }
+                                  >
+                                    Abschluss
+                                  </button>
+                                </div>
+                                {perfSubmode === 'colors' ? (
+                                  <div
+                                    className="pt-zoom-perf-swatches"
+                                    role="radiogroup"
+                                    aria-label={`Nachsorge-Intervall für ${p.name}`}
+                                  >
+                                    {PT_ZOOM_PERF_LEVELS.map((level) => (
+                                      <button
+                                        key={level}
+                                        type="button"
+                                        role="radio"
+                                        aria-checked={performance === level}
+                                        aria-label={
+                                          level === 'green'
+                                            ? 'Grün: nächster Videocall in 3 Wochen'
+                                            : level === 'yellow'
+                                              ? 'Gelb: nächster Videocall in 2 Wochen'
+                                              : 'Rot: nächster Videocall in 1 Woche'
+                                        }
+                                        title={
+                                          level === 'green'
+                                            ? 'Grün: nächster Videocall in 3 Wochen'
+                                            : level === 'yellow'
+                                              ? 'Gelb: in 2 Wochen'
+                                              : 'Rot: in 1 Woche'
+                                        }
+                                        className={`pt-zoom-perf-swatch pt-zoom-perf-swatch--${level}${performance === level ? ' is-selected' : ''}`}
+                                        disabled={
+                                          isViewer || !mayCalendarWrite
+                                        }
+                                        onClick={() =>
+                                          handlePtZoomPerformanceChange(
+                                            p.id,
+                                            level,
+                                          )
+                                        }
+                                      />
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <>
+                                    <label className="pt-zoom-abschluss-field">
+                                      <span className="pt-zoom-abschluss-label">
+                                        Abschluss
+                                      </span>
+                                      <input
+                                        type="text"
+                                        className="pt-zoom-abschluss-input"
+                                        value={abschluss}
+                                        maxLength={PT_ZOOM_ABSCHLUSS_MAX_LEN}
+                                        disabled={
+                                          isViewer || !mayCalendarWrite
+                                        }
+                                        autoComplete="off"
+                                        aria-label={`Abschluss PT-Zoom für ${p.name}`}
+                                        placeholder="…"
+                                        onChange={(e) =>
+                                          handlePtZoomAbschlussChange(
+                                            p.id,
+                                            e.target.value,
+                                          )
+                                        }
+                                      />
+                                    </label>
+                                    <button
+                                      type="button"
+                                      className="pt-zoom-nachsorge-beenden"
+                                      disabled={
+                                        isViewer || !mayCalendarWrite
+                                      }
+                                      onClick={() =>
+                                        handlePtZoomNachsorgeBeenden(p.id)
+                                      }
+                                    >
+                                      Nachsorge beenden
+                                    </button>
+                                  </>
+                                )}
                               </td>
-                              <td
-                                className={
-                                  terminOk
-                                    ? 'pt-zoom-bestaetigt-cell pt-zoom-bestaetigt-cell--ja'
-                                    : 'pt-zoom-bestaetigt-cell pt-zoom-bestaetigt-cell--nein'
-                                }
-                              >
+                              <td className="pt-zoom-next-cell">
+                                {nextTermin != null ? (
+                                  nextTermin.kind === 'booked' ? (
+                                    <button
+                                      type="button"
+                                      className="pt-zoom-next-termin-btn"
+                                      onClick={() => {
+                                        const b = nextTermin.block
+                                        openPtZoomPlannedTermin(
+                                          b.dk,
+                                          b.room,
+                                          b.start,
+                                        )
+                                      }}
+                                    >
+                                      <span className="pt-zoom-next-termin-date">
+                                        {parseDateKey(
+                                          nextTermin.block.dk,
+                                        ).toLocaleDateString('de-DE', {
+                                          weekday: 'short',
+                                          day: '2-digit',
+                                          month: '2-digit',
+                                          year: 'numeric',
+                                        })}
+                                      </span>
+                                      <span className="pt-zoom-next-termin-meta">
+                                        {slotIndexToLabel(
+                                          nextTermin.block.start,
+                                        )}
+                                        –
+                                        {slotEndTimeLabelExclusive(
+                                          nextTermin.block.end,
+                                        )}{' '}
+                                        · {nextTermin.block.room} ·{' '}
+                                        {nextTermin.block.anchor.staff?.trim() ||
+                                          '—'}{' '}
+                                        ·{' '}
+                                        {nextTermin.block.anchor.art?.trim() ||
+                                          '—'}
+                                      </span>
+                                      <span className="pt-zoom-next-termin-hint">
+                                        Zum Bearbeiten im Hauptkalender öffnen
+                                      </span>
+                                    </button>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      className="pt-zoom-next-termin-btn pt-zoom-next-termin-btn--planned"
+                                      onClick={() =>
+                                        openPtZoomPlannedDaySlot(
+                                          nextTermin.targetDk,
+                                          nextTermin.idealStartSlot,
+                                        )
+                                      }
+                                    >
+                                      <span className="pt-zoom-next-termin-date">
+                                        {parseDateKey(
+                                          nextTermin.targetDk,
+                                        ).toLocaleDateString('de-DE', {
+                                          weekday: 'short',
+                                          day: '2-digit',
+                                          month: '2-digit',
+                                          year: 'numeric',
+                                        })}
+                                      </span>
+                                      <span className="pt-zoom-next-termin-meta">
+                                        {slotIndexToLabel(
+                                          nextTermin.idealStartSlot,
+                                        )}
+                                        –
+                                        {slotEndTimeLabelExclusive(
+                                          nextTermin.idealEndSlot,
+                                        )}{' '}
+                                        · {nextTermin.weeks}{' '}
+                                        {nextTermin.weeks === 1
+                                          ? 'Woche'
+                                          : 'Wochen'}{' '}
+                                        nach letztem PT (vorgesehen)
+                                      </span>
+                                      <span className="pt-zoom-next-termin-hint">
+                                        Noch nicht gebucht — Kalendertag öffnen
+                                      </span>
+                                    </button>
+                                  )
+                                ) : perfSubmode === 'abschluss' ? (
+                                  <span
+                                    className="muted"
+                                    title="Im Modus Abschluss kein weiterer Nachsorge-Termin vorgesehen."
+                                  >
+                                    —
+                                  </span>
+                                ) : (
+                                  <span className="muted">—</span>
+                                )}
+                              </td>
+                              <td className="pt-zoom-bestaetigt-cell">
                                 <button
                                   type="button"
-                                  className="pt-zoom-bestaetigt-hitbox"
+                                  role="switch"
+                                  aria-checked={terminOk}
+                                  className={
+                                    terminOk
+                                      ? 'pt-zoom-bestaetigt-switch pt-zoom-bestaetigt-switch--ja'
+                                      : 'pt-zoom-bestaetigt-switch pt-zoom-bestaetigt-switch--nein'
+                                  }
                                   disabled={isViewer || !mayCalendarWrite}
-                                  aria-pressed={terminOk}
-                                  aria-label={`Termin durch Patient bestätigt: ${p.name}. Klicken zum Umschalten.`}
+                                  aria-label={`Termin durch Patient bestätigt: ${p.name}. Umschalten zwischen Ja und Nein.`}
                                   onClick={() =>
                                     handlePtZoomTerminBestaetigtChange(
                                       p.id,
@@ -11020,7 +11344,20 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                                     )
                                   }
                                 >
-                                  {terminOk ? 'Ja' : 'Nein'}
+                                  <span className="pt-zoom-bestaetigt-switch__track">
+                                    <span className="pt-zoom-bestaetigt-switch__thumb" />
+                                  </span>
+                                  <span className="pt-zoom-bestaetigt-switch__labels">
+                                    <span
+                                      className={
+                                        terminOk
+                                          ? 'pt-zoom-bestaetigt-switch__on'
+                                          : 'pt-zoom-bestaetigt-switch__off'
+                                      }
+                                    >
+                                      {terminOk ? 'Ja' : 'Nein'}
+                                    </span>
+                                  </span>
                                 </button>
                               </td>
                               <td className="pt-zoom-kommentar-cell">
