@@ -102,8 +102,27 @@ const DAY_END_HOUR = 22
 const OP_TAB_VIEW_START_HOUR = 7
 const OP_TAB_VIEW_END_HOUR = 18
 const CALENDAR_TAB_OP = 'op' as const
+/** Tab „PT Zoom“: Nachsorge nach OP — Intervalle bis nächster Physio-Videocall. */
+const CALENDAR_TAB_PT_ZOOM = 'pt-zoom' as const
 /** OP-Kalender: feste Übersicht (Spalten = Tage, Zeilen = Uhrzeiten). */
 const OP_OVERVIEW_DAY_COUNT = 12
+
+/** Letzter PT-Termin: Physiotherapy oder Physiotherapy Videocall (Hauptkalender). */
+const PHYSIO_ART_IDS: ReadonlySet<string> = new Set([
+  'art-physiotherapy',
+  'art-physio-videocall',
+])
+const PHYSIO_VIDEOCALL_ART_ID = 'art-physio-videocall'
+
+type PtZoomTrafficLight = 'green' | 'yellow' | 'red' | 'done'
+
+/** Abweichung der Patientenzeit zu MEZ (Normalzeit), −12 … +12 h; Buchung verschiebt Start entsprechend. */
+function clampPtZoomMezHours(h: number): number {
+  if (!Number.isFinite(h)) return 0
+  return Math.max(-12, Math.min(12, h))
+}
+
+const PT_ZOOM_KOMMENTAR_MAX_LEN = 4000
 
 const MIME_PHYSIO = 'application/x-physio-planung+json'
 
@@ -1499,6 +1518,88 @@ type LoadedPanels = {
   muster: BelegungsmusterItem[]
   mitarbeiter: MitarbeiterItem[]
   musterUsageCountById: Record<string, number>
+  /** PT-Zoom-Ampel pro Patient (Persistenz in panels / Cloud). */
+  ptZoomPatientStatus?: Record<string, PtZoomTrafficLight>
+  /** PT-Zoom: Abweichung zu MEZ in Stunden (−12 … +12), pro Patient. */
+  ptZoomMezDeviationHours?: Record<string, number>
+  /** PT-Zoom: Termin durch Patient bestätigt (Ja/Nein), pro Patient. */
+  ptZoomTerminBestaetigt?: Record<string, boolean>
+  /** PT-Zoom: Freitext-Kommentar pro Patient. */
+  ptZoomKommentar?: Record<string, string>
+}
+
+function normalizePtZoomPatientStatus(
+  raw: unknown,
+): Record<string, PtZoomTrafficLight> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, PtZoomTrafficLight> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (v === 'green' || v === 'yellow' || v === 'red' || v === 'done') {
+      out[k] = v
+    }
+  }
+  return out
+}
+
+function normalizePtZoomMezDeviationHours(
+  raw: unknown,
+): Record<string, number> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, number> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const n =
+      typeof v === 'number'
+        ? v
+        : typeof v === 'string'
+          ? parseFloat(v.replace(',', '.'))
+          : NaN
+    if (Number.isFinite(n)) out[k] = clampPtZoomMezHours(n)
+  }
+  return out
+}
+
+function normalizePtZoomTerminBestaetigt(
+  raw: unknown,
+): Record<string, boolean> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, boolean> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === 'boolean') {
+      out[k] = v
+      continue
+    }
+    if (v === true || v === 'true' || v === 1) {
+      out[k] = true
+      continue
+    }
+    if (v === false || v === 'false' || v === 0) {
+      out[k] = false
+      continue
+    }
+    if (typeof v === 'string') {
+      const t = v.trim().toLowerCase()
+      if (t === 'ja' || t === 'yes' || t === 'j') {
+        out[k] = true
+        continue
+      }
+      if (t === 'nein' || t === 'no' || t === 'n') {
+        out[k] = false
+        continue
+      }
+    }
+  }
+  return out
+}
+
+function normalizePtZoomKommentar(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v !== 'string') continue
+    const t = v.slice(0, PT_ZOOM_KOMMENTAR_MAX_LEN)
+    out[k] = t
+  }
+  return out
 }
 
 function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
@@ -1510,6 +1611,10 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
     mitarbeiter?: MitarbeiterItem[]
     artenCatalogVersion?: number
     musterUsageCountById?: unknown
+    ptZoomPatientStatus?: unknown
+    ptZoomMezDeviationHours?: unknown
+    ptZoomTerminBestaetigt?: unknown
+    ptZoomKommentar?: unknown
   }
   const catalogOk =
     (o.artenCatalogVersion ?? 0) >= ARTEN_CATALOG_VERSION &&
@@ -1551,6 +1656,14 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
           )
       : DEFAULT_MITARBEITER,
     musterUsageCountById: normalizeMusterUsageCountById(o.musterUsageCountById),
+    ptZoomPatientStatus: normalizePtZoomPatientStatus(o.ptZoomPatientStatus),
+    ptZoomMezDeviationHours: normalizePtZoomMezDeviationHours(
+      o.ptZoomMezDeviationHours,
+    ),
+    ptZoomTerminBestaetigt: normalizePtZoomTerminBestaetigt(
+      o.ptZoomTerminBestaetigt,
+    ),
+    ptZoomKommentar: normalizePtZoomKommentar(o.ptZoomKommentar),
   }
 }
 
@@ -1570,6 +1683,10 @@ function savePanelsState(p: {
   muster: BelegungsmusterItem[]
   mitarbeiter: MitarbeiterItem[]
   musterUsageCountById: Record<string, number>
+  ptZoomPatientStatus: Record<string, PtZoomTrafficLight>
+  ptZoomMezDeviationHours: Record<string, number>
+  ptZoomTerminBestaetigt: Record<string, boolean>
+  ptZoomKommentar: Record<string, string>
 }) {
   localStorage.setItem(
     STORAGE_PANELS,
@@ -4685,6 +4802,195 @@ function cellMatchesPatientRecord(c: CellData, p: PatientItem): boolean {
   return cc === pc
 }
 
+function patientHadOpBookingInCells(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+): boolean {
+  const seen = new Set<string>()
+  for (const [key, data] of Object.entries(cells)) {
+    if (!isCellBooked(data)) continue
+    if (!cellMatchesPatientRecord(data, patient)) continue
+    const pos = parseSlotCellKey(key)
+    if (!pos || pos.room !== OP_TAB_ROOM) continue
+    const { start } = findBlockBounds(cells, pos.dk, pos.room, pos.slot)
+    const canon = `${pos.dk}|${start}`
+    if (seen.has(canon)) continue
+    seen.add(canon)
+    return true
+  }
+  return false
+}
+
+function findLastPhysioBlockForPatient(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+  artenList: BelegungsartItem[],
+): {
+  dk: string
+  room: Room
+  start: number
+  end: number
+  anchor: CellData
+} | null {
+  let best: {
+    dk: string
+    room: Room
+    start: number
+    end: number
+    anchor: CellData
+  } | null = null
+  const seen = new Set<string>()
+  for (const [key, data] of Object.entries(cells)) {
+    if (!isCellBooked(data)) continue
+    if (!cellMatchesPatientRecord(data, patient)) continue
+    const pos = parseSlotCellKey(key)
+    if (!pos || pos.room === OP_TAB_ROOM) continue
+    if (!(ROOMS as readonly string[]).includes(pos.room)) continue
+    const { start, end } = findBlockBounds(cells, pos.dk, pos.room, pos.slot)
+    const canon = `${pos.dk}|${pos.room}|${start}`
+    if (seen.has(canon)) continue
+    seen.add(canon)
+    const anchor = cells[makeSlotKey(pos.dk, pos.room, start)]!
+    const artId = findArtIdForCell(anchor, artenList)
+    if (!artId || !PHYSIO_ART_IDS.has(artId)) continue
+    if (
+      !best ||
+      pos.dk > best.dk ||
+      (pos.dk === best.dk && start > best.start)
+    ) {
+      best = { dk: pos.dk, room: pos.room, start, end, anchor }
+    }
+  }
+  return best
+}
+
+function patientHasVideocallOnDate(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+  dk: string,
+  videocallArtId: string,
+): boolean {
+  const seen = new Set<string>()
+  for (const room of ROOMS) {
+    const r = room as Room
+    for (let sl = 0; sl < slotCount(); sl++) {
+      const d = cells[makeSlotKey(dk, r, sl)]
+      if (!isCellBooked(d)) continue
+      const { start } = findBlockBounds(cells, dk, r, sl)
+      if (sl !== start) continue
+      const canon = `${dk}|${r}|${start}`
+      if (seen.has(canon)) continue
+      seen.add(canon)
+      const anchor = cells[makeSlotKey(dk, r, start)]
+      if (anchor?.artId !== videocallArtId) continue
+      if (cellMatchesPatientRecord(anchor, patient)) return true
+    }
+  }
+  return false
+}
+
+function tryPlacePtZoomVideocallBlock(
+  prev: Record<string, CellData>,
+  patient: PatientItem,
+  last: { dk: string; room: Room; start: number },
+  targetDk: string,
+  staff: MitarbeiterItem,
+  videocallArt: BelegungsartItem,
+  staffList: MitarbeiterItem[],
+  /** Abweichung zu MEZ (h): negativ = früher am Tag, positiv = später. */
+  mezDeviationHours: number,
+): { next: Record<string, CellData>; error: string | null } {
+  const max = slotCount()
+  const spanNeed = Math.max(1, videocallArt.slots)
+  const slotDelta = Math.round((mezDeviationHours * 60) / SLOT_MINUTES)
+  let startSlot = last.start + slotDelta
+  startSlot = Math.max(0, Math.min(max - spanNeed, startSlot))
+  const wd = weekdayMon0FromDate(parseDateKey(targetDk))
+  const span = Math.min(spanNeed, max - startSlot)
+  if (span < spanNeed) {
+    return {
+      next: prev,
+      error:
+        'Der gewählte Start-Slot passt nicht zur Dauer von Physiotherapie Videocall (Tagesende).',
+    }
+  }
+
+  for (let i = 0; i < span; i++) {
+    const sl = startSlot + i
+    if (isStaffAbsentAtSlot(staff, targetDk, sl)) {
+      return { next: prev, error: 'Behandler ist am Zieldatum abwesend.' }
+    }
+    if (!isStaffSlotAvailable(staff, wd, sl, targetDk)) {
+      return {
+        next: prev,
+        error: 'Behandler ist im Wochenplan zu dieser Zeit nicht verfügbar.',
+      }
+    }
+    if (!staffHasArtAllowed(staff, videocallArt.id)) {
+      return {
+        next: prev,
+        error:
+          '„Physiotherapie Videocall“ ist für den Behandler nicht freigegeben.',
+      }
+    }
+  }
+
+  const roomOrder: Room[] = []
+  if ((ROOMS as readonly string[]).includes(last.room)) {
+    roomOrder.push(last.room)
+  }
+  for (const r of ROOMS) {
+    const rr = r as Room
+    if (!roomOrder.includes(rr)) roomOrder.push(rr)
+  }
+
+  for (const room of roomOrder) {
+    const blocked = artFromPanelBlockedReason(
+      prev,
+      targetDk,
+      room,
+      startSlot,
+      videocallArt,
+      staffList,
+      false,
+    )
+    if (blocked) continue
+
+    let spanFree = true
+    for (let i = 0; i < span; i++) {
+      const k = makeSlotKey(targetDk, room, startSlot + i)
+      const cur = prev[k]
+      if (cur && isCellBooked(cur)) {
+        spanFree = false
+        break
+      }
+    }
+    if (!spanFree) continue
+
+    const next = { ...prev }
+    for (let i = 0; i < span; i++) {
+      const k = makeSlotKey(targetDk, room, startSlot + i)
+      const cur = { ...(next[k] ?? {}) }
+      next[k] = {
+        ...cur,
+        patient: patient.name,
+        patientCode: patient.patientCode,
+        art: videocallArt.label,
+        artId: videocallArt.id,
+        artColor: videocallArt.color,
+        staff: staff.name,
+        staffId: staff.id,
+      }
+    }
+    return { next, error: null }
+  }
+  return {
+    next: prev,
+    error:
+      'Kein freier Raum für diesen Termin am gewählten Datum und Zeitslot.',
+  }
+}
+
 function collectPatientAppointmentsInRange(
   cells: Record<string, CellData>,
   patient: PatientItem,
@@ -4766,10 +5072,11 @@ function formatAbsencePeriodSummary(p: StaffAbsencePeriod): string {
 /** Gefilterte Kopie: nur Slots mit zugewiesenem MA (gleiche Datenbasis wie Hauptkalender). */
 function projectCellsForCalendarTab(
   cells: Record<string, CellData>,
-  tab: 'main' | typeof CALENDAR_TAB_OP | string,
+  tab: 'main' | typeof CALENDAR_TAB_OP | typeof CALENDAR_TAB_PT_ZOOM | string,
   staffList: MitarbeiterItem[],
 ): Record<string, CellData> {
-  if (tab === 'main' || tab === CALENDAR_TAB_OP) return cells
+  if (tab === 'main' || tab === CALENDAR_TAB_OP || tab === CALENDAR_TAB_PT_ZOOM)
+    return cells
   const staff = staffList.find((s) => s.id === tab)
   if (!staff) return cells
   const next: Record<string, CellData> = {}
@@ -5619,6 +5926,18 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const [musterUsageCountById, setMusterUsageCountById] = useState<
     Record<string, number>
   >(() => initialPanels?.musterUsageCountById ?? {})
+  const [ptZoomPatientStatus, setPtZoomPatientStatus] = useState<
+    Record<string, PtZoomTrafficLight>
+  >(() => initialPanels?.ptZoomPatientStatus ?? {})
+  const [ptZoomMezDeviationHours, setPtZoomMezDeviationHours] = useState<
+    Record<string, number>
+  >(() => initialPanels?.ptZoomMezDeviationHours ?? {})
+  const [ptZoomTerminBestaetigt, setPtZoomTerminBestaetigt] = useState<
+    Record<string, boolean>
+  >(() => initialPanels?.ptZoomTerminBestaetigt ?? {})
+  const [ptZoomKommentar, setPtZoomKommentar] = useState<Record<string, string>>(
+    () => initialPanels?.ptZoomKommentar ?? {},
+  )
   const [musterModal, setMusterModal] = useState<
     | null
     | { mode: 'create'; templateWeekCount: 1 | 3 }
@@ -5864,6 +6183,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             setMuster(parsed.muster)
             setMitarbeiter(parsed.mitarbeiter)
             setMusterUsageCountById(parsed.musterUsageCountById)
+            setPtZoomPatientStatus(parsed.ptZoomPatientStatus ?? {})
+            setPtZoomMezDeviationHours(parsed.ptZoomMezDeviationHours ?? {})
+            setPtZoomTerminBestaetigt(parsed.ptZoomTerminBestaetigt ?? {})
+            setPtZoomKommentar(parsed.ptZoomKommentar ?? {})
           }
         }
         if (byType.ui !== undefined) {
@@ -5991,6 +6314,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         muster,
         mitarbeiter,
         musterUsageCountById,
+        ptZoomPatientStatus,
+        ptZoomMezDeviationHours,
+        ptZoomTerminBestaetigt,
+        ptZoomKommentar,
         artenCatalogVersion: ARTEN_CATALOG_VERSION,
       })
       return
@@ -6001,6 +6328,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       muster,
       mitarbeiter,
       musterUsageCountById,
+      ptZoomPatientStatus,
+      ptZoomMezDeviationHours,
+      ptZoomTerminBestaetigt,
+      ptZoomKommentar,
     })
   }, [
     patients,
@@ -6008,6 +6339,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     muster,
     mitarbeiter,
     musterUsageCountById,
+    ptZoomPatientStatus,
+    ptZoomMezDeviationHours,
+    ptZoomTerminBestaetigt,
+    ptZoomKommentar,
     cloudSyncEnabled,
     cloudHydrated,
     organizationId,
@@ -6155,7 +6490,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const activeDayKey = dateKey(anchorDate)
 
   useEffect(() => {
-    if (calendarTabId === 'main' || calendarTabId === CALENDAR_TAB_OP) return
+    if (
+      calendarTabId === 'main' ||
+      calendarTabId === CALENDAR_TAB_OP ||
+      calendarTabId === CALENDAR_TAB_PT_ZOOM
+    ) {
+      return
+    }
     if (!mitarbeiter.some((s) => s.id === calendarTabId)) {
       setCalendarTabId('main')
     }
@@ -6166,8 +6507,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     [slotCells, calendarTabId, mitarbeiter],
   )
 
-  const isStaffCalendarReadOnly =
-    calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP
+  const isStaffCalendarReadOnly = mitarbeiter.some(
+    (s) => s.id === calendarTabId,
+  )
 
   const calendarRooms: readonly Room[] = useMemo(
     () =>
@@ -6196,8 +6538,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   )
 
   const calendarTabStaffMember = useMemo(() => {
-    if (calendarTabId === 'main' || calendarTabId === CALENDAR_TAB_OP)
+    if (
+      calendarTabId === 'main' ||
+      calendarTabId === CALENDAR_TAB_OP ||
+      calendarTabId === CALENDAR_TAB_PT_ZOOM
+    ) {
       return null
+    }
     return mitarbeiter.find((s) => s.id === calendarTabId) ?? null
   }, [calendarTabId, mitarbeiter])
 
@@ -6209,8 +6556,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       startSlot?: number
       endSlot?: number
     }) => {
-      if (calendarTabId === 'main' || calendarTabId === CALENDAR_TAB_OP)
+      if (
+        calendarTabId === 'main' ||
+        calendarTabId === CALENDAR_TAB_OP ||
+        calendarTabId === CALENDAR_TAB_PT_ZOOM
+      ) {
         return
+      }
       const from = prefs?.fromDk ?? activeDayKey
       setStaffAbsenceFormFrom(from)
       setStaffAbsenceFormTo(prefs?.toDk ?? from)
@@ -7853,7 +8205,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   }
 
   const headerLabel =
-    calendarTabId === CALENDAR_TAB_OP
+    calendarTabId === CALENDAR_TAB_PT_ZOOM
+      ? 'PT Zoom — Nachsorge nach OP'
+      : calendarTabId === CALENDAR_TAB_OP
       ? `${opOverviewDays[0]!.toLocaleDateString('de-DE', {
           day: 'numeric',
           month: 'short',
@@ -7880,6 +8234,171 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     viewMode === 'day' &&
     !isStaffCalendarReadOnly
   const dayGridRowCount = isOpDayCalendar ? opViewSlotCount() : slots
+
+  const ptZoomRows = useMemo(() => {
+    return patients
+      .filter(
+        (p) =>
+          patientHadOpBookingInCells(slotCells, p) &&
+          ptZoomPatientStatus[p.id] !== 'done',
+      )
+      .map((p) => {
+        const last = findLastPhysioBlockForPatient(slotCells, p, arten)
+        const traffic: PtZoomTrafficLight = ptZoomPatientStatus[p.id] ?? 'green'
+        const mezH = clampPtZoomMezHours(ptZoomMezDeviationHours[p.id] ?? 0)
+        const terminOk = ptZoomTerminBestaetigt[p.id] === true
+        const kommentar = ptZoomKommentar[p.id] ?? ''
+        return { patient: p, last, traffic, mezH, terminOk, kommentar }
+      })
+      .sort((a, b) =>
+        a.patient.name.localeCompare(b.patient.name, 'de', {
+          sensitivity: 'base',
+        }),
+      )
+  }, [
+    patients,
+    slotCells,
+    arten,
+    ptZoomPatientStatus,
+    ptZoomMezDeviationHours,
+    ptZoomTerminBestaetigt,
+    ptZoomKommentar,
+  ])
+
+  const applyPtZoomVideocallBooking = useCallback(
+    (patientId: string, mode: PtZoomTrafficLight, mezHours: number) => {
+      if (mode === 'done') return
+      const patient = patients.find((p) => p.id === patientId)
+      if (!patient) return
+      const mez = clampPtZoomMezHours(mezHours)
+
+      setSlotCells((prev) => {
+        const last = findLastPhysioBlockForPatient(prev, patient, arten)
+        if (!last) {
+          queueMicrotask(() =>
+            alertOnce(
+              'Kein Physiotherapie-Termin (Physiotherapy oder Videocall) für diesen Patienten im Hauptkalender gefunden.',
+            ),
+          )
+          return prev
+        }
+        const st = findStaffForCell(last.anchor, mitarbeiter)
+        if (!st) {
+          queueMicrotask(() =>
+            alertOnce(
+              'Am letzten Physiotherapietermin ist kein Mitarbeiter zugewiesen.',
+            ),
+          )
+          return prev
+        }
+        const videocallArt = arten.find((a) => a.id === PHYSIO_VIDEOCALL_ART_ID)
+        if (!videocallArt) {
+          queueMicrotask(() =>
+            alertOnce(
+              'Belegungsart „Physiotherapie Videocall“ fehlt im Katalog.',
+            ),
+          )
+          return prev
+        }
+
+        const weeks = mode === 'green' ? 3 : mode === 'yellow' ? 2 : 1
+        const targetDk = dateKey(addDays(parseDateKey(last.dk), weeks * 7))
+
+        if (
+          patientHasVideocallOnDate(
+            prev,
+            patient,
+            targetDk,
+            PHYSIO_VIDEOCALL_ART_ID,
+          )
+        ) {
+          return prev
+        }
+        const r = tryPlacePtZoomVideocallBlock(
+          prev,
+          patient,
+          last,
+          targetDk,
+          st,
+          videocallArt,
+          mitarbeiter,
+          mez,
+        )
+        if (r.error) {
+          queueMicrotask(() => alertOnce(r.error!))
+          return prev
+        }
+        return r.next
+      })
+    },
+    [patients, arten, mitarbeiter, setSlotCells],
+  )
+
+  const handlePtZoomTrafficChange = useCallback(
+    (patientId: string, mode: PtZoomTrafficLight) => {
+      if (cloudSyncEnabled && !mayCalendarWrite) return
+      setPtZoomPatientStatus((prev) => ({ ...prev, [patientId]: mode }))
+      if (mode === 'done') return
+      applyPtZoomVideocallBooking(
+        patientId,
+        mode,
+        clampPtZoomMezHours(ptZoomMezDeviationHours[patientId] ?? 0),
+      )
+    },
+    [
+      cloudSyncEnabled,
+      mayCalendarWrite,
+      applyPtZoomVideocallBooking,
+      ptZoomMezDeviationHours,
+    ],
+  )
+
+  const handlePtZoomMezInputChange = useCallback(
+    (patientId: string, rawValue: string) => {
+      const n = parseFloat(rawValue.replace(',', '.'))
+      const next = Number.isFinite(n) ? clampPtZoomMezHours(n) : 0
+      setPtZoomMezDeviationHours((prev) => ({ ...prev, [patientId]: next }))
+    },
+    [],
+  )
+
+  const handlePtZoomMezInputBlur = useCallback(
+    (patientId: string, rawValue: string) => {
+      if (cloudSyncEnabled && !mayCalendarWrite) return
+      const n = parseFloat(rawValue.replace(',', '.'))
+      const clamped = clampPtZoomMezHours(Number.isFinite(n) ? n : 0)
+      setPtZoomMezDeviationHours((prev) => ({ ...prev, [patientId]: clamped }))
+      const mode = ptZoomPatientStatus[patientId] ?? 'green'
+      if (mode === 'done') return
+      applyPtZoomVideocallBooking(patientId, mode, clamped)
+    },
+    [
+      cloudSyncEnabled,
+      mayCalendarWrite,
+      ptZoomPatientStatus,
+      applyPtZoomVideocallBooking,
+    ],
+  )
+
+  const handlePtZoomTerminBestaetigtChange = useCallback(
+    (patientId: string, confirmed: boolean) => {
+      if (cloudSyncEnabled && !mayCalendarWrite) return
+      setPtZoomTerminBestaetigt((prev) => ({
+        ...prev,
+        [patientId]: confirmed,
+      }))
+    },
+    [cloudSyncEnabled, mayCalendarWrite],
+  )
+
+  const handlePtZoomKommentarChange = useCallback(
+    (patientId: string, text: string) => {
+      if (cloudSyncEnabled && !mayCalendarWrite) return
+      const next = text.slice(0, PT_ZOOM_KOMMENTAR_MAX_LEN)
+      setPtZoomKommentar((prev) => ({ ...prev, [patientId]: next }))
+    },
+    [cloudSyncEnabled, mayCalendarWrite],
+  )
 
   const draggedArtForPreview = useMemo(
     () =>
@@ -9680,16 +10199,22 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               aria-pressed={viewMode === 'day'}
               disabled={
                 calendarTabId === CALENDAR_TAB_OP ||
+                calendarTabId === CALENDAR_TAB_PT_ZOOM ||
                 (calendarTabId !== 'main' &&
-                  calendarTabId !== CALENDAR_TAB_OP) ||
+                  calendarTabId !== CALENDAR_TAB_OP &&
+                  calendarTabId !== CALENDAR_TAB_PT_ZOOM) ||
                 isViewer
               }
               title={
                 calendarTabId === CALENDAR_TAB_OP
                   ? 'Im OP-Kalender: feste 12-Tage-Übersicht'
-                  : calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP
-                    ? 'Im Mitarbeiter-Kalender nur Wochenansicht Mo–So'
-                    : undefined
+                  : calendarTabId === CALENDAR_TAB_PT_ZOOM
+                    ? 'Im PT-Zoom-Tab: Listenansicht'
+                    : calendarTabId !== 'main' &&
+                        calendarTabId !== CALENDAR_TAB_OP &&
+                        calendarTabId !== CALENDAR_TAB_PT_ZOOM
+                      ? 'Im Mitarbeiter-Kalender nur Wochenansicht Mo–So'
+                      : undefined
               }
               onClick={() => setViewMode('day')}
             >
@@ -9699,11 +10224,17 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               type="button"
               className={viewMode === 'week' ? 'active' : ''}
               aria-pressed={viewMode === 'week'}
-              disabled={calendarTabId === CALENDAR_TAB_OP || isViewer}
+              disabled={
+                calendarTabId === CALENDAR_TAB_OP ||
+                calendarTabId === CALENDAR_TAB_PT_ZOOM ||
+                isViewer
+              }
               title={
                 calendarTabId === CALENDAR_TAB_OP
                   ? 'Im OP-Kalender: feste 12-Tage-Übersicht'
-                  : undefined
+                  : calendarTabId === CALENDAR_TAB_PT_ZOOM
+                    ? 'Im PT-Zoom-Tab: Listenansicht'
+                    : undefined
               }
               onClick={() => setViewMode('week')}
             >
@@ -9959,6 +10490,17 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               onClick={() => setCalendarTabId(CALENDAR_TAB_OP)}
             >
               OP
+            </button>
+            <button
+              type="button"
+              role="tab"
+              className={`calendar-view-tab ${calendarTabId === CALENDAR_TAB_PT_ZOOM ? 'calendar-view-tab--active' : ''}`}
+              aria-selected={calendarTabId === CALENDAR_TAB_PT_ZOOM}
+              id="calendar-tab-pt-zoom"
+              title="PT Zoom — Nachsorge: Intervall bis nächster Physio-Videocall"
+              onClick={() => setCalendarTabId(CALENDAR_TAB_PT_ZOOM)}
+            >
+              PT Zoom
             </button>
             {mitarbeiter.map((s) => (
               <button
@@ -10223,6 +10765,198 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                   ))}
                 </div>
               </div>
+          ) : calendarTabId === CALENDAR_TAB_PT_ZOOM ? (
+            <div className="grid-wrap pt-zoom-wrap">
+              <div className="pt-zoom-inner">
+                <p className="pt-zoom-intro">
+                  Patienten mit OP im OP-Saal, die nicht auf „Beenden“ gesetzt
+                  sind. Ampel:{' '}
+                  <strong>Grün</strong> = nächster Videocall in 3 Wochen,{' '}
+                  <strong>Gelb</strong> in 2 Wochen, <strong>Rot</strong> in 1
+                  Woche (jeweils ab letztem Physiotherapy- oder
+                  Physiotherapy-Videocall-Termin; Startzeit relativ dazu,{' '}
+                  <strong>Behandler</strong> unverändert). Spalte{' '}
+                  <strong>Δ MEZ</strong>: dokumentierte Abweichung der
+                  Patientenzeit zu <strong>MEZ (Normalzeit)</strong> in Stunden
+                  (−12 bis +12). <strong>Negative</strong> Werte verschieben den
+                  Videocall <strong>eher in den frühen Tag</strong>,{' '}
+                  <strong>positive</strong> Werte <strong>später</strong>.
+                  Änderung Δ MEZ: nach Verlassen des Felds wird neu gebucht (sofern
+                  nicht „Beenden“). <strong>Beenden</strong> = keine weiteren
+                  automatischen Buchungen, Zeile verschwindet.{' '}
+                  <strong>Termin bestätigt</strong>: Verifikation durch den
+                  Patienten — <span className="pt-zoom-legend-ja">Ja</span> /
+                  <span className="pt-zoom-legend-nein"> Nein</span>. Spalte{' '}
+                  <strong>Kommentar</strong>: freie Notiz pro Patient (wird mit
+                  den Stammdaten gespeichert).
+                </p>
+                <div className="pt-zoom-table-scroll">
+                  <table className="pt-zoom-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Patient</th>
+                        <th scope="col">Letzter PT-Termin</th>
+                        <th scope="col" title="Abweichung zu MEZ (Normalzeit), −12 … +12 h">
+                          Δ zu MEZ (h)
+                        </th>
+                        <th scope="col">Ampel / Aktion</th>
+                        <th scope="col">Termin bestätigt</th>
+                        <th scope="col">Kommentar</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ptZoomRows.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="pt-zoom-empty">
+                            Keine passenden Patienten (OP ohne Status
+                            „Beenden“, oder noch kein OP eingetragen).
+                          </td>
+                        </tr>
+                      ) : (
+                        ptZoomRows.map(
+                          ({
+                            patient: p,
+                            last,
+                            traffic,
+                            mezH,
+                            terminOk,
+                            kommentar,
+                          }) => {
+                          const lastCell =
+                            last != null ? (
+                              <>
+                                <span className="pt-zoom-last-date">
+                                  {parseDateKey(last.dk).toLocaleDateString(
+                                    'de-DE',
+                                    {
+                                      weekday: 'short',
+                                      day: '2-digit',
+                                      month: '2-digit',
+                                      year: 'numeric',
+                                    },
+                                  )}
+                                </span>
+                                <span className="pt-zoom-last-meta">
+                                  {slotIndexToLabel(last.start)}–
+                                  {slotEndTimeLabelExclusive(last.end)} ·{' '}
+                                  {last.room} ·{' '}
+                                  {last.anchor.staff?.trim() || '—'} ·{' '}
+                                  {last.anchor.art?.trim() || '—'}
+                                </span>
+                              </>
+                            ) : (
+                              <span className="muted">
+                                Kein Physiotherapy- oder Videocall-Termin im
+                                Hauptkalender
+                              </span>
+                            )
+                          return (
+                            <tr key={p.id}>
+                              <td>
+                                <span className="pt-zoom-patient-name">
+                                  {p.name}
+                                </span>
+                                <span className="pt-zoom-patient-code">
+                                  {p.patientCode}
+                                </span>
+                              </td>
+                              <td className="pt-zoom-last-cell">{lastCell}</td>
+                              <td className="pt-zoom-mez-cell">
+                                <input
+                                  type="number"
+                                  className="pt-zoom-mez-input"
+                                  min={-12}
+                                  max={12}
+                                  step={0.5}
+                                  value={mezH}
+                                  disabled={isViewer || !mayCalendarWrite}
+                                  aria-label={`Abweichung zu MEZ in Stunden für ${p.name} (−12 bis +12)`}
+                                  onChange={(e) =>
+                                    handlePtZoomMezInputChange(
+                                      p.id,
+                                      e.target.value,
+                                    )
+                                  }
+                                  onBlur={(e) =>
+                                    handlePtZoomMezInputBlur(
+                                      p.id,
+                                      e.target.value,
+                                    )
+                                  }
+                                />
+                              </td>
+                              <td>
+                                <select
+                                  className={`pt-zoom-select pt-zoom-select--${traffic}`}
+                                  value={traffic}
+                                  disabled={isViewer || !mayCalendarWrite}
+                                  aria-label={`Nachsorge-Intervall für ${p.name}`}
+                                  onChange={(e) =>
+                                    handlePtZoomTrafficChange(
+                                      p.id,
+                                      e.target.value as PtZoomTrafficLight,
+                                    )
+                                  }
+                                >
+                                  <option value="green">
+                                    Grün — Videocall in 3 Wochen
+                                  </option>
+                                  <option value="yellow">
+                                    Gelb — Videocall in 2 Wochen
+                                  </option>
+                                  <option value="red">
+                                    Rot — Videocall in 1 Woche
+                                  </option>
+                                  <option value="done">Beenden</option>
+                                </select>
+                              </td>
+                              <td className="pt-zoom-bestaetigt-cell">
+                                <select
+                                  className={
+                                    terminOk
+                                      ? 'pt-zoom-bestaetigt-select pt-zoom-bestaetigt-select--ja'
+                                      : 'pt-zoom-bestaetigt-select pt-zoom-bestaetigt-select--nein'
+                                  }
+                                  value={terminOk ? 'yes' : 'no'}
+                                  disabled={isViewer || !mayCalendarWrite}
+                                  aria-label={`Termin durch Patient bestätigt: ${p.name}`}
+                                  onChange={(e) =>
+                                    handlePtZoomTerminBestaetigtChange(
+                                      p.id,
+                                      e.target.value === 'yes',
+                                    )
+                                  }
+                                >
+                                  <option value="yes">Ja</option>
+                                  <option value="no">Nein</option>
+                                </select>
+                              </td>
+                              <td className="pt-zoom-kommentar-cell">
+                                <textarea
+                                  className="pt-zoom-kommentar-input"
+                                  rows={2}
+                                  maxLength={PT_ZOOM_KOMMENTAR_MAX_LEN}
+                                  value={kommentar}
+                                  disabled={isViewer || !mayCalendarWrite}
+                                  aria-label={`Kommentar PT-Zoom für ${p.name}`}
+                                  placeholder="Notiz …"
+                                  onChange={(e) =>
+                                    handlePtZoomKommentarChange(
+                                      p.id,
+                                      e.target.value,
+                                    )
+                                  }
+                                />
+                              </td>
+                            </tr>
+                          )
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
           ) : calendarTabId === CALENDAR_TAB_OP ? (
             <div className="grid-wrap grid-wrap--op-12d" ref={dayGridRef}>
               <div

@@ -385,6 +385,228 @@
   font-weight: 600;
 }
 
+/* PT Zoom — Nachsorge nach OP */
+.pt-zoom-wrap {
+  flex: 1 1 auto;
+  min-height: var(--calendar-grid-block-height);
+  overflow: auto;
+}
+
+.pt-zoom-inner {
+  padding: 0.35rem 0.15rem 0.75rem;
+  max-width: 56rem;
+}
+
+.pt-zoom-intro {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+  margin: 0 0 0.85rem;
+  max-width: 52rem;
+}
+
+.pt-zoom-table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.pt-zoom-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.pt-zoom-table th,
+.pt-zoom-table td {
+  padding: 0.45rem 0.55rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.pt-zoom-table th {
+  font-weight: 600;
+  color: var(--text-h);
+  background: color-mix(in srgb, var(--surface-2) 88%, var(--text-muted));
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.pt-zoom-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.pt-zoom-empty {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 1rem 0.55rem !important;
+}
+
+.pt-zoom-patient-name {
+  display: block;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.pt-zoom-patient-code {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-top: 0.12rem;
+}
+
+.pt-zoom-last-cell {
+  min-width: 12rem;
+}
+
+.pt-zoom-last-date {
+  display: block;
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+.pt-zoom-last-meta {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
+.pt-zoom-select {
+  width: 100%;
+  max-width: 16rem;
+  font: inherit;
+  font-size: 0.76rem;
+  padding: 0.32rem 0.45rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  color: var(--text-h);
+}
+
+.pt-zoom-select:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.pt-zoom-select--green {
+  border-color: color-mix(in srgb, #16a34a 45%, var(--border-subtle));
+  background: color-mix(in srgb, #16a34a 10%, var(--surface-1));
+}
+
+.pt-zoom-select--yellow {
+  border-color: color-mix(in srgb, #ca8a04 50%, var(--border-subtle));
+  background: color-mix(in srgb, #ca8a04 12%, var(--surface-1));
+}
+
+.pt-zoom-select--red {
+  border-color: color-mix(in srgb, #dc2626 45%, var(--border-subtle));
+  background: color-mix(in srgb, #dc2626 10%, var(--surface-1));
+}
+
+.pt-zoom-select--done {
+  border-color: var(--border-subtle);
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+
+.pt-zoom-mez-cell {
+  width: 6.5rem;
+  white-space: nowrap;
+}
+
+.pt-zoom-mez-input {
+  width: 100%;
+  max-width: 5.5rem;
+  font: inherit;
+  font-size: 0.76rem;
+  padding: 0.28rem 0.35rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  color: var(--text-h);
+}
+
+.pt-zoom-mez-input:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.pt-zoom-bestaetigt-cell {
+  width: 7.5rem;
+}
+
+.pt-zoom-kommentar-cell {
+  min-width: 10rem;
+  max-width: 22rem;
+}
+
+.pt-zoom-kommentar-input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 2.6rem;
+  max-width: 100%;
+  font: inherit;
+  font-size: 0.76rem;
+  line-height: 1.35;
+  padding: 0.32rem 0.4rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  color: var(--text-h);
+  resize: vertical;
+}
+
+.pt-zoom-kommentar-input:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+  resize: none;
+}
+
+.pt-zoom-bestaetigt-select {
+  width: 100%;
+  max-width: 6.75rem;
+  font: inherit;
+  font-size: 0.76rem;
+  font-weight: 600;
+  padding: 0.32rem 0.4rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+}
+
+.pt-zoom-bestaetigt-select:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.pt-zoom-bestaetigt-select--ja {
+  border-color: color-mix(in srgb, #16a34a 55%, var(--border-subtle));
+  background: color-mix(in srgb, #16a34a 22%, var(--surface-1));
+  color: #14532d;
+}
+
+.pt-zoom-bestaetigt-select--nein {
+  border-color: color-mix(in srgb, #dc2626 50%, var(--border-subtle));
+  background: color-mix(in srgb, #dc2626 16%, var(--surface-1));
+  color: #7f1d1d;
+}
+
+.pt-zoom-legend-ja {
+  color: #15803d;
+  font-weight: 600;
+}
+
+.pt-zoom-legend-nein {
+  color: #b91c1c;
+  font-weight: 600;
+}
+
 .grid-wrap--staff-readonly .slot-cell-main,
 .grid-wrap--staff-readonly .week-cell {
   cursor: default;
