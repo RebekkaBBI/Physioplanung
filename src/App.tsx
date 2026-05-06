@@ -114,15 +114,15 @@ const PHYSIO_ART_IDS: ReadonlySet<string> = new Set([
 ])
 const PHYSIO_VIDEOCALL_ART_ID = 'art-physio-videocall'
 
-type PtZoomPerformance = 'green' | 'yellow' | 'red'
-type PtZoomTrafficLight = PtZoomPerformance | 'done'
-type PtZoomPerfSubmode = 'colors' | 'abschluss'
+/** PT-Zoom: Wochen bis zum nächsten Videocall, oder Nachsorge beendet. */
+type PtZoomNachsorgeIntervall = 1 | 2 | 3 | 5 | 8 | 'done'
 
-function ptZoomPerformanceFromStatus(
-  s: PtZoomTrafficLight | undefined,
-): PtZoomPerformance {
-  if (s === 'yellow' || s === 'red') return s
-  return 'green'
+function isPtZoomIntervallWochen(
+  v: PtZoomNachsorgeIntervall | undefined,
+): v is 1 | 2 | 3 | 5 | 8 {
+  return (
+    v === 1 || v === 2 || v === 3 || v === 5 || v === 8
+  )
 }
 
 /** Abweichung der Patientenzeit zu MEZ (Normalzeit), −12 … +12 h; Buchung verschiebt Start entsprechend. */
@@ -133,12 +133,6 @@ function clampPtZoomMezHours(h: number): number {
 
 const PT_ZOOM_KOMMENTAR_MAX_LEN = 4000
 const PT_ZOOM_ABSCHLUSS_MAX_LEN = 2000
-
-const PT_ZOOM_PERF_LEVELS: readonly PtZoomPerformance[] = [
-  'green',
-  'yellow',
-  'red',
-]
 
 const MIME_PHYSIO = 'application/x-physio-planung+json'
 
@@ -1534,29 +1528,48 @@ type LoadedPanels = {
   muster: BelegungsmusterItem[]
   mitarbeiter: MitarbeiterItem[]
   musterUsageCountById: Record<string, number>
-  /** PT-Zoom-Ampel pro Patient (Persistenz in panels / Cloud). */
-  ptZoomPatientStatus?: Record<string, PtZoomTrafficLight>
+  /** PT-Zoom: Intervall in Wochen bis Videocall, oder „done“. */
+  ptZoomPatientStatus?: Record<string, PtZoomNachsorgeIntervall>
   /** PT-Zoom: Abweichung zu MEZ in Stunden (−12 … +12), pro Patient. */
   ptZoomMezDeviationHours?: Record<string, number>
   /** PT-Zoom: Termin durch Patient bestätigt (Ja/Nein), pro Patient. */
   ptZoomTerminBestaetigt?: Record<string, boolean>
   /** PT-Zoom: Freitext-Kommentar pro Patient. */
   ptZoomKommentar?: Record<string, string>
-  /** PT-Zoom: Abschluss-Notiz (Performance-Spalte). */
+  /** PT-Zoom: Abschluss-Notiz (Legacy, optional). */
   ptZoomAbschluss?: Record<string, string>
-  /** PT-Zoom: Umschalter Performance — Farben vs. Abschluss. */
-  ptZoomPerfSubmode?: Record<string, PtZoomPerfSubmode>
 }
 
-function normalizePtZoomPatientStatus(
+function normalizePtZoomNachsorgeIntervall(
   raw: unknown,
-): Record<string, PtZoomTrafficLight> {
+): Record<string, PtZoomNachsorgeIntervall> {
   if (!raw || typeof raw !== 'object') return {}
-  const out: Record<string, PtZoomTrafficLight> = {}
+  const out: Record<string, PtZoomNachsorgeIntervall> = {}
+  const allowed = new Set<number>([1, 2, 3, 5, 8])
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (v === 'green' || v === 'yellow' || v === 'red' || v === 'done') {
-      out[k] = v
+    if (v === 'done' || v === 'abschluss') {
+      out[k] = 'done'
+      continue
     }
+    if (v === 'green') {
+      out[k] = 3
+      continue
+    }
+    if (v === 'yellow') {
+      out[k] = 2
+      continue
+    }
+    if (v === 'red') {
+      out[k] = 1
+      continue
+    }
+    const n =
+      typeof v === 'number'
+        ? v
+        : typeof v === 'string'
+          ? parseInt(v, 10)
+          : NaN
+    if (allowed.has(n)) out[k] = n as 1 | 2 | 3 | 5 | 8
   }
   return out
 }
@@ -1632,17 +1645,6 @@ function normalizePtZoomAbschluss(raw: unknown): Record<string, string> {
   return out
 }
 
-function normalizePtZoomPerfSubmode(
-  raw: unknown,
-): Record<string, PtZoomPerfSubmode> {
-  if (!raw || typeof raw !== 'object') return {}
-  const out: Record<string, PtZoomPerfSubmode> = {}
-  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (v === 'colors' || v === 'abschluss') out[k] = v
-  }
-  return out
-}
-
 function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
   if (!parsed || typeof parsed !== 'object') return null
   const o = parsed as {
@@ -1657,7 +1659,6 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
     ptZoomTerminBestaetigt?: unknown
     ptZoomKommentar?: unknown
     ptZoomAbschluss?: unknown
-    ptZoomPerfSubmode?: unknown
   }
   const catalogOk =
     (o.artenCatalogVersion ?? 0) >= ARTEN_CATALOG_VERSION &&
@@ -1699,7 +1700,7 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
           )
       : DEFAULT_MITARBEITER,
     musterUsageCountById: normalizeMusterUsageCountById(o.musterUsageCountById),
-    ptZoomPatientStatus: normalizePtZoomPatientStatus(o.ptZoomPatientStatus),
+    ptZoomPatientStatus: normalizePtZoomNachsorgeIntervall(o.ptZoomPatientStatus),
     ptZoomMezDeviationHours: normalizePtZoomMezDeviationHours(
       o.ptZoomMezDeviationHours,
     ),
@@ -1708,7 +1709,6 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
     ),
     ptZoomKommentar: normalizePtZoomKommentar(o.ptZoomKommentar),
     ptZoomAbschluss: normalizePtZoomAbschluss(o.ptZoomAbschluss),
-    ptZoomPerfSubmode: normalizePtZoomPerfSubmode(o.ptZoomPerfSubmode),
   }
 }
 
@@ -1728,12 +1728,11 @@ function savePanelsState(p: {
   muster: BelegungsmusterItem[]
   mitarbeiter: MitarbeiterItem[]
   musterUsageCountById: Record<string, number>
-  ptZoomPatientStatus: Record<string, PtZoomTrafficLight>
+  ptZoomPatientStatus: Record<string, PtZoomNachsorgeIntervall>
   ptZoomMezDeviationHours: Record<string, number>
   ptZoomTerminBestaetigt: Record<string, boolean>
   ptZoomKommentar: Record<string, string>
   ptZoomAbschluss: Record<string, string>
-  ptZoomPerfSubmode: Record<string, PtZoomPerfSubmode>
 }) {
   localStorage.setItem(
     STORAGE_PANELS,
@@ -4868,6 +4867,60 @@ function patientHadOpBookingInCells(
   return false
 }
 
+/** Erster OP-Termin im OP-Saal (frühestes Datum), Bezug für Nachsorge-Fenster. */
+function findEarliestOpDateKeyForPatient(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+): string | null {
+  let best: string | null = null
+  const seen = new Set<string>()
+  for (const [key, data] of Object.entries(cells)) {
+    if (!isCellBooked(data)) continue
+    if (!cellMatchesPatientRecord(data, patient)) continue
+    const pos = parseSlotCellKey(key)
+    if (!pos || pos.room !== OP_TAB_ROOM) continue
+    const { start } = findBlockBounds(cells, pos.dk, pos.room, pos.slot)
+    const canon = `${pos.dk}|${start}`
+    if (seen.has(canon)) continue
+    seen.add(canon)
+    if (!best || pos.dk < best) best = pos.dk
+  }
+  return best
+}
+
+const NACHSORGE_ZAEHL_AB_TAG_NACH_OP = 21
+
+/**
+ * Anzahl gebuchter Termin-Blöcke im Hauptkalender ab einschließlich Kalendertag
+ * OP + 21 Tage (die ersten 21 Tage ab OP zählen nicht).
+ */
+function countNachsorgeTermineForPatient(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+): number {
+  const opDk = findEarliestOpDateKeyForPatient(cells, patient)
+  if (!opDk) return 0
+  const firstZaehlTag = dateKey(
+    addDays(parseDateKey(opDk), NACHSORGE_ZAEHL_AB_TAG_NACH_OP),
+  )
+  const seen = new Set<string>()
+  let n = 0
+  for (const [key, data] of Object.entries(cells)) {
+    if (!isCellBooked(data)) continue
+    if (!cellMatchesPatientRecord(data, patient)) continue
+    const pos = parseSlotCellKey(key)
+    if (!pos || pos.room === OP_TAB_ROOM) continue
+    if (!(ROOMS as readonly string[]).includes(pos.room)) continue
+    if (pos.dk < firstZaehlTag) continue
+    const { start } = findBlockBounds(cells, pos.dk, pos.room, pos.slot)
+    const canon = `${pos.dk}|${pos.room}|${start}`
+    if (seen.has(canon)) continue
+    seen.add(canon)
+    n += 1
+  }
+  return n
+}
+
 function findLastPhysioBlockForPatient(
   cells: Record<string, CellData>,
   patient: PatientItem,
@@ -4929,10 +4982,95 @@ type PtZoomNextTerminRow =
       idealEndSlot: number
     }
 
-function ptZoomPerformanceWeeks(mode: PtZoomPerformance): number {
-  if (mode === 'green') return 3
-  if (mode === 'yellow') return 2
-  return 1
+function nachsorgeBlockStrictlyAfterLastPhysio(
+  dk: string,
+  start: number,
+  last: { dk: string; start: number },
+): boolean {
+  if (dk > last.dk) return true
+  if (dk < last.dk) return false
+  return start > last.start
+}
+
+/** Frühester PT-Zoom-Folge-Videocall strikt nach dem letzten Physio-/Videocall-Block. */
+function findEarliestNachsorgeVideocallAfterLastPhysio(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+  last: { dk: string; start: number },
+  videocallArtId: string,
+): { dk: string; room: Room; start: number; end: number } | null {
+  let best: { dk: string; room: Room; start: number; end: number } | null =
+    null
+  const seen = new Set<string>()
+  for (const [key, data] of Object.entries(cells)) {
+    if (!isCellBooked(data)) continue
+    if (!cellMatchesPatientRecord(data, patient)) continue
+    const pos = parseSlotCellKey(key)
+    if (!pos || pos.room === OP_TAB_ROOM) continue
+    if (!(ROOMS as readonly string[]).includes(pos.room)) continue
+    const { start, end } = findBlockBounds(cells, pos.dk, pos.room, pos.slot)
+    const canon = `${pos.dk}|${pos.room}|${start}`
+    if (seen.has(canon)) continue
+    seen.add(canon)
+    const anchor = cells[makeSlotKey(pos.dk, pos.room, start)]!
+    if (anchor?.artId !== videocallArtId) continue
+    if (!nachsorgeBlockStrictlyAfterLastPhysio(pos.dk, start, last)) continue
+    const cand = {
+      dk: pos.dk,
+      room: pos.room as Room,
+      start,
+      end,
+    }
+    if (
+      !best ||
+      cand.dk < best.dk ||
+      (cand.dk === best.dk && cand.start < best.start)
+    ) {
+      best = cand
+    }
+  }
+  return best
+}
+
+/** Entfernt alle Videocall-Blöcke strikt nach dem letzten Physio-Termin (nur ein Folgetermin). */
+function stripAllNachsorgeVideocallsAfterLastPhysio(
+  cells: Record<string, CellData>,
+  patient: PatientItem,
+  last: { dk: string; start: number },
+  videocallArtId: string,
+): Record<string, CellData> {
+  let next = cells
+  for (;;) {
+    const ex = findEarliestNachsorgeVideocallAfterLastPhysio(
+      next,
+      patient,
+      last,
+      videocallArtId,
+    )
+    if (!ex) break
+    next = deletePhysioBlockRangeFromCells(
+      next,
+      ex.dk,
+      ex.room,
+      ex.start,
+      ex.end,
+    )
+  }
+  return next
+}
+
+function deletePhysioBlockRangeFromCells(
+  cells: Record<string, CellData>,
+  dk: string,
+  room: Room,
+  start: number,
+  end: number,
+): Record<string, CellData> {
+  const next = { ...cells }
+  for (let s = start; s <= end; s++) {
+    delete next[makeSlotKey(dk, room, s)]
+  }
+  return next
 }
 
 /** Idealer Start-Slot für PT-Zoom-Videocall (wie tryPlacePtZoomVideocallBlock). */
@@ -4977,21 +5115,19 @@ function findVideocallBlockForPatientOnDate(
 }
 
 /**
- * Nächster PT-Zoom-Termin abhängig von Performance (3/2/1 Woche ab letztem PT)
- * bzw. kein Folgetermin im Modus „Abschluss“.
+ * Nächster PT-Zoom-Termin aus gewähltem Intervall (Wochen ab letztem PT).
  */
 function resolvePtZoomNextTermin(
   cells: Record<string, CellData>,
   patient: PatientItem,
   artenList: BelegungsartItem[],
   lastBlock: { dk: string; start: number } | null,
-  perfSubmode: PtZoomPerfSubmode,
-  performance: PtZoomPerformance,
+  intervall: PtZoomNachsorgeIntervall | undefined,
   mezHours: number,
 ): PtZoomNextTerminRow | null {
-  if (perfSubmode === 'abschluss') return null
+  if (intervall === 'done') return null
   if (!lastBlock) return null
-  const weeks = ptZoomPerformanceWeeks(performance)
+  const weeks = isPtZoomIntervallWochen(intervall) ? intervall : 3
   const targetDk = dateKey(
     addDays(parseDateKey(lastBlock.dk), weeks * 7),
   )
@@ -6085,7 +6221,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     Record<string, number>
   >(() => initialPanels?.musterUsageCountById ?? {})
   const [ptZoomPatientStatus, setPtZoomPatientStatus] = useState<
-    Record<string, PtZoomTrafficLight>
+    Record<string, PtZoomNachsorgeIntervall>
   >(() => initialPanels?.ptZoomPatientStatus ?? {})
   const [ptZoomMezDeviationHours, setPtZoomMezDeviationHours] = useState<
     Record<string, number>
@@ -6099,9 +6235,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const [ptZoomAbschluss, setPtZoomAbschluss] = useState<Record<string, string>>(
     () => initialPanels?.ptZoomAbschluss ?? {},
   )
-  const [ptZoomPerfSubmode, setPtZoomPerfSubmode] = useState<
-    Record<string, PtZoomPerfSubmode>
-  >(() => initialPanels?.ptZoomPerfSubmode ?? {})
   const [musterModal, setMusterModal] = useState<
     | null
     | { mode: 'create'; templateWeekCount: 1 | 3 }
@@ -6352,7 +6485,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             setPtZoomTerminBestaetigt(parsed.ptZoomTerminBestaetigt ?? {})
             setPtZoomKommentar(parsed.ptZoomKommentar ?? {})
             setPtZoomAbschluss(parsed.ptZoomAbschluss ?? {})
-            setPtZoomPerfSubmode(parsed.ptZoomPerfSubmode ?? {})
           }
         }
         if (byType.ui !== undefined) {
@@ -6485,7 +6617,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         ptZoomTerminBestaetigt,
         ptZoomKommentar,
         ptZoomAbschluss,
-        ptZoomPerfSubmode,
         artenCatalogVersion: ARTEN_CATALOG_VERSION,
       })
       return
@@ -6501,7 +6632,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       ptZoomTerminBestaetigt,
       ptZoomKommentar,
       ptZoomAbschluss,
-      ptZoomPerfSubmode,
     })
   }, [
     patients,
@@ -6514,7 +6644,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     ptZoomTerminBestaetigt,
     ptZoomKommentar,
     ptZoomAbschluss,
-    ptZoomPerfSubmode,
     cloudSyncEnabled,
     cloudHydrated,
     organizationId,
@@ -8434,32 +8563,30 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       )
       .map((p) => {
         const last = findLastPhysioBlockForPatient(slotCells, p, arten)
-        const status = ptZoomPatientStatus[p.id]
-        const performance = ptZoomPerformanceFromStatus(status)
+        const nachsorgeIntervall: PtZoomNachsorgeIntervall =
+          ptZoomPatientStatus[p.id] ?? 3
         const mezH = clampPtZoomMezHours(ptZoomMezDeviationHours[p.id] ?? 0)
         const terminOk = ptZoomTerminBestaetigt[p.id] === true
         const kommentar = ptZoomKommentar[p.id] ?? ''
-        const abschluss = ptZoomAbschluss[p.id] ?? ''
-        const perfSubmode = ptZoomPerfSubmode[p.id] ?? 'colors'
         const nextTermin = resolvePtZoomNextTermin(
           slotCells,
           p,
           arten,
           last ? { dk: last.dk, start: last.start } : null,
-          perfSubmode,
-          performance,
+          nachsorgeIntervall,
           mezH,
         )
+        const nachsorgeTermineAnzahl =
+          countNachsorgeTermineForPatient(slotCells, p)
         return {
           patient: p,
           last,
-          performance,
+          nachsorgeIntervall,
           mezH,
           terminOk,
           kommentar,
-          abschluss,
-          perfSubmode,
           nextTermin,
+          nachsorgeTermineAnzahl,
         }
       })
       .sort((a, b) =>
@@ -8475,12 +8602,32 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     ptZoomMezDeviationHours,
     ptZoomTerminBestaetigt,
     ptZoomKommentar,
-    ptZoomAbschluss,
-    ptZoomPerfSubmode,
   ])
 
-  const applyPtZoomVideocallBooking = useCallback(
-    (patientId: string, mode: PtZoomPerformance, mezHours: number) => {
+  const removePtZoomFollowupVideocall = useCallback(
+    (patientId: string) => {
+      const patient = patients.find((p) => p.id === patientId)
+      if (!patient) return
+      setSlotCells((prev) => {
+        const last = findLastPhysioBlockForPatient(prev, patient, arten)
+        if (!last) return prev
+        return stripAllNachsorgeVideocallsAfterLastPhysio(
+          prev,
+          patient,
+          { dk: last.dk, start: last.start },
+          PHYSIO_VIDEOCALL_ART_ID,
+        )
+      })
+    },
+    [patients, arten, setSlotCells],
+  )
+
+  const syncPtZoomNachsorgeVideocall = useCallback(
+    (
+      patientId: string,
+      weeks: 1 | 2 | 3 | 5 | 8,
+      mezHours: number,
+    ) => {
       const patient = patients.find((p) => p.id === patientId)
       if (!patient) return
       const mez = clampPtZoomMezHours(mezHours)
@@ -8495,6 +8642,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           )
           return prev
         }
+        const next = stripAllNachsorgeVideocallsAfterLastPhysio(
+          prev,
+          patient,
+          { dk: last.dk, start: last.start },
+          PHYSIO_VIDEOCALL_ART_ID,
+        )
         const st = findStaffForCell(last.anchor, mitarbeiter)
         if (!st) {
           queueMicrotask(() =>
@@ -8514,21 +8667,20 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           return prev
         }
 
-        const weeks = mode === 'green' ? 3 : mode === 'yellow' ? 2 : 1
         const targetDk = dateKey(addDays(parseDateKey(last.dk), weeks * 7))
 
         if (
           patientHasVideocallOnDate(
-            prev,
+            next,
             patient,
             targetDk,
             PHYSIO_VIDEOCALL_ART_ID,
           )
         ) {
-          return prev
+          return next
         }
         const r = tryPlacePtZoomVideocallBlock(
-          prev,
+          next,
           patient,
           last,
           targetDk,
@@ -8539,7 +8691,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         )
         if (r.error) {
           queueMicrotask(() => alertOnce(r.error!))
-          return prev
+          return next
         }
         return r.next
       })
@@ -8547,30 +8699,62 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     [patients, arten, mitarbeiter, setSlotCells],
   )
 
-  const handlePtZoomPerformanceChange = useCallback(
-    (patientId: string, mode: PtZoomPerformance) => {
+  const handlePtZoomNachsorgeIntervallChange = useCallback(
+    (patientId: string, raw: string) => {
       if (cloudSyncEnabled && !mayCalendarWrite) return
-      setPtZoomPatientStatus((prev) => ({ ...prev, [patientId]: mode }))
-      applyPtZoomVideocallBooking(
+      if (raw === 'done') {
+        removePtZoomFollowupVideocall(patientId)
+        setPtZoomPatientStatus((prev) => ({ ...prev, [patientId]: 'done' }))
+        return
+      }
+      const weeks = parseInt(raw, 10)
+      if (![1, 2, 3, 5, 8].includes(weeks)) {
+        return
+      }
+      const w = weeks as 1 | 2 | 3 | 5 | 8
+      setPtZoomPatientStatus((prev) => ({ ...prev, [patientId]: w }))
+      syncPtZoomNachsorgeVideocall(
         patientId,
-        mode,
+        w,
         clampPtZoomMezHours(ptZoomMezDeviationHours[patientId] ?? 0),
       )
     },
     [
       cloudSyncEnabled,
       mayCalendarWrite,
-      applyPtZoomVideocallBooking,
+      removePtZoomFollowupVideocall,
+      syncPtZoomNachsorgeVideocall,
       ptZoomMezDeviationHours,
     ],
   )
 
-  const handlePtZoomNachsorgeBeenden = useCallback(
+  const handlePtZoomNachsorgeReaktivieren = useCallback(
     (patientId: string) => {
       if (cloudSyncEnabled && !mayCalendarWrite) return
-      setPtZoomPatientStatus((prev) => ({ ...prev, [patientId]: 'done' }))
+      const patient = patients.find((x) => x.id === patientId)
+      if (!patient) return
+      if (ptZoomPatientStatus[patientId] !== 'done') return
+      if (!patientHadOpBookingInCells(slotCells, patient)) return
+      const defaultWochen = 3 as const
+      setPtZoomPatientStatus((prev) => ({
+        ...prev,
+        [patientId]: defaultWochen,
+      }))
+      syncPtZoomNachsorgeVideocall(
+        patientId,
+        defaultWochen,
+        clampPtZoomMezHours(ptZoomMezDeviationHours[patientId] ?? 0),
+      )
     },
-    [cloudSyncEnabled, mayCalendarWrite],
+    [
+      cloudSyncEnabled,
+      mayCalendarWrite,
+      patients,
+      slotCells,
+      ptZoomPatientStatus,
+      syncPtZoomNachsorgeVideocall,
+      ptZoomMezDeviationHours,
+    ],
   )
 
   const handlePtZoomMezInputChange = useCallback(
@@ -8590,17 +8774,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       setPtZoomMezDeviationHours((prev) => ({ ...prev, [patientId]: clamped }))
       const mode = ptZoomPatientStatus[patientId]
       if (mode === 'done') return
-      applyPtZoomVideocallBooking(
-        patientId,
-        ptZoomPerformanceFromStatus(mode),
-        clamped,
-      )
+      const wochen = isPtZoomIntervallWochen(mode) ? mode : 3
+      syncPtZoomNachsorgeVideocall(patientId, wochen, clamped)
     },
     [
       cloudSyncEnabled,
       mayCalendarWrite,
       ptZoomPatientStatus,
-      applyPtZoomVideocallBooking,
+      syncPtZoomNachsorgeVideocall,
     ],
   )
 
@@ -8620,23 +8801,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       if (cloudSyncEnabled && !mayCalendarWrite) return
       const next = text.slice(0, PT_ZOOM_KOMMENTAR_MAX_LEN)
       setPtZoomKommentar((prev) => ({ ...prev, [patientId]: next }))
-    },
-    [cloudSyncEnabled, mayCalendarWrite],
-  )
-
-  const handlePtZoomAbschlussChange = useCallback(
-    (patientId: string, text: string) => {
-      if (cloudSyncEnabled && !mayCalendarWrite) return
-      const next = text.slice(0, PT_ZOOM_ABSCHLUSS_MAX_LEN)
-      setPtZoomAbschluss((prev) => ({ ...prev, [patientId]: next }))
-    },
-    [cloudSyncEnabled, mayCalendarWrite],
-  )
-
-  const handlePtZoomPerfSubmodeChange = useCallback(
-    (patientId: string, mode: PtZoomPerfSubmode) => {
-      if (cloudSyncEnabled && !mayCalendarWrite) return
-      setPtZoomPerfSubmode((prev) => ({ ...prev, [patientId]: mode }))
     },
     [cloudSyncEnabled, mayCalendarWrite],
   )
@@ -10655,6 +10819,20 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           >
                             Bearbeiten
                           </button>
+                          {ptZoomPatientStatus[p.id] === 'done' &&
+                          patientHadOpBookingInCells(slotCells, p) ? (
+                            <button
+                              type="button"
+                              className="btn-patient-action btn-patient-pt-zoom-reactivate"
+                              disabled={!mayCalendarWrite}
+                              title="Nachsorge im Tab PT Zoom fortsetzen: Standard 3 Wochen, Videocall wird neu eingeplant (sofern möglich)."
+                              onClick={() =>
+                                handlePtZoomNachsorgeReaktivieren(p.id)
+                              }
+                            >
+                              Nachsorge aktivieren
+                            </button>
+                          ) : null}
                           <button
                             type="button"
                             className="btn-patient-action btn-patient-delete"
@@ -11018,8 +11196,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                         <th scope="col" title="Abweichung zu MEZ (Normalzeit), −12 … +12 h">
                           Δ zu MEZ (h)
                         </th>
-                        <th scope="col">Performance</th>
+                        <th scope="col">Nachsorge-Intervall</th>
                         <th scope="col">Nächster Termin</th>
+                        <th
+                          scope="col"
+                          title="Anzahl Termine im Hauptkalender ab Tag 22 nach OP (erste 3 Wochen nach OP zählen nicht)."
+                        >
+                          Nachsorge-Termine
+                        </th>
                         <th scope="col">Termin bestätigt</th>
                         <th scope="col">Kommentar</th>
                       </tr>
@@ -11027,7 +11211,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                     <tbody>
                       {ptZoomRows.length === 0 ? (
                         <tr>
-                          <td colSpan={7} className="pt-zoom-empty">
+                          <td colSpan={8} className="pt-zoom-empty">
                             Keine passenden Patienten (aktive Nachsorge mit OP im
                             OP-Saal, oder noch kein OP eingetragen).
                           </td>
@@ -11037,13 +11221,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           ({
                             patient: p,
                             last,
-                            performance,
+                            nachsorgeIntervall,
                             mezH,
                             terminOk,
                             kommentar,
-                            abschluss,
-                            perfSubmode,
                             nextTermin,
+                            nachsorgeTermineAnzahl,
                           }) => {
                           const lastCell =
                             last != null ? (
@@ -11109,126 +11292,27 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                                 />
                               </td>
                               <td className="pt-zoom-performance-cell">
-                                <div
-                                  className="pt-zoom-perf-mode-switch"
-                                  role="group"
-                                  aria-label={`Performance: Farben oder Abschluss für ${p.name}`}
+                                <select
+                                  className="pt-zoom-intervall-select"
+                                  value={String(nachsorgeIntervall)}
+                                  disabled={isViewer || !mayCalendarWrite}
+                                  aria-label={`Nachsorge-Intervall für ${p.name}: nur ein Folge-Videocall; Änderung verschiebt den bestehenden Termin.`}
+                                  onChange={(e) =>
+                                    handlePtZoomNachsorgeIntervallChange(
+                                      p.id,
+                                      e.target.value,
+                                    )
+                                  }
                                 >
-                                  <button
-                                    type="button"
-                                    className={
-                                      perfSubmode === 'colors'
-                                        ? 'pt-zoom-perf-mode-btn is-active'
-                                        : 'pt-zoom-perf-mode-btn'
-                                    }
-                                    disabled={isViewer || !mayCalendarWrite}
-                                    aria-pressed={perfSubmode === 'colors'}
-                                    onClick={() =>
-                                      handlePtZoomPerfSubmodeChange(
-                                        p.id,
-                                        'colors',
-                                      )
-                                    }
-                                  >
-                                    Farben
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className={
-                                      perfSubmode === 'abschluss'
-                                        ? 'pt-zoom-perf-mode-btn is-active'
-                                        : 'pt-zoom-perf-mode-btn'
-                                    }
-                                    disabled={isViewer || !mayCalendarWrite}
-                                    aria-pressed={perfSubmode === 'abschluss'}
-                                    onClick={() =>
-                                      handlePtZoomPerfSubmodeChange(
-                                        p.id,
-                                        'abschluss',
-                                      )
-                                    }
-                                  >
-                                    Abschluss
-                                  </button>
-                                </div>
-                                {perfSubmode === 'colors' ? (
-                                  <div
-                                    className="pt-zoom-perf-swatches"
-                                    role="radiogroup"
-                                    aria-label={`Nachsorge-Intervall für ${p.name}`}
-                                  >
-                                    {PT_ZOOM_PERF_LEVELS.map((level) => (
-                                      <button
-                                        key={level}
-                                        type="button"
-                                        role="radio"
-                                        aria-checked={performance === level}
-                                        aria-label={
-                                          level === 'green'
-                                            ? 'Grün: nächster Videocall in 3 Wochen'
-                                            : level === 'yellow'
-                                              ? 'Gelb: nächster Videocall in 2 Wochen'
-                                              : 'Rot: nächster Videocall in 1 Woche'
-                                        }
-                                        title={
-                                          level === 'green'
-                                            ? 'Grün: nächster Videocall in 3 Wochen'
-                                            : level === 'yellow'
-                                              ? 'Gelb: in 2 Wochen'
-                                              : 'Rot: in 1 Woche'
-                                        }
-                                        className={`pt-zoom-perf-swatch pt-zoom-perf-swatch--${level}${performance === level ? ' is-selected' : ''}`}
-                                        disabled={
-                                          isViewer || !mayCalendarWrite
-                                        }
-                                        onClick={() =>
-                                          handlePtZoomPerformanceChange(
-                                            p.id,
-                                            level,
-                                          )
-                                        }
-                                      />
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <>
-                                    <label className="pt-zoom-abschluss-field">
-                                      <span className="pt-zoom-abschluss-label">
-                                        Abschluss
-                                      </span>
-                                      <input
-                                        type="text"
-                                        className="pt-zoom-abschluss-input"
-                                        value={abschluss}
-                                        maxLength={PT_ZOOM_ABSCHLUSS_MAX_LEN}
-                                        disabled={
-                                          isViewer || !mayCalendarWrite
-                                        }
-                                        autoComplete="off"
-                                        aria-label={`Abschluss PT-Zoom für ${p.name}`}
-                                        placeholder="…"
-                                        onChange={(e) =>
-                                          handlePtZoomAbschlussChange(
-                                            p.id,
-                                            e.target.value,
-                                          )
-                                        }
-                                      />
-                                    </label>
-                                    <button
-                                      type="button"
-                                      className="pt-zoom-nachsorge-beenden"
-                                      disabled={
-                                        isViewer || !mayCalendarWrite
-                                      }
-                                      onClick={() =>
-                                        handlePtZoomNachsorgeBeenden(p.id)
-                                      }
-                                    >
-                                      Nachsorge beenden
-                                    </button>
-                                  </>
-                                )}
+                                  <option value="1">1 Woche (Rot)</option>
+                                  <option value="2">2 Wochen (Gelb)</option>
+                                  <option value="3">3 Wochen (Grün)</option>
+                                  <option value="5">5 Wochen</option>
+                                  <option value="8">8 Wochen</option>
+                                  <option value="done">
+                                    Nachsorge beendet
+                                  </option>
+                                </select>
                               </td>
                               <td className="pt-zoom-next-cell">
                                 {nextTermin != null ? (
@@ -11314,16 +11398,17 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                                       </span>
                                     </button>
                                   )
-                                ) : perfSubmode === 'abschluss' ? (
-                                  <span
-                                    className="muted"
-                                    title="Im Modus Abschluss kein weiterer Nachsorge-Termin vorgesehen."
-                                  >
-                                    —
-                                  </span>
                                 ) : (
                                   <span className="muted">—</span>
                                 )}
+                              </td>
+                              <td className="pt-zoom-nachsorge-count-cell">
+                                <span
+                                  className="pt-zoom-nachsorge-count"
+                                  title="Gebuchte Termin-Blöcke im Hauptkalender ab Tag 22 nach dem frühesten OP (erste 21 Tage nach OP ohne)."
+                                >
+                                  {nachsorgeTermineAnzahl}
+                                </span>
                               </td>
                               <td className="pt-zoom-bestaetigt-cell">
                                 <button
