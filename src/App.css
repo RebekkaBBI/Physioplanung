@@ -421,7 +421,7 @@
 }
 
 .pt-zoom-table :is(th, td):nth-child(2) {
-  width: 13rem;
+  width: 6.5rem;
 }
 
 .pt-zoom-table :is(th, td):nth-child(3) {
@@ -433,16 +433,16 @@
 }
 
 .pt-zoom-table :is(th, td):nth-child(5) {
-  width: 13rem;
+  width: 6.5rem;
 }
 
 .pt-zoom-table :is(th, td):nth-child(6) {
-  width: 5.25rem;
+  width: 5rem;
   text-align: center;
 }
 
 .pt-zoom-table :is(th, td):nth-child(7) {
-  width: 6.25rem;
+  width: 5rem;
 }
 
 /* Überschriften dürfen zweizeilig umbrechen, damit die Spalten schmal bleiben */
@@ -494,7 +494,7 @@
 }
 
 .pt-zoom-last-cell {
-  min-width: 12rem;
+  min-width: 0;
 }
 
 .pt-zoom-last-date {
@@ -573,20 +573,23 @@
   cursor: not-allowed;
 }
 
-/* Intervalle: 1W grün, 2W gelb, 3W rot */
-.pt-zoom-intervall-btn--1w {
-  background: color-mix(in srgb, #16a34a 18%, var(--surface-1));
-  border-color: color-mix(in srgb, #16a34a 35%, var(--border-subtle));
+/* Farben nur für den aktiven 1/2/3-Wochen-Button (sonst farblos) */
+.pt-zoom-intervall-btn--1w.is-active {
+  background: #dc2626;
+  border-color: color-mix(in srgb, #dc2626 65%, var(--border-subtle));
+  color: #fff;
 }
 
-.pt-zoom-intervall-btn--2w {
-  background: color-mix(in srgb, #facc15 22%, var(--surface-1));
-  border-color: color-mix(in srgb, #ca8a04 38%, var(--border-subtle));
+.pt-zoom-intervall-btn--2w.is-active {
+  background: #facc15;
+  border-color: color-mix(in srgb, #ca8a04 55%, var(--border-subtle));
+  color: #111827;
 }
 
-.pt-zoom-intervall-btn--3w {
-  background: color-mix(in srgb, #dc2626 16%, var(--surface-1));
-  border-color: color-mix(in srgb, #dc2626 35%, var(--border-subtle));
+.pt-zoom-intervall-btn--3w.is-active {
+  background: #16a34a;
+  border-color: color-mix(in srgb, #16a34a 65%, var(--border-subtle));
+  color: #fff;
 }
 
 .pt-zoom-intervall-btn.is-active {
@@ -626,8 +629,8 @@
 }
 
 .pt-zoom-next-cell {
-  min-width: 11rem;
-  max-width: 15rem;
+  min-width: 0;
+  max-width: 9rem;
   vertical-align: top;
 }
 
