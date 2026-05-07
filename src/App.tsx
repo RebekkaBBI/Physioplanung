@@ -11292,27 +11292,97 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                                 />
                               </td>
                               <td className="pt-zoom-performance-cell">
-                                <select
-                                  className="pt-zoom-intervall-select"
-                                  value={String(nachsorgeIntervall)}
-                                  disabled={isViewer || !mayCalendarWrite}
-                                  aria-label={`Nachsorge-Intervall für ${p.name}: nur ein Folge-Videocall; Änderung verschiebt den bestehenden Termin.`}
-                                  onChange={(e) =>
-                                    handlePtZoomNachsorgeIntervallChange(
-                                      p.id,
-                                      e.target.value,
-                                    )
-                                  }
-                                >
-                                  <option value="1">1 Woche (Rot)</option>
-                                  <option value="2">2 Wochen (Gelb)</option>
-                                  <option value="3">3 Wochen (Grün)</option>
-                                  <option value="5">5 Wochen</option>
-                                  <option value="8">8 Wochen</option>
-                                  <option value="done">
-                                    Nachsorge beendet
-                                  </option>
-                                </select>
+                                <div className="pt-zoom-intervall-control">
+                                  <select
+                                    className="pt-zoom-intervall-select"
+                                    value={
+                                      nachsorgeIntervall === 5 ||
+                                      nachsorgeIntervall === 8 ||
+                                      nachsorgeIntervall === 'done'
+                                        ? String(nachsorgeIntervall)
+                                        : 'quick'
+                                    }
+                                    disabled={isViewer || !mayCalendarWrite}
+                                    aria-label={`Nachsorge-Intervall für ${p.name}: nur ein Folge-Videocall; Änderung verschiebt den bestehenden Termin.`}
+                                    onChange={(e) => {
+                                      const v = e.target.value
+                                      if (v === 'quick') return
+                                      handlePtZoomNachsorgeIntervallChange(
+                                        p.id,
+                                        v,
+                                      )
+                                    }}
+                                  >
+                                    <option value="quick">
+                                      1/2/3 Wochen (Buttons unten)
+                                    </option>
+                                    <option value="5">5 Wochen</option>
+                                    <option value="8">8 Wochen</option>
+                                    <option value="done">
+                                      Nachsorge beendet
+                                    </option>
+                                  </select>
+
+                                  <div className="pt-zoom-intervall-quick">
+                                    <button
+                                      type="button"
+                                      className={[
+                                        'pt-zoom-intervall-btn',
+                                        'pt-zoom-intervall-btn--1w',
+                                        nachsorgeIntervall === 1
+                                          ? 'is-active'
+                                          : '',
+                                      ].join(' ')}
+                                      disabled={isViewer || !mayCalendarWrite}
+                                      onClick={() =>
+                                        handlePtZoomNachsorgeIntervallChange(
+                                          p.id,
+                                          '1',
+                                        )
+                                      }
+                                    >
+                                      1W
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className={[
+                                        'pt-zoom-intervall-btn',
+                                        'pt-zoom-intervall-btn--2w',
+                                        nachsorgeIntervall === 2
+                                          ? 'is-active'
+                                          : '',
+                                      ].join(' ')}
+                                      disabled={isViewer || !mayCalendarWrite}
+                                      onClick={() =>
+                                        handlePtZoomNachsorgeIntervallChange(
+                                          p.id,
+                                          '2',
+                                        )
+                                      }
+                                    >
+                                      2W
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className={[
+                                        'pt-zoom-intervall-btn',
+                                        'pt-zoom-intervall-btn--3w',
+                                        nachsorgeIntervall === 3
+                                          ? 'is-active'
+                                          : '',
+                                      ].join(' ')}
+                                      disabled={isViewer || !mayCalendarWrite}
+                                      onClick={() =>
+                                        handlePtZoomNachsorgeIntervallChange(
+                                          p.id,
+                                          '3',
+                                        )
+                                      }
+                                    >
+                                      3W
+                                    </button>
+                                  </div>
+                                </div>
                               </td>
                               <td className="pt-zoom-next-cell">
                                 {nextTermin != null ? (

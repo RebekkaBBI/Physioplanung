@@ -429,7 +429,7 @@
 }
 
 .pt-zoom-table :is(th, td):nth-child(4) {
-  width: 12rem;
+  width: 6rem;
 }
 
 .pt-zoom-table :is(th, td):nth-child(5) {
@@ -442,7 +442,15 @@
 }
 
 .pt-zoom-table :is(th, td):nth-child(7) {
-  width: 8.5rem;
+  width: 6.25rem;
+}
+
+/* Überschriften dürfen zweizeilig umbrechen, damit die Spalten schmal bleiben */
+.pt-zoom-table th:nth-child(6),
+.pt-zoom-table th:nth-child(7) {
+  white-space: normal;
+  hyphens: auto;
+  line-height: 1.15;
 }
 
 .pt-zoom-table th,
@@ -507,6 +515,13 @@
   min-width: 0;
 }
 
+.pt-zoom-intervall-control {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
 .pt-zoom-intervall-select {
   display: block;
   width: 100%;
@@ -520,6 +535,62 @@
   background: var(--surface-1);
   color: var(--text-h);
   cursor: pointer;
+}
+
+.pt-zoom-intervall-quick {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.25rem;
+}
+
+.pt-zoom-intervall-btn {
+  appearance: none;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 0.28rem 0.15rem;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  color: var(--text-h);
+  cursor: pointer;
+  min-width: 0;
+}
+
+.pt-zoom-intervall-btn:hover:not(:disabled) {
+  filter: brightness(0.98);
+  border-color: color-mix(in srgb, var(--text-h) 28%, var(--border-subtle));
+}
+
+.pt-zoom-intervall-btn:focus-visible {
+  outline: 2px solid var(--focus-ring, #2563eb);
+  outline-offset: 2px;
+}
+
+.pt-zoom-intervall-btn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+/* Intervalle: 1W grün, 2W gelb, 3W rot */
+.pt-zoom-intervall-btn--1w {
+  background: color-mix(in srgb, #16a34a 18%, var(--surface-1));
+  border-color: color-mix(in srgb, #16a34a 35%, var(--border-subtle));
+}
+
+.pt-zoom-intervall-btn--2w {
+  background: color-mix(in srgb, #facc15 22%, var(--surface-1));
+  border-color: color-mix(in srgb, #ca8a04 38%, var(--border-subtle));
+}
+
+.pt-zoom-intervall-btn--3w {
+  background: color-mix(in srgb, #dc2626 16%, var(--surface-1));
+  border-color: color-mix(in srgb, #dc2626 35%, var(--border-subtle));
+}
+
+.pt-zoom-intervall-btn.is-active {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .pt-zoom-intervall-select:disabled {
