@@ -37,10 +37,14 @@ import {
 } from './cloud/permissions'
 import { getSupabaseBrowserClient } from './cloud/supabaseClient'
 import type { AppRole } from './cloud/types'
+import type { WorkspaceDocType } from './cloud/workspaceDocTypes'
 import {
   fetchWorkspaceDocuments,
   flushPendingWorkspaceWrites,
+  initWorkspaceCrossTabVersionSync,
   scheduleWorkspaceUpsert,
+  startWorkspaceRemoteVersionWatcher,
+  WORKSPACE_REMOTE_STALE_EVENT,
 } from './cloud/workspaceSync'
 
 const CLOUD_ROLE_ORDER: AppRole[] = [
@@ -6359,6 +6363,59 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const [adminOrgProfilesError, setAdminOrgProfilesError] = useState<
     string | null
   >(null)
+  const [remoteWorkspaceStale, setRemoteWorkspaceStale] = useState(false)
+
+  const hydrateWorkspaceFromFetchedDocuments = useCallback(
+    (byType: Partial<Record<WorkspaceDocType, unknown>>) => {
+      if (byType.slots !== undefined) {
+        setSlotCellsBase(parseSlotCellsFromUnknown(byType.slots))
+        slotUndoStackRef.current = []
+        setCanUndoSlots(false)
+      }
+      if (byType.panels !== undefined) {
+        const parsed = parsePanelsFromJsonObject(byType.panels)
+        if (parsed) {
+          setPatients(parsed.patients)
+          setArten(parsed.arten)
+          setMuster(parsed.muster)
+          setMitarbeiter(parsed.mitarbeiter)
+          setMusterUsageCountById(parsed.musterUsageCountById)
+          setPtZoomPatientStatus(parsed.ptZoomPatientStatus ?? {})
+          setPtZoomMezDeviationHours(parsed.ptZoomMezDeviationHours ?? {})
+          setPtZoomTerminBestaetigt(parsed.ptZoomTerminBestaetigt ?? {})
+          setPtZoomKommentar(parsed.ptZoomKommentar ?? {})
+          setPtZoomAbschluss(parsed.ptZoomAbschluss ?? {})
+        }
+      }
+      if (byType.ui !== undefined) {
+        const ui = parseUiFromUnknown(byType.ui)
+        if (ui) {
+          setViewMode(ui.viewMode)
+          setAnchorDate(parseDateKey(ui.anchorDateKey))
+        }
+      }
+      if (byType.role_permissions !== undefined) {
+        setRoleCapabilityMatrix(
+          parseRoleCapabilityDocument(byType.role_permissions),
+        )
+      } else {
+        setRoleCapabilityMatrix(null)
+      }
+    },
+    [],
+  )
+
+  const reloadWorkspaceFromCloud = useCallback(async () => {
+    if (!organizationId) return
+    setRemoteWorkspaceStale(false)
+    try {
+      const byType = await fetchWorkspaceDocuments(organizationId)
+      hydrateWorkspaceFromFetchedDocuments(byType)
+    } catch (e) {
+      console.error('Workspace nachladen', e)
+      alertOnce('Arbeitsbereich konnte nicht neu geladen werden.')
+    }
+  }, [organizationId, hydrateWorkspaceFromFetchedDocuments])
 
   useEffect(() => {
     if (cloudSyncEnabled && !cloudHydrated) return
@@ -6459,48 +6516,17 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     if (!organizationId) {
       setRoleCapabilityMatrix(null)
       setCloudHydrated(false)
+      setRemoteWorkspaceStale(false)
       return
     }
     let cancelled = false
     setCloudHydrated(false)
+    setRemoteWorkspaceStale(false)
     void (async () => {
       try {
         const byType = await fetchWorkspaceDocuments(organizationId)
         if (cancelled) return
-        if (byType.slots !== undefined) {
-          setSlotCellsBase(parseSlotCellsFromUnknown(byType.slots))
-          slotUndoStackRef.current = []
-          setCanUndoSlots(false)
-        }
-        if (byType.panels !== undefined) {
-          const parsed = parsePanelsFromJsonObject(byType.panels)
-          if (parsed) {
-            setPatients(parsed.patients)
-            setArten(parsed.arten)
-            setMuster(parsed.muster)
-            setMitarbeiter(parsed.mitarbeiter)
-            setMusterUsageCountById(parsed.musterUsageCountById)
-            setPtZoomPatientStatus(parsed.ptZoomPatientStatus ?? {})
-            setPtZoomMezDeviationHours(parsed.ptZoomMezDeviationHours ?? {})
-            setPtZoomTerminBestaetigt(parsed.ptZoomTerminBestaetigt ?? {})
-            setPtZoomKommentar(parsed.ptZoomKommentar ?? {})
-            setPtZoomAbschluss(parsed.ptZoomAbschluss ?? {})
-          }
-        }
-        if (byType.ui !== undefined) {
-          const ui = parseUiFromUnknown(byType.ui)
-          if (ui) {
-            setViewMode(ui.viewMode)
-            setAnchorDate(parseDateKey(ui.anchorDateKey))
-          }
-        }
-        if (byType.role_permissions !== undefined) {
-          setRoleCapabilityMatrix(
-            parseRoleCapabilityDocument(byType.role_permissions),
-          )
-        } else {
-          setRoleCapabilityMatrix(null)
-        }
+        hydrateWorkspaceFromFetchedDocuments(byType)
       } catch (e) {
         console.error('Cloud-Hydration', e)
       } finally {
@@ -6510,7 +6536,26 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     return () => {
       cancelled = true
     }
-  }, [cloudSyncEnabled, organizationId])
+  }, [
+    cloudSyncEnabled,
+    organizationId,
+    hydrateWorkspaceFromFetchedDocuments,
+  ])
+
+  useEffect(() => {
+    if (!cloudSyncEnabled || !organizationId || !cloudHydrated) return
+    initWorkspaceCrossTabVersionSync()
+    const stop = startWorkspaceRemoteVersionWatcher(organizationId, 45_000)
+    return stop
+  }, [cloudSyncEnabled, organizationId, cloudHydrated])
+
+  useEffect(() => {
+    if (!cloudSyncEnabled) return
+    const onStale = () => setRemoteWorkspaceStale(true)
+    window.addEventListener(WORKSPACE_REMOTE_STALE_EVENT, onStale)
+    return () =>
+      window.removeEventListener(WORKSPACE_REMOTE_STALE_EVENT, onStale)
+  }, [cloudSyncEnabled])
 
   useEffect(() => {
     if (!cloudSyncEnabled || appRole !== 'admin' || !organizationId) {
@@ -10555,6 +10600,26 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   return (
     <div className="app">
+      {cloudSyncEnabled && remoteWorkspaceStale ? (
+        <div
+          className="workspace-remote-stale-banner"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="workspace-remote-stale-banner__text">
+            In der Cloud gibt es neuere Daten (anderer Tab oder Kollege). Jetzt
+            laden, um den gleichen Stand zu sehen. Änderungen, die hier noch
+            nicht erfolgreich gespeichert wurden, gehen dabei verloren.
+          </span>
+          <button
+            type="button"
+            className="btn-workspace-reload"
+            onClick={() => void reloadWorkspaceFromCloud()}
+          >
+            Jetzt laden
+          </button>
+        </div>
+      ) : null}
       <header className="app-header">
         <div className="app-title-row">
           <div className="app-title-brand">

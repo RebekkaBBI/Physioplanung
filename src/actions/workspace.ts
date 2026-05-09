@@ -96,3 +96,46 @@ export async function fetchWorkspaceDocumentsAction(
   }
   return { ok: true, data: out, versions }
 }
+
+/** Nur Zeitstempel — für Abgleich bei parallelen Clients ohne große Payload. */
+export async function fetchWorkspaceDocumentVersionsOnlyAction(
+  organizationId: string,
+): Promise<
+  { ok: true; versions: WorkspaceVersions } | { ok: false; error: string }
+> {
+  const supabase = await createSupabaseServerClient()
+  const {
+    data: { user },
+    error: userErr,
+  } = await supabase.auth.getUser()
+  if (userErr || !user) {
+    return { ok: false, error: 'Nicht angemeldet.' }
+  }
+  const gate = await assertOrgForUser(supabase, user.id, organizationId)
+  if (!gate.ok) return gate
+
+  const { data, error } = await supabase
+    .from('workspace_documents')
+    .select('doc_type, updated_at')
+    .eq('organization_id', organizationId)
+  if (error) return { ok: false, error: error.message }
+
+  const versions: WorkspaceVersions = {
+    slots: null,
+    panels: null,
+    ui: null,
+    role_permissions: null,
+  }
+  for (const row of data ?? []) {
+    const t = row.doc_type as WorkspaceDocType
+    if (
+      t === 'slots' ||
+      t === 'panels' ||
+      t === 'ui' ||
+      t === 'role_permissions'
+    ) {
+      versions[t] = row.updated_at
+    }
+  }
+  return { ok: true, versions }
+}

@@ -21,6 +21,44 @@
   --panel-below-calendar-list-min: 14rem;
 }
 
+.workspace-remote-stale-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem 1rem;
+  margin: 0 0 0.85rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-subtle));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface-2));
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: var(--text-h);
+}
+
+.workspace-remote-stale-banner__text {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.btn-workspace-reload {
+  flex-shrink: 0;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.35rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  cursor: pointer;
+}
+
+.btn-workspace-reload:hover {
+  filter: brightness(1.04);
+}
+
 .app-body {
   display: flex;
   flex-direction: column;
