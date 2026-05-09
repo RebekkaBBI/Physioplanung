@@ -86,9 +86,14 @@ const ROOMS = [
   'Physio 2',
   'Gym Area',
   'Cardio',
-  'Behandlung',
+  'Orga/Videocall',
   'Patientenzimmer',
 ] as const
+
+/** Früherer Spaltenname im Hauptkalender — Schlüssel in gespeicherten Daten umbenennen. */
+const LEGACY_MAIN_CALENDAR_ROOM_KEYS: Record<string, string> = {
+  Behandlung: 'Orga/Videocall',
+}
 
 /** Eigener logischer Raum für den OP-Kalender — keine gemeinsamen Slot-Keys mit ROOMS. */
 const OP_TAB_ROOM = 'OP-Saal' as const
@@ -153,6 +158,22 @@ type BelegungsartItem = {
   /** Teammeeting: kein Patient; Teilnehmer als teamStaffIds; erscheint in deren Kalendern */
   teamMeeting?: boolean
 }
+
+const OP_BELEGUNGSART_ID = 'art-op'
+/** OP: feste Art nur für OP-Kalender & Muster-Editor, nicht im Arten-Panel / MA-Profil. */
+const OP_BELEGUNGSART_DEF: BelegungsartItem = {
+  id: OP_BELEGUNGSART_ID,
+  label: 'OP',
+  color: '#991b1b',
+  slots: 1,
+}
+
+function artenWithFixedOpForMuster(artenList: BelegungsartItem[]): BelegungsartItem[] {
+  return artenList.some((a) => a.id === OP_BELEGUNGSART_ID)
+    ? artenList
+    : [...artenList, OP_BELEGUNGSART_DEF]
+}
+
 /** Pro Slot im Muster-Editor; Schlüssel `woche|wd|Raum|slot` (woche 0–2, wd 0=Mo … 6=So). Ältere Daten `wd|Raum|slot` = Woche 0. */
 type MusterTemplateCell = {
   art?: string
@@ -376,6 +397,62 @@ function makeSlotKey(dateKeyStr: string, room: string, slotIndex: number): strin
   return `${dateKeyStr}|${room}|${slotIndex}`
 }
 
+function migrateLegacyRoomSegment(room: string): string {
+  return LEGACY_MAIN_CALENDAR_ROOM_KEYS[room] ?? room
+}
+
+/** Kalender-Schlüssel `yyyy-mm-dd|Raum|slot`: alten Raumnamen auf aktuellen Stand bringen. */
+function migrateLegacyRoomNamesInSlotMap(
+  cells: Record<string, CellData>,
+): Record<string, CellData> {
+  let anyRenamed = false
+  const out: Record<string, CellData> = {}
+  for (const [k, v] of Object.entries(cells)) {
+    const parts = k.split('|')
+    if (parts.length < 3 || !/^\d{4}-\d{2}-\d{2}$/.test(parts[0]!)) {
+      out[k] = v
+      continue
+    }
+    const dk = parts[0]!
+    const slot = Number(parts[parts.length - 1])
+    const room = parts[parts.length - 2]!
+    const newRoom = migrateLegacyRoomSegment(room)
+    const nk =
+      newRoom !== room && Number.isInteger(slot)
+        ? makeSlotKey(dk, newRoom, slot)
+        : k
+    if (nk !== k) anyRenamed = true
+    out[nk] = v
+  }
+  return anyRenamed ? out : cells
+}
+
+function migrateLegacyRoomInMusterTemplateKey(key: string): string {
+  const parts = key.split('|')
+  if (parts.length === 4) {
+    const [w, wd, room, sl] = parts
+    const nr = migrateLegacyRoomSegment(room)
+    if (nr !== room) return `${w}|${wd}|${nr}|${sl}`
+  } else if (parts.length === 3) {
+    const [wd, room, sl] = parts
+    const nr = migrateLegacyRoomSegment(room)
+    if (nr !== room) return `${wd}|${nr}|${sl}`
+  }
+  return key
+}
+
+function migrateLegacyRoomNamesInMusterTemplates(
+  list: BelegungsmusterItem[],
+): BelegungsmusterItem[] {
+  return list.map((m) => {
+    const tc: Record<string, MusterTemplateCell> = {}
+    for (const [k, cell] of Object.entries(m.templateCells ?? {})) {
+      tc[migrateLegacyRoomInMusterTemplateKey(k)] = cell
+    }
+    return { ...m, templateCells: tc }
+  })
+}
+
 function parseDateKey(dk: string): Date {
   const [y, m, d] = dk.split('-').map(Number)
   return new Date(y, m - 1, d, 12, 0, 0)
@@ -530,9 +607,21 @@ function findArtIdForCell(
   artenList: BelegungsartItem[],
 ): string | undefined {
   if (!cur) return undefined
-  if (cur.artId) return cur.artId
-  if (cur.art) return artenList.find((a) => a.label === cur.art)?.id
+  if (cur.artId) {
+    if (cur.artId === OP_BELEGUNGSART_ID) return OP_BELEGUNGSART_ID
+    return artenList.some((a) => a.id === cur.artId) ? cur.artId : undefined
+  }
+  if (cur.art) {
+    const lab = cur.art.trim()
+    if (lab === OP_BELEGUNGSART_DEF.label) return OP_BELEGUNGSART_ID
+    return artenList.find((a) => a.label === cur.art)?.id
+  }
   return undefined
+}
+
+/** OP zählt nicht zur MA-Freigabe; nur echte Katalog-Arten prüfen. */
+function staffProfileMustAllowArt(artId: string): boolean {
+  return artId !== OP_BELEGUNGSART_ID
 }
 
 /** Patient im Termin, aber noch keine gültige Belegungsart aus dem Katalog. */
@@ -656,6 +745,17 @@ function artFromPanelBlockedReason(
   /** OP-Kalender: keine Pflicht, dass ein freier MA die ganze Spanne abdeckt (außer MA ist schon auf dem Termin). */
   opTab = false,
 ): string | null {
+  const isOpCalendarArt = a.id === OP_BELEGUNGSART_ID
+  if (isOpCalendarArt && !opTab) {
+    return 'Die Belegungsart OP ist nur im OP-Kalender verfügbar.'
+  }
+  if (opTab && isTeamMeetingArt(a)) {
+    return 'Im OP-Kalender sind keine Teammeetings möglich.'
+  }
+  if (opTab && !isOpCalendarArt) {
+    return 'Im OP-Kalender ist nur die Belegungsart OP erlaubt.'
+  }
+
   const wd = weekdayMon0FromDate(parseDateKey(dk))
   const max = slotCount()
   const span = Math.min(Math.max(1, a.slots), max - startSlot)
@@ -712,7 +812,7 @@ function artFromPanelBlockedReason(
       if (!isStaffSlotAvailable(st, wd, startSlot + i, dk)) {
         return 'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.'
       }
-      if (!staffHasArtAllowed(st, a.id)) {
+      if (staffProfileMustAllowArt(a.id) && !staffHasArtAllowed(st, a.id)) {
         return 'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.'
       }
     }
@@ -726,14 +826,18 @@ function artFromPanelBlockedReason(
     startSlot,
     span,
   )
-  const skipPoolStaffRequirement = opTab && uniqueStaff.size === 0
+  const skipPoolStaffRequirement =
+    opTab && (uniqueStaff.size === 0 || isOpCalendarArt)
   if (!skipPoolStaffRequirement && canTreat.length === 0) {
     return 'Kein Mitarbeiter mit Freigabe für diese Belegungsart ist in diesem Zeitraum durchgehend verfügbar.'
   }
 
   if (uniqueStaff.size === 1) {
     const sid = [...uniqueStaff][0]!
-    if (!canTreat.some((c) => c.id === sid)) {
+    if (
+      staffProfileMustAllowArt(a.id) &&
+      !canTreat.some((c) => c.id === sid)
+    ) {
       return 'Der eingetragene Mitarbeiter ist für diese Belegungsart oder den gewählten Zeitraum nicht geeignet.'
     }
   }
@@ -750,6 +854,9 @@ function cellIsValidArtPanelDropPreview(
   staffList: MitarbeiterItem[],
   opTab = false,
 ): boolean {
+  if (opTab && isTeamMeetingArt(a)) return false
+  if (opTab && a.id !== OP_BELEGUNGSART_ID) return false
+  if (!opTab && a.id === OP_BELEGUNGSART_ID) return false
   if (isTeamMeetingArt(a)) {
     return (
       teamMeetingFromPanelBlockedReason(cells, dk, room, startSlot, a) === null
@@ -793,7 +900,11 @@ function extensionSlotError(
       if (!isStaffSlotAvailable(st, wd, slot, dk)) {
         return 'Ein Teamteilnehmer ist zu dieser Zeit in seinem Wochenplan nicht verfügbar.'
       }
-      if (artId && !st.allowedArtIds.includes(artId)) {
+      if (
+        artId &&
+        staffProfileMustAllowArt(artId) &&
+        !st.allowedArtIds.includes(artId)
+      ) {
         return 'Die Belegungsart ist für einen Teamteilnehmer in seinem Profil nicht freigegeben.'
       }
     }
@@ -808,7 +919,11 @@ function extensionSlotError(
       return 'Zu dieser Zeit ist der Mitarbeiter in seinem Wochenplan nicht verfügbar.'
     }
     const artId = findArtIdForCell(template, artenList)
-    if (artId && !st.allowedArtIds.includes(artId)) {
+    if (
+      artId &&
+      staffProfileMustAllowArt(artId) &&
+      !st.allowedArtIds.includes(artId)
+    ) {
       return 'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.'
     }
   }
@@ -975,9 +1090,10 @@ function migrateMitarbeiter(
     }
   }
   /* Nur wenn das Feld in den Stammdaten fehlt (ältere Daten): alle Arten. Explizit [] bleibt []. */
-  const allowedArtIds = Array.isArray(raw.allowedArtIds)
+  let allowedArtIds = Array.isArray(raw.allowedArtIds)
     ? [...raw.allowedArtIds]
     : [...allArtIds]
+  allowedArtIds = allowedArtIds.filter((id) => id !== OP_BELEGUNGSART_ID)
   if (!allowedArtIds.includes(TEAM_MEETING_ART_ID)) {
     allowedArtIds.push(TEAM_MEETING_ART_ID)
   }
@@ -1011,7 +1127,7 @@ function migrateMitarbeiter(
   }
 }
 
-/** Fehlende Einträge aus DEFAULT_ARTEN anhängen (Migration neuer Katalog-Arten). */
+/** Fehlende Einträge aus DEFAULT_ARTEN anhängen (Migration neuer Katalog-Arten bei alter Speicherversion). */
 function ensureDefaultArtenMigratedIntoCatalog(
   list: BelegungsartItem[],
 ): BelegungsartItem[] {
@@ -1037,9 +1153,20 @@ const STORAGE_PANELS = 'physio-planung-panels-v1'
 /** Ansicht & Kalenderdatum (Auto-Save bei jeder Änderung) */
 const STORAGE_UI = 'physio-planung-ui-v1'
 /** Erhöhen, wenn sich die feste Belegungsarten-Liste ändert (Migration aus localStorage). */
-const ARTEN_CATALOG_VERSION = 5
+const ARTEN_CATALOG_VERSION = 6
 
-const OP_BELEGUNGSART_ID = 'art-op'
+/**
+ * Nur bei gespeicherter Katalog-Version &lt; ARTEN_CATALOG_VERSION: neue Standard-Arten nachziehen.
+ * Bei aktueller Version: gespeicherte Liste unverändert (vom Nutzer gelöschte Standard-Arten bleiben weg).
+ */
+function mergeArtenCatalogOnLoad(
+  list: BelegungsartItem[],
+  storedCatalogVersion: number,
+): BelegungsartItem[] {
+  if (storedCatalogVersion >= ARTEN_CATALOG_VERSION) return list
+  return ensureDefaultArtenMigratedIntoCatalog(list)
+}
+
 const TEAM_MEETING_ART_ID = 'art-team-meeting'
 
 /** Hauptkalender: Belegungsarten, die im Termindialog als wöchentliche Reihe (gleiche Uhrzeit) angelegt werden können. */
@@ -1133,6 +1260,7 @@ function resolveStaffForBookedSpan(
   const artId = findArtIdForCell(anchorCell, artenList)
   if (
     !artId ||
+    artId === OP_BELEGUNGSART_ID ||
     artId === TEAM_MEETING_ART_ID ||
     artId === MUSTER_PAUSE_ART_ID ||
     artId === '__muster_anchor_hold__'
@@ -1375,7 +1503,6 @@ const DEFAULT_ARTEN: BelegungsartItem[] = [
   { id: 'art-gait-training', label: 'Gait training', color: '#16a34a', slots: 2 },
   { id: 'art-gymarea', label: 'GymArea', color: '#9333ea', slots: 2 },
   { id: 'art-shockwave', label: 'Shockwave', color: '#dc2626', slots: 2 },
-  { id: 'art-op', label: 'OP', color: '#991b1b', slots: 1 },
   { id: 'art-hbot', label: 'HBOT', color: '#0891b2', slots: 2 },
   { id: 'art-clicking', label: 'Clicking', color: '#a855f7', slots: 4 },
   { id: 'art-orga', label: 'Orga', color: '#64748b', slots: 2 },
@@ -1424,33 +1551,31 @@ function buildOberschenkelOpWeekdayTemplate(
   return out
 }
 
-const _defaultOpArt = DEFAULT_ARTEN.find((a) => a.id === OP_BELEGUNGSART_ID)!
-
 const DEFAULT_MUSTER: BelegungsmusterItem[] = [
   {
     id: 'muster-oberschenkel-op-dienstag',
     label: 'Oberschenkelverlängerung OP Tag Dienstag',
-    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 1),
+    templateCells: buildOberschenkelOpWeekdayTemplate(OP_BELEGUNGSART_DEF, 1),
   },
   {
     id: 'muster-unterschenkel-op-dienstag',
     label: 'Unterschenkelverlängerung OP Tag Dienstag',
-    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 1),
+    templateCells: buildOberschenkelOpWeekdayTemplate(OP_BELEGUNGSART_DEF, 1),
   },
   {
     id: 'muster-oberschenkel-op-mittwoch',
     label: 'Oberschenkelverlängerung OP Tag Mittwoch',
-    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 2),
+    templateCells: buildOberschenkelOpWeekdayTemplate(OP_BELEGUNGSART_DEF, 2),
   },
   {
     id: 'muster-unterschenkel-op-mittwoch',
     label: 'Unterschenkelverlängerung OP Tag Mittwoch',
-    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 2),
+    templateCells: buildOberschenkelOpWeekdayTemplate(OP_BELEGUNGSART_DEF, 2),
   },
   {
     id: 'muster-oberschenkel-op-freitag',
     label: 'Oberschenkelverlängerung OP Tag Freitag',
-    templateCells: buildOberschenkelOpWeekdayTemplate(_defaultOpArt, 4, 4),
+    templateCells: buildOberschenkelOpWeekdayTemplate(OP_BELEGUNGSART_DEF, 4, 4),
   },
   {
     id: 'muster-verlaengerungswoche',
@@ -1487,7 +1612,8 @@ function loadSlotCells(): Record<string, CellData> {
     const v2 = localStorage.getItem(STORAGE_KEY_V2)
     if (v2) {
       const o = JSON.parse(v2) as Record<string, CellData>
-      return o && typeof o === 'object' ? o : {}
+      const raw = o && typeof o === 'object' ? o : {}
+      return migrateLegacyRoomNamesInSlotMap(raw)
     }
     const v1 = localStorage.getItem(STORAGE_KEY_V1)
     if (v1) {
@@ -1498,7 +1624,7 @@ function loadSlotCells(): Record<string, CellData> {
           out[k] = { art: 'Belegung' }
         }
       }
-      return out
+      return migrateLegacyRoomNamesInSlotMap(out)
     }
   } catch {
     /* ignore */
@@ -1512,7 +1638,7 @@ function saveSlotCells(next: Record<string, CellData>) {
 
 function parseSlotCellsFromUnknown(parsed: unknown): Record<string, CellData> {
   if (!parsed || typeof parsed !== 'object') return {}
-  return parsed as Record<string, CellData>
+  return migrateLegacyRoomNamesInSlotMap(parsed as Record<string, CellData>)
 }
 
 function normalizeMusterUsageCountById(raw: unknown): Record<string, number> {
@@ -1664,14 +1790,24 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
     ptZoomKommentar?: unknown
     ptZoomAbschluss?: unknown
   }
+  const storedCatalogVersion = o.artenCatalogVersion ?? 0
   const catalogOk =
-    (o.artenCatalogVersion ?? 0) >= ARTEN_CATALOG_VERSION &&
+    storedCatalogVersion >= ARTEN_CATALOG_VERSION &&
     Array.isArray(o.arten) &&
     o.arten.length > 0
-  const resolvedArten = ensureDefaultArtenMigratedIntoCatalog(
+  const resolvedArten = mergeArtenCatalogOnLoad(
     catalogOk ? o.arten! : DEFAULT_ARTEN,
-  )
+    storedCatalogVersion,
+  ).filter((a) => a.id !== OP_BELEGUNGSART_ID)
   const artIdsForMigrate = resolvedArten.map((a) => a.id)
+  const musterRaw = ensureVerlaengerungswocheMusterPreset(
+    ensureOberschenkelOpMusterPreset(
+      Array.isArray(o.muster)
+        ? o.muster.map(normalizeMusterItem)
+        : DEFAULT_MUSTER,
+      resolvedArten,
+    ),
+  )
   return {
     patients: Array.isArray(o.patients)
       ? normalizePatientsUniqueIds(
@@ -1682,13 +1818,9 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
         )
       : normalizePatientsUniqueIds(DEFAULT_PATIENTS),
     arten: resolvedArten,
-    muster: ensureVerlaengerungswocheMusterPreset(
-      ensureOberschenkelOpMusterPreset(
-        Array.isArray(o.muster)
-          ? o.muster.map(normalizeMusterItem)
-          : DEFAULT_MUSTER,
-        resolvedArten,
-      ),
+    muster: stripOrphanArtsFromMusterTemplates(
+      migrateLegacyRoomNamesInMusterTemplates(musterRaw),
+      resolvedArten,
     ),
     mitarbeiter: Array.isArray(o.mitarbeiter)
       ? o.mitarbeiter
@@ -2892,7 +3024,10 @@ function normalizeMusterTemplateCellForIdentity(
   let id = cell.artId
   if (!id && cell.art?.trim()) {
     const t = cell.art.trim()
-    id = artenList.find((a) => a.label.trim() === t)?.id
+    id =
+      t === OP_BELEGUNGSART_DEF.label
+        ? OP_BELEGUNGSART_ID
+        : artenList.find((a) => a.label.trim() === t)?.id
   }
   if (!id) return { ...cell }
   if (id === OP_BELEGUNGSART_ID || id === MUSTER_PAUSE_ART_ID) return { ...cell }
@@ -2968,6 +3103,9 @@ function musterTemplateArtSlotCountsFullCatalog(
     if (!cell.art?.trim() && !cell.artId) continue
     const id =
       cell.artId ??
+      (cell.art?.trim() === OP_BELEGUNGSART_DEF.label
+        ? OP_BELEGUNGSART_ID
+        : undefined) ??
       artenList.find((a) => a.label === cell.art)?.id ??
       null
     if (!id || id === OP_BELEGUNGSART_ID || id === MUSTER_PAUSE_ART_ID) continue
@@ -4367,7 +4505,11 @@ function cellMapApplyMove(
           )
           return null
         }
-        if (artId && !st.allowedArtIds.includes(artId)) {
+        if (
+          artId &&
+          staffProfileMustAllowArt(artId) &&
+          !st.allowedArtIds.includes(artId)
+        ) {
           alertOnce(
             'Die Belegungsart ist für einen Teamteilnehmer in seinem Profil nicht freigegeben.',
           )
@@ -4390,7 +4532,11 @@ function cellMapApplyMove(
           return null
         }
         const artId = findArtIdForCell(cell, arten)
-        if (artId && !st.allowedArtIds.includes(artId)) {
+        if (
+          artId &&
+          staffProfileMustAllowArt(artId) &&
+          !st.allowedArtIds.includes(artId)
+        ) {
           alertOnce(
             'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
           )
@@ -4571,13 +4717,12 @@ function normalizeMusterItem(raw: unknown): BelegungsmusterItem {
   }
 }
 
-/** Fehlende Standard-Muster nachziehen (z. B. nach Update), sofern Belegungsart OP existiert */
+/** Fehlende Standard-Muster nachziehen (z. B. nach Update); OP-Tag immer mit fester OP-Definition. */
 function ensureOberschenkelOpMusterPreset(
   list: BelegungsmusterItem[],
-  artenList: BelegungsartItem[],
+  _artenList: BelegungsartItem[],
 ): BelegungsmusterItem[] {
-  const opArt = artenList.find((a) => a.id === OP_BELEGUNGSART_ID)
-  if (!opArt) return list
+  const opArt = OP_BELEGUNGSART_DEF
   const prefix: BelegungsmusterItem[] = []
   if (!list.some((m) => m.id === 'muster-oberschenkel-op-dienstag')) {
     prefix.push({
@@ -4632,6 +4777,30 @@ function ensureVerlaengerungswocheMusterPreset(
     return [...list.slice(0, m1Idx), entry, ...list.slice(m1Idx)]
   }
   return [...list, entry]
+}
+
+/** Zellen mit nicht mehr existierender Belegungsart leeren (künftige Muster-Buchungen ohne „Geister-Art“). */
+function stripOrphanArtsFromMusterTemplates(
+  list: BelegungsmusterItem[],
+  artenList: BelegungsartItem[],
+): BelegungsmusterItem[] {
+  return list.map((m) => {
+    const nextCells: Record<string, MusterTemplateCell> = {}
+    for (const [k, cell] of Object.entries(m.templateCells ?? {})) {
+      if (!cell?.art?.trim() && !cell?.artId) {
+        nextCells[k] = cell
+        continue
+      }
+      const probe: CellData = {
+        art: cell.art,
+        artId: cell.artId,
+        artColor: cell.artColor,
+      }
+      if (findArtIdForCell(probe, artenList)) nextCells[k] = cell
+      else nextCells[k] = {}
+    }
+    return { ...m, templateCells: nextCells }
+  })
 }
 
 function parseDragPayload(dt: DataTransfer): DragPayload | null {
@@ -5641,13 +5810,16 @@ function listKollisionPanelItems(
     if (seen.has(anchorKey)) continue
     const anchor = cells[anchorKey]
     if (!anchor?.patient?.trim()) continue
-    if (findStaffForCell(anchor, staffList)) continue
     const needsArt = patientTerminNeedsArtChoice(anchor, artenList)
+    const hasStaff = !!findStaffForCell(anchor, staffList)
+    if (hasStaff && !needsArt) continue
     const kind: KollisionPanelItem['kind'] = needsArt
       ? 'termin-unvollständig'
       : 'termin-ohne-mitarbeiter'
     const tag = needsArt
-      ? 'Ohne Belegungsart & Mitarbeiter'
+      ? hasStaff
+        ? 'Belegungsart wählen'
+        : 'Ohne Belegungsart & Mitarbeiter'
       : 'Mitarbeiter zuteilen'
     seen.add(anchorKey)
     const when = formatKollisionDatumZeile(p.dk, p.room, start)
@@ -6262,13 +6434,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const [mitarbeiter, setMitarbeiter] = useState<MitarbeiterItem[]>(
     () => initialPanels?.mitarbeiter ?? DEFAULT_MITARBEITER,
   )
-  // Katalog-Migration auch nach Hot-Reload / bestehendem State erzwingen
+  // Fehlende Profil-Freigaben für feste Sonder-Arten (Clicking/Orga/…), nur wenn die Art im Katalog existiert
   useEffect(() => {
-    setArten((prev) => ensureDefaultArtenMigratedIntoCatalog(prev))
     setMitarbeiter((prev) =>
       prev.map((s) => {
         const add = STAFF_AUTO_ALLOWED_ART_IDS.filter(
-          (id) => !s.allowedArtIds.includes(id),
+          (id) =>
+            !s.allowedArtIds.includes(id) && arten.some((x) => x.id === id),
         )
         if (add.length === 0) return s
         return { ...s, allowedArtIds: [...s.allowedArtIds, ...add] }
@@ -6798,18 +6970,24 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     [slotCells, arten, mitarbeiter],
   )
 
-  /** Panel: nach Häufigkeit im Hauptkalender (Slot-Zellen), bei Gleichstand Katalogreihenfolge */
+  const artenForMusterEditor = useMemo(
+    () => artenWithFixedOpForMuster(arten),
+    [arten],
+  )
+
+  /** Panel: nach Häufigkeit im Hauptkalender (Slot-Zellen), bei Gleichstand Katalogreihenfolge (ohne OP) */
   const artenSortedForPanel = useMemo(() => {
+    const panelArten = arten.filter((a) => a.id !== OP_BELEGUNGSART_ID)
     const counts = new Map<string, number>()
-    for (const a of arten) counts.set(a.id, 0)
+    for (const a of panelArten) counts.set(a.id, 0)
     for (const d of Object.values(slotCells)) {
       if (!isCellBooked(d)) continue
       const id = findArtIdForCell(d, arten)
-      if (!id) continue
+      if (!id || id === OP_BELEGUNGSART_ID) continue
       counts.set(id, (counts.get(id) ?? 0) + 1)
     }
-    const indexById = new Map(arten.map((a, i) => [a.id, i] as const))
-    return [...arten].sort((a, b) => {
+    const indexById = new Map(panelArten.map((a, i) => [a.id, i] as const))
+    return [...panelArten].sort((a, b) => {
       const ca = counts.get(a.id) ?? 0
       const cb = counts.get(b.id) ?? 0
       if (cb !== ca) return cb - ca
@@ -7106,12 +7284,23 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       payload: PanelDragPayload,
     ) => {
       const patientById = (id: string) => patients.find((p) => p.id === id)
-      const artById = (id: string) => arten.find((a) => a.id === id)
+      const artById = (id: string) =>
+        arten.find((a) => a.id === id) ??
+        (id === OP_BELEGUNGSART_ID ? OP_BELEGUNGSART_DEF : undefined)
       const musterById = (id: string) => muster.find((m) => m.id === id)
       const staffById = (id: string) => mitarbeiter.find((s) => s.id === id)
       const wd = weekdayMon0FromDate(parseDateKey(dk))
 
       if (payload.kind === 'art') {
+        if (calendarTabId === CALENDAR_TAB_OP) {
+          if (payload.id !== OP_BELEGUNGSART_ID) {
+            alertOnce('Im OP-Kalender ist nur die Belegungsart OP erlaubt.')
+            return
+          }
+        } else if (payload.id === OP_BELEGUNGSART_ID) {
+          alertOnce('Die Belegungsart OP ist nur im OP-Kalender verfügbar.')
+          return
+        }
         const a = artById(payload.id)
         if (!a) return
         const blocked = isTeamMeetingArt(a)
@@ -7326,7 +7515,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               m.templateCells,
               patientN,
               patientC,
-              arten,
+              artenForMusterEditor,
               mitarbeiter,
               { dk, room, slotIndex: blockStart },
               effectiveMusterTemplateWeekCount(m),
@@ -7420,7 +7609,11 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             const kk = makeSlotKey(dk, room, sl)
             const curSl = prev[kk]
             const artId = findArtIdForCell(curSl, arten)
-            if (artId && !staffHasArtAllowed(s, artId)) {
+            if (
+              artId &&
+              staffProfileMustAllowArt(artId) &&
+              !staffHasArtAllowed(s, artId)
+            ) {
               alertOnce(
                 'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
               )
@@ -7442,6 +7635,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     [
       patients,
       arten,
+      artenForMusterEditor,
       muster,
       mitarbeiter,
       calendarTabId,
@@ -7563,7 +7757,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               m.templateCells,
               patientN,
               patientC,
-              arten,
+              artenForMusterEditor,
               mitarbeiter,
               { dk, room: OP_TAB_ROOM, slotIndex: blockStart },
               effectiveMusterTemplateWeekCount(m),
@@ -7657,6 +7851,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       applyMoveBlock,
       muster,
       arten,
+      artenForMusterEditor,
       mitarbeiter,
       calendarTabId,
       setSlotCells,
@@ -7759,7 +7954,11 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           const k = makeSlotKey(dk, room, sl)
           const cur = prev[k]
           const artId = findArtIdForCell(cur, arten)
-          if (artId && !staffHasArtAllowed(s, artId)) {
+          if (
+            artId &&
+            staffProfileMustAllowArt(artId) &&
+            !staffHasArtAllowed(s, artId)
+          ) {
             alertOnce(
               'Diese Belegungsart ist für den Mitarbeiter in seinem Profil nicht freigegeben.',
             )
@@ -8487,7 +8686,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         m.templateCells,
         patientN,
         patientC || undefined,
-        arten,
+        artenForMusterEditor,
         mitarbeiter,
         { dk, room, slotIndex: start },
         effectiveMusterTemplateWeekCount(m),
@@ -8514,7 +8713,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     opTerminPatientDraft,
     opTerminPatientCodeDraft,
     muster,
-    arten,
+    artenForMusterEditor,
     mitarbeiter,
     setSlotCells,
     cloudSyncEnabled,
@@ -8853,7 +9052,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const draggedArtForPreview = useMemo(
     () =>
       artDragHighlight
-        ? arten.find((x) => x.id === artDragHighlight.artId)
+        ? (arten.find((x) => x.id === artDragHighlight.artId) ??
+          (artDragHighlight.artId === OP_BELEGUNGSART_ID
+            ? OP_BELEGUNGSART_DEF
+            : undefined))
         : undefined,
     [artDragHighlight, arten],
   )
@@ -8863,8 +9065,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     if (calendarTabId !== 'main' && calendarTabId !== CALENDAR_TAB_OP)
       return null
     if (calendarTabId === 'main' && viewMode !== 'day') return null
-    const a = arten.find((x) => x.id === artDragHighlight.artId)
+    const a =
+      arten.find((x) => x.id === artDragHighlight.artId) ??
+      (artDragHighlight.artId === OP_BELEGUNGSART_ID
+        ? OP_BELEGUNGSART_DEF
+        : undefined)
     if (!a) return null
+    if (calendarTabId === 'main' && a.id === OP_BELEGUNGSART_ID) return null
+    if (calendarTabId === CALENDAR_TAB_OP && a.id !== OP_BELEGUNGSART_ID)
+      return null
     const fullKeys = new Set<string>()
     const partialKeys = new Set<string>()
     const dkList =
@@ -9365,7 +9574,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         ? { ...s.availabilityOddWeek }
         : emptyStaffAvailability(slotCount()),
     )
-    setStaffDraftArtIds([...s.allowedArtIds])
+    setStaffDraftArtIds(
+      s.allowedArtIds.filter((id) => id !== OP_BELEGUNGSART_ID),
+    )
     setStaffModal({ mode: 'edit', id })
   }
 
@@ -9640,13 +9851,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     }
     if (
       !window.confirm(
-        `Belegungsart „${a.label}“ wirklich entfernen? Sie wird bei allen Mitarbeitern aus den Freigaben gelöscht und aus betroffenen Terminzellen entfernt.`,
+        `Belegungsart „${a.label}“ wirklich entfernen? Sie wird bei allen Mitarbeitern aus den Freigaben gelöscht, aus Mustern und aus betroffenen Terminzellen entfernt. Patiententermine ohne gültige Art erscheinen im Panel „Kollision“ (Belegungsart wählen).`,
       )
     ) {
       return
     }
     if (editingArtId === a.id) cancelEditArt()
-    setArten((prev) => prev.filter((x) => x.id !== a.id))
+    const nextArten = arten.filter((x) => x.id !== a.id)
+    setArten(nextArten)
+    setMuster((prev) => stripOrphanArtsFromMusterTemplates(prev, nextArten))
     setMitarbeiter((prev) =>
       prev.map((s) => ({
         ...s,
@@ -9658,7 +9871,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       const next = { ...prev }
       for (const k of Object.keys(next)) {
         const c = next[k]
-        if (c?.artId === a.id) {
+        const matchesArt =
+          c?.artId === a.id ||
+          (!!c?.art?.trim() && c.art.trim() === a.label.trim())
+        if (matchesArt) {
           const { art: _a, artId: _aid, artColor: _ac, ...rest } = c
           const merged = rest as CellData
           if (!isCellBooked(merged)) delete next[k]
@@ -9691,7 +9907,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     (artId: string) => {
       setMusterArtPicker((pick) => {
         if (!pick) return null
-        const a = arten.find((x) => x.id === artId)
+        const a = artenForMusterEditor.find((x) => x.id === artId)
         if (a) {
           setMusterDraftCells((prev) => {
             const k = makeSlotKey(pick.dk, pick.room, pick.anchorSlot)
@@ -9712,7 +9928,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         return null
       })
     },
-    [arten],
+    [artenForMusterEditor],
   )
 
   const openMusterModalCreate = useCallback(() => {
@@ -9736,12 +9952,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     setMusterHighlightArtId(null)
     setMusterDraftCells(
       injectMusterPauseSlots(
-        musterTemplateToVirtual(m.templateCells, arten),
+        musterTemplateToVirtual(m.templateCells, artenForMusterEditor),
         tw,
       ),
     )
     setMusterModal({ mode: 'edit', id: m.id, templateWeekCount: tw })
-  }, [cloudSyncEnabled, mayMusterWrite, arten])
+  }, [cloudSyncEnabled, mayMusterWrite, artenForMusterEditor])
 
   const saveMusterModal = useCallback(() => {
     if (cloudSyncEnabled && !mayMusterWrite) return
@@ -9836,7 +10052,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             dk,
             room,
             sl,
-            arten,
+            artenForMusterEditor,
             mitarbeiter,
             { blockLunchPauseAsMoveTarget: true },
           ) ?? prev,
@@ -9851,21 +10067,21 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             room,
             sl,
             payload,
-            arten,
+            artenForMusterEditor,
             mitarbeiter,
           ) ?? prev,
         )
         return
       }
       if (payload.kind === 'art') {
-        const a = arten.find((x) => x.id === payload.id)
+        const a = artenForMusterEditor.find((x) => x.id === payload.id)
         if (!a) return
         setMusterDraftCells((prev) =>
           applyArtDropNoPatient(prev, dk, room, sl, a) ?? prev,
         )
       }
     },
-    [arten, mitarbeiter],
+    [artenForMusterEditor, mitarbeiter],
   )
 
   const clearMusterDraftBlock = useCallback((dk: string, room: Room, sl: number) => {
@@ -10374,7 +10590,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   const musterHighlightColor = useMemo(() => {
     if (!musterHighlightArtId) return undefined
-    return arten.find((a) => a.id === musterHighlightArtId)?.color
+    return (
+      arten.find((a) => a.id === musterHighlightArtId)?.color ??
+      (musterHighlightArtId === OP_BELEGUNGSART_ID
+        ? OP_BELEGUNGSART_DEF.color
+        : undefined)
+    )
   }, [musterHighlightArtId, arten])
 
   const musterModalOverlay =
@@ -10541,10 +10762,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                   ersetzt.
                 </p>
                 <ul className="termin-staff-pick-list">
-                  {arten.length === 0 ? (
+                  {artenForMusterEditor.length === 0 ? (
                     <li className="muted">Keine Belegungsarten angelegt.</li>
                   ) : (
-                    arten.map((a) => (
+                    artenForMusterEditor.map((a) => (
                       <li key={a.id}>
                         <button
                           type="button"
