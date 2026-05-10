@@ -98,7 +98,16 @@ const LEGACY_MAIN_CALENDAR_ROOM_KEYS: Record<string, string> = {
 /** Eigener logischer Raum für den OP-Kalender — keine gemeinsamen Slot-Keys mit ROOMS. */
 const OP_TAB_ROOM = 'OP-Saal' as const
 
-type Room = (typeof ROOMS)[number] | typeof OP_TAB_ROOM
+/**
+ * Virtuelle „Spalte“ im Muster-Editor: eine Zeitleiste pro Tag; echte Räume werden
+ * beim Anwenden des Musters aus den Belegungsarten zufällig gewählt.
+ */
+const MUSTER_EDITOR_LANE_ROOM = '__MUSTER_LANE__' as const
+
+type Room =
+  | (typeof ROOMS)[number]
+  | typeof OP_TAB_ROOM
+  | typeof MUSTER_EDITOR_LANE_ROOM
 
 /** Spalten des Hauptkalenders (ohne OP-Saal). */
 type MainCalendarRoom = (typeof ROOMS)[number]
@@ -228,8 +237,15 @@ function artAllowedInMainCalendarRoom(art: BelegungsartItem, room: Room): boolea
   return artEffectiveAllowedRooms(art).includes(room)
 }
 
-/** Muster-Raster: nur Spalten aus ROOMS; OP-Zellen dürfen in jeder Spalte liegen. */
+/**
+ * Muster-Editor: echte Räume oder MUSTER_EDITOR_LANE_ROOM (eine Spalte pro Tag).
+ * OP-Zellen dürfen überall im Raster liegen.
+ */
 function artAllowedInMusterGridRoom(art: BelegungsartItem, room: Room): boolean {
+  if (room === MUSTER_EDITOR_LANE_ROOM) {
+    if (art.id === OP_BELEGUNGSART_ID) return true
+    return artEffectiveAllowedRooms(art).length > 0
+  }
   if (!isMainCalendarRoomName(room)) return false
   if (art.id === OP_BELEGUNGSART_ID) return true
   return artEffectiveAllowedRooms(art).includes(room)
@@ -242,7 +258,11 @@ function formatArtRoomSummary(art: BelegungsartItem): string {
   return r.join(', ')
 }
 
-/** Pro Slot im Muster-Editor; Schlüssel `woche|wd|Raum|slot` (woche 0–2, wd 0=Mo … 6=So). Ältere Daten `wd|Raum|slot` = Woche 0. */
+/**
+ * Pro Slot im Muster-Editor; Schlüssel `woche|wd|Raum|slot` (woche 0–2, wd 0=Mo … 6=So).
+ * Raum ist `__MUSTER_LANE__` (eine Zeitleiste pro Tag); ältere Daten: je `wd|Hauptkalender-Raum|slot`
+ * oder `woche|wd|Hauptkalender-Raum|slot` — werden beim Laden auf einen Eintrag pro Uhrzeit zusammengeführt.
+ */
 type MusterTemplateCell = {
   art?: string
   artId?: string
@@ -1582,10 +1602,8 @@ function injectMusterPauseSlots(
   const p = pauseCellData()
   for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
     const dk = templateDkForDayIndex(dayIndex)
-    for (const room of ROOMS) {
-      for (let sl = PAUSE_START_SLOT; sl < PAUSE_START_SLOT + PAUSE_SLOT_COUNT && sl < max; sl++) {
-        out[makeSlotKey(dk, room, sl)] = { ...p }
-      }
+    for (let sl = PAUSE_START_SLOT; sl < PAUSE_START_SLOT + PAUSE_SLOT_COUNT && sl < max; sl++) {
+      out[makeSlotKey(dk, MUSTER_EDITOR_LANE_ROOM, sl)] = { ...p }
     }
   }
   return out
@@ -1652,9 +1670,9 @@ function buildOberschenkelOpWeekdayTemplate(
   const slotFrom = 0
   const slotTo = Math.min(slotToExclusive, max)
   const out: Record<string, MusterTemplateCell> = {}
-  for (const room of ROOMS) {
-    for (let sl = slotFrom; sl < slotTo; sl++) {
-      out[`${weekIndex}|${weekdayMon0}|${room}|${sl}`] = { ...cell }
+  for (let sl = slotFrom; sl < slotTo; sl++) {
+    out[`${weekIndex}|${weekdayMon0}|${MUSTER_EDITOR_LANE_ROOM}|${sl}`] = {
+      ...cell,
     }
   }
   return out
@@ -3058,8 +3076,40 @@ function formatWeekRange(weekStart: Date): string {
 function isRoomString(x: unknown): x is Room {
   return (
     typeof x === 'string' &&
-    ((ROOMS as readonly string[]).includes(x) || x === OP_TAB_ROOM)
+    ((ROOMS as readonly string[]).includes(x) ||
+      x === OP_TAB_ROOM ||
+      x === MUSTER_EDITOR_LANE_ROOM)
   )
+}
+
+function shuffleArrayInPlace<T>(arr: T[]): T[] {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    const t = arr[i]!
+    arr[i] = arr[j]!
+    arr[j] = t
+  }
+  return arr
+}
+
+/** Für Muster-Anwendung: zufälliger Hauptkalender-Raum aus den erlaubten (optional ohne Anker-Raum). */
+function randomPickAllowedMainRoom(
+  artItem: BelegungsartItem | undefined,
+  roomsFilter: MainCalendarRoom[] | undefined,
+  excludeRoom?: Room,
+): MainCalendarRoom {
+  let pool: MainCalendarRoom[] =
+    roomsFilter && roomsFilter.length > 0
+      ? [...roomsFilter]
+      : artItem
+        ? [...artEffectiveAllowedRooms(artItem)]
+        : [...ROOMS]
+  if (excludeRoom && (ROOMS as readonly string[]).includes(excludeRoom as string)) {
+    const filtered = pool.filter((r) => r !== excludeRoom)
+    if (filtered.length > 0) pool = filtered
+  }
+  shuffleArrayInPlace(pool)
+  return pool[0]!
 }
 
 /** Fiktiver Start (1970) für Muster-Editor: aufeinanderfolgende Tage wie im Plan */
@@ -3104,7 +3154,11 @@ function parseMusterTemplateKey(
       return null
     }
     if (!Number.isInteger(wd) || wd < 0 || wd > 6) return null
-    if (!isRoomString(room) || !Number.isInteger(slot) || slot < 0 || slot >= n) {
+    const roomValid =
+      room === MUSTER_EDITOR_LANE_ROOM ||
+      (ROOMS as readonly string[]).includes(room as string) ||
+      room === OP_TAB_ROOM
+    if (!roomValid || !Number.isInteger(slot) || slot < 0 || slot >= n) {
       return null
     }
     return { weekIndex, wd, room, slot }
@@ -3114,6 +3168,7 @@ function parseMusterTemplateKey(
     const room = parts[1] as Room
     const slot = Number(parts[2])
     if (!Number.isInteger(wd) || wd < 0 || wd > 6) return null
+    if (room === MUSTER_EDITOR_LANE_ROOM) return null
     if (!isRoomString(room) || !Number.isInteger(slot) || slot < 0 || slot >= n) {
       return null
     }
@@ -3153,14 +3208,27 @@ function musterTemplateToVirtual(
 ): Record<string, CellData> {
   const out: Record<string, CellData> = {}
   const arten = artenList?.length ? artenList : null
+  /** Alte Muster: mehrere Räume pro Slot — nur ein Eintrag pro Tag+Uhrzeit (erster gewinnt). */
+  const byDaySlot = new Map<string, MusterTemplateCell>()
   for (const [key, cell] of Object.entries(tpl)) {
     const p = parseMusterTemplateKey(key)
     if (!p) continue
+    if (!cell.art?.trim() && !cell.artId) continue
     const dayIndex = p.weekIndex * 7 + p.wd
+    const mk = `${dayIndex}|${p.slot}`
+    if (!byDaySlot.has(mk)) {
+      byDaySlot.set(
+        mk,
+        arten ? normalizeMusterTemplateCellForIdentity(cell, arten) : { ...cell },
+      )
+    }
+  }
+  for (const [mk, cell] of byDaySlot) {
+    const [dayIndexStr, slotStr] = mk.split('|')
+    const dayIndex = Number(dayIndexStr)
+    const slot = Number(slotStr)
     const dk = templateDkForDayIndex(dayIndex)
-    out[makeSlotKey(dk, p.room, p.slot)] = arten
-      ? normalizeMusterTemplateCellForIdentity(cell, arten)
-      : { ...cell }
+    out[makeSlotKey(dk, MUSTER_EDITOR_LANE_ROOM, slot)] = cell
   }
   return out
 }
@@ -3176,9 +3244,10 @@ function virtualToMusterTemplate(
     const slot = Number(parts[parts.length - 1])
     const room = parts[parts.length - 2] as Room
     const pos = templateWeekAndDayFromDk(dk)
-    if (pos === null || !isRoomString(room)) continue
+    if (pos === null) continue
+    if (room !== MUSTER_EDITOR_LANE_ROOM) continue
     if (!data.art && !data.artId) continue
-    out[`${pos.weekIndex}|${pos.wd}|${room}|${slot}`] = {
+    out[`${pos.weekIndex}|${pos.wd}|${MUSTER_EDITOR_LANE_ROOM}|${slot}`] = {
       art: data.art,
       artId: data.artId,
       artColor: data.artColor,
@@ -3250,50 +3319,51 @@ function tryApplyMusterWeekToSlots(
 ): { next: Record<string, CellData> } | { error: string } {
   const virt = musterTemplateToVirtual(templateCells, artenList)
   const seen = new Set<string>()
-  type Op = { targetKeys: string[]; cells: CellData[] }
+  type Op = {
+    tDk: string
+    idealStart: number
+    cells: CellData[]
+    artItem: BelegungsartItem
+  }
   const ops: Op[] = []
   const max = slotCount()
   const dayCount = templateWeekCount * 7
 
   for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
     const vdk = templateDkForDayIndex(dayIndex)
-    for (const room of ROOMS) {
-      for (let sl = 0; sl < max; sl++) {
-        const k = makeSlotKey(vdk, room, sl)
-        const d = virt[k]
-        if (!isCellBooked(d)) continue
-        if (seen.has(k)) continue
-        const { start, end } = findBlockBounds(virt, vdk, room, sl)
-        const tDk = dateKey(addDays(weekStart, dayIndex))
-        const cells: CellData[] = []
-        const targetKeys: string[] = []
-        for (let s = start; s <= end; s++) {
-          const vk = makeSlotKey(vdk, room, s)
-          seen.add(vk)
-          cells.push({ ...virt[vk]! })
-          targetKeys.push(makeSlotKey(tDk, room, s))
-        }
-        if (
-          musterBlockIsOpOnly(cells, artenList) ||
-          musterBlockIsPauseOnly(cells)
-        ) {
-          continue
-        }
-        const artId0 = findArtIdForCell(cells[0], artenList)
-        if (artId0) {
-          const ai = artenList.find((x) => x.id === artId0)
-          if (
-            ai &&
-            (ROOMS as readonly string[]).includes(room as string) &&
-            !artAllowedInMainCalendarRoom(ai, room)
-          ) {
-            return {
-              error: `Im Muster steht „${ai.label}“ im Raum „${room}“; diese Art ist dort nicht vorgesehen (Belegungsart bearbeiten: Räume).`,
-            }
-          }
-        }
-        ops.push({ targetKeys, cells })
+    const tDk = dateKey(addDays(weekStart, dayIndex))
+    for (let sl = 0; sl < max; sl++) {
+      const k = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, sl)
+      const d = virt[k]
+      if (!isCellBooked(d)) continue
+      if (seen.has(k)) continue
+      const { start, end } = findBlockBounds(
+        virt,
+        vdk,
+        MUSTER_EDITOR_LANE_ROOM,
+        sl,
+      )
+      const cells: CellData[] = []
+      for (let s = start; s <= end; s++) {
+        const vk = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, s)
+        seen.add(vk)
+        cells.push({ ...virt[vk]! })
       }
+      if (
+        musterBlockIsOpOnly(cells, artenList) ||
+        musterBlockIsPauseOnly(cells)
+      ) {
+        continue
+      }
+      const artId0 = findArtIdForCell(cells[0], artenList)
+      const ai = artId0 ? artenList.find((x) => x.id === artId0) : undefined
+      if (!ai) {
+        return {
+          error:
+            'Im Muster ist eine Belegungsart nicht im Katalog — bitte Stammdaten prüfen.',
+        }
+      }
+      ops.push({ tDk, idealStart: start, cells, artItem: ai })
     }
   }
 
@@ -3302,24 +3372,18 @@ function tryApplyMusterWeekToSlots(
   const remappedOps: { targetKeys: string[]; cells: CellData[] }[] = []
 
   for (const op of ops) {
-    const firstK = op.targetKeys[0]!
-    const parts = firstK.split('|')
-    const tDk = parts[0]!
-    const room = parts[parts.length - 2] as Room
-    const startSlot = Number(parts[parts.length - 1])
-    const span = op.cells.length
-    const placedKeys = findAutoMusterSpanForTryApply(
+    const placedKeys = findAutoMusterSpanInRandomAllowedRoom(
       next,
       reserved,
-      tDk,
-      room,
-      startSlot,
-      span,
+      op.tDk,
+      op.idealStart,
+      op.cells.length,
+      op.artItem,
     )
     if (placedKeys === null) {
       return {
         error:
-          'Kein freier Bereich außerhalb der Mittagspause (12:00–13:30) für ein automatisches Muster-Platzieren.',
+          'Kein freier Bereich außerhalb der Mittagspause (12:00–13:30) für ein automatisches Muster-Platzieren (in keinem für die Art freigegebenen Raum).',
       }
     }
     remappedOps.push({ targetKeys: placedKeys, cells: op.cells })
@@ -3412,6 +3476,30 @@ function findAutoMusterSpanForTryApply(
   return Array.from({ length: span }, (_, i) =>
     makeSlotKey(tDk, room, s + i),
   )
+}
+
+function findAutoMusterSpanInRandomAllowedRoom(
+  base: Record<string, CellData>,
+  reserved: Set<string>,
+  tDk: string,
+  idealStart: number,
+  span: number,
+  artItem: BelegungsartItem,
+): string[] | null {
+  const rooms = [...artEffectiveAllowedRooms(artItem)]
+  shuffleArrayInPlace(rooms)
+  for (const room of rooms) {
+    const keys = findAutoMusterSpanForTryApply(
+      base,
+      reserved,
+      tDk,
+      room,
+      idealStart,
+      span,
+    )
+    if (keys) return keys
+  }
+  return null
 }
 
 function rangeFullyFree(
@@ -3663,41 +3751,43 @@ function applyMusterWithPatientWeek(
     const vdk = templateDkForDayIndex(dayIndex)
     const tDk = dateKey(addDays(weekStart, dayIndex))
     const wd = weekdayMon0FromDate(parseDateKey(tDk))
-    for (const room of ROOMS) {
-      for (let sl = 0; sl < max; sl++) {
-        const k = makeSlotKey(vdk, room, sl)
-        const d = virt[k]
-        if (!isCellBooked(d)) continue
-        if (seen.has(k)) continue
-        const { start, end } = findBlockBounds(virt, vdk, room, sl)
-        const cells: CellData[] = []
-        for (let s = start; s <= end; s++) {
-          const vk = makeSlotKey(vdk, room, s)
-          seen.add(vk)
-          cells.push({ ...virt[vk]! })
-        }
-        if (
-          musterBlockIsOpOnly(cells, artenList) ||
-          musterBlockIsPauseOnly(cells)
-        ) {
-          continue
-        }
-        const artId0 = findArtIdForCell(cells[0], artenList)
-        if (artId0) {
-          const ai = artenList.find((x) => x.id === artId0)
-          if (
-            ai &&
-            (ROOMS as readonly string[]).includes(room as string) &&
-            !artAllowedInMainCalendarRoom(ai, room)
-          ) {
-            alertOnce(
-              `Im Muster steht „${ai.label}“ im Raum „${room}“; diese Art ist dort nicht vorgesehen (Belegungsart bearbeiten: Räume). Das Muster wird nicht angewendet.`,
-            )
-            return prev
-          }
-        }
-        ops.push({ tDk, wd, templateRoom: room, idealStart: start, cells })
+    for (let sl = 0; sl < max; sl++) {
+      const k = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, sl)
+      const d = virt[k]
+      if (!isCellBooked(d)) continue
+      if (seen.has(k)) continue
+      const { start, end } = findBlockBounds(
+        virt,
+        vdk,
+        MUSTER_EDITOR_LANE_ROOM,
+        sl,
+      )
+      const cells: CellData[] = []
+      for (let s = start; s <= end; s++) {
+        const vk = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, s)
+        seen.add(vk)
+        cells.push({ ...virt[vk]! })
       }
+      if (
+        musterBlockIsOpOnly(cells, artenList) ||
+        musterBlockIsPauseOnly(cells)
+      ) {
+        continue
+      }
+      const artId0 = findArtIdForCell(cells[0], artenList)
+      const ai = artId0 ? artenList.find((x) => x.id === artId0) : undefined
+      if (!ai) {
+        alertOnce(
+          'Im Muster ist eine Belegungsart nicht im Katalog — das Muster wird nicht angewendet.',
+        )
+        return prev
+      }
+      const roomsFilter = artMainRoomsFilterForMusterPlacement(
+        cells,
+        artenList,
+      )
+      const templateRoom = randomPickAllowedMainRoom(ai, roomsFilter)
+      ops.push({ tDk, wd, templateRoom, idealStart: start, cells })
     }
   }
 
@@ -3898,25 +3988,28 @@ function collectTemplateOpOnlyDayIndices(
   const dayCount = templateWeekCount * 7
   for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
     const vdk = templateDkForDayIndex(dayIndex)
-    for (const room of ROOMS) {
-      for (let sl = 0; sl < max; sl++) {
-        const k = makeSlotKey(vdk, room, sl)
-        const d = virt[k]
-        if (!isCellBooked(d)) continue
-        if (seen.has(k)) continue
-        const { start, end } = findBlockBounds(virt, vdk, room, sl)
-        const cells: CellData[] = []
-        for (let s = start; s <= end; s++) {
-          const vk = makeSlotKey(vdk, room, s)
-          seen.add(vk)
-          cells.push({ ...virt[vk]! })
-        }
-        if (
-          musterBlockIsOpOnly(cells, artenList) &&
-          !musterBlockIsPauseOnly(cells)
-        ) {
-          out.add(dayIndex)
-        }
+    for (let sl = 0; sl < max; sl++) {
+      const k = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, sl)
+      const d = virt[k]
+      if (!isCellBooked(d)) continue
+      if (seen.has(k)) continue
+      const { start, end } = findBlockBounds(
+        virt,
+        vdk,
+        MUSTER_EDITOR_LANE_ROOM,
+        sl,
+      )
+      const cells: CellData[] = []
+      for (let s = start; s <= end; s++) {
+        const vk = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, s)
+        seen.add(vk)
+        cells.push({ ...virt[vk]! })
+      }
+      if (
+        musterBlockIsOpOnly(cells, artenList) &&
+        !musterBlockIsPauseOnly(cells)
+      ) {
+        out.add(dayIndex)
       }
     }
   }
@@ -4097,8 +4190,8 @@ function relocateNonOpMusterOutOfOpTabRoom(
 
 /**
  * Belegungsmuster auf OP-Buchung:
- * - Der Tag im Muster, an dem die Belegungsart „OP“ steht (beliebiger Raum im
- *   Muster-Editor), wird auf den OP-Kalendertag der Buchung gelegt; Wochentags-
+ * - Der Tag im Muster, an dem die Belegungsart „OP“ steht (eine Zeile im Muster-Editor),
+ *   wird auf den OP-Kalendertag der Buchung gelegt; Wochentags-
  *   Labels im Muster sind irrelevant, es zählt nur der Tag-Index im Muster-Raster.
  * - `weekStart` ist so gewählt, dass Muster-Tag `opAnchorDayIndex` = `anchor.dk`
  *   (addDays(weekStart, opAnchorDayIndex) === anchor-Datum).
@@ -4135,30 +4228,33 @@ function applyMusterFromOpBookingOnce(
     const vdk = templateDkForDayIndex(dayIndex)
     const tDk = dateKey(addDays(weekStart, dayIndex))
     if (tDk !== anchor.dk) continue
-    for (const room of ROOMS) {
-      for (let sl = 0; sl < max; sl++) {
-        const k = makeSlotKey(vdk, room, sl)
-        const d = virt[k]
-        if (!isCellBooked(d)) continue
-        if (seenO.has(k)) continue
-        const { start, end } = findBlockBounds(virt, vdk, room, sl)
-        const cells: CellData[] = []
-        for (let s = start; s <= end; s++) {
-          const vk = makeSlotKey(vdk, room, s)
-          seenO.add(vk)
-          cells.push({ ...virt[vk]! })
-        }
-        if (!musterBlockIsOpOnly(cells, artenList)) continue
-        if (
-          slotsRangeOverlap(
-            start,
-            end,
-            anchorBounds.start,
-            anchorBounds.end,
-          )
-        ) {
-          opOverlap = true
-        }
+    for (let sl = 0; sl < max; sl++) {
+      const k = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, sl)
+      const d = virt[k]
+      if (!isCellBooked(d)) continue
+      if (seenO.has(k)) continue
+      const { start, end } = findBlockBounds(
+        virt,
+        vdk,
+        MUSTER_EDITOR_LANE_ROOM,
+        sl,
+      )
+      const cells: CellData[] = []
+      for (let s = start; s <= end; s++) {
+        const vk = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, s)
+        seenO.add(vk)
+        cells.push({ ...virt[vk]! })
+      }
+      if (!musterBlockIsOpOnly(cells, artenList)) continue
+      if (
+        slotsRangeOverlap(
+          start,
+          end,
+          anchorBounds.start,
+          anchorBounds.end,
+        )
+      ) {
+        opOverlap = true
       }
     }
   }
@@ -4182,40 +4278,47 @@ function applyMusterFromOpBookingOnce(
     const vdk = templateDkForDayIndex(dayIndex)
     const tDk = dateKey(addDays(weekStart, dayIndex))
     const wd = weekdayMon0FromDate(parseDateKey(tDk))
-    for (const room of ROOMS) {
-      for (let sl = 0; sl < max; sl++) {
-        const k = makeSlotKey(vdk, room, sl)
-        const d = virt[k]
-        if (!isCellBooked(d)) continue
-        if (seen.has(k)) continue
-        const { start, end } = findBlockBounds(virt, vdk, room, sl)
-        const cells: CellData[] = []
-        for (let s = start; s <= end; s++) {
-          const vk = makeSlotKey(vdk, room, s)
-          seen.add(vk)
-          cells.push({ ...virt[vk]! })
-        }
-        if (
-          musterBlockIsOpOnly(cells, artenList) ||
-          musterBlockIsPauseOnly(cells)
-        ) {
-          continue
-        }
-        const artId0 = findArtIdForCell(cells[0], artenList)
-        if (artId0) {
-          const ai = artenList.find((x) => x.id === artId0)
-          if (
-            ai &&
-            (ROOMS as readonly string[]).includes(room as string) &&
-            !artAllowedInMainCalendarRoom(ai, room)
-          ) {
-            return {
-              error: `Im Muster steht „${ai.label}“ im Raum „${room}“; diese Art ist dort nicht vorgesehen (Belegungsart bearbeiten: Räume).`,
-            }
-          }
-        }
-        ops.push({ tDk, wd, templateRoom: room, idealStart: start, cells })
+    for (let sl = 0; sl < max; sl++) {
+      const k = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, sl)
+      const d = virt[k]
+      if (!isCellBooked(d)) continue
+      if (seen.has(k)) continue
+      const { start, end } = findBlockBounds(
+        virt,
+        vdk,
+        MUSTER_EDITOR_LANE_ROOM,
+        sl,
+      )
+      const cells: CellData[] = []
+      for (let s = start; s <= end; s++) {
+        const vk = makeSlotKey(vdk, MUSTER_EDITOR_LANE_ROOM, s)
+        seen.add(vk)
+        cells.push({ ...virt[vk]! })
       }
+      if (
+        musterBlockIsOpOnly(cells, artenList) ||
+        musterBlockIsPauseOnly(cells)
+      ) {
+        continue
+      }
+      const artId0 = findArtIdForCell(cells[0], artenList)
+      const ai = artId0 ? artenList.find((x) => x.id === artId0) : undefined
+      if (!ai) {
+        return {
+          error:
+            'Im Muster ist eine Belegungsart nicht im Katalog — bitte Stammdaten prüfen.',
+        }
+      }
+      const roomsFilter = artMainRoomsFilterForMusterPlacement(
+        cells,
+        artenList,
+      )
+      const templateRoom = randomPickAllowedMainRoom(
+        ai,
+        roomsFilter,
+        anchor.room,
+      )
+      ops.push({ tDk, wd, templateRoom, idealStart: start, cells })
     }
   }
 
@@ -4246,24 +4349,11 @@ function applyMusterFromOpBookingOnce(
 
   for (const op of ops) {
     const span = op.cells.length
-    const { tDk, wd, templateRoom: trRaw, idealStart } = op
-    let tr: Room =
-      trRaw === anchor.room
-        ? (ROOMS.find((r) => r !== anchor.room) ?? trRaw)
-        : trRaw
+    const { tDk, wd, templateRoom: tr, idealStart } = op
     const roomsFilter = artMainRoomsFilterForMusterPlacement(
       op.cells,
       artenList,
     )
-    if (
-      roomsFilter &&
-      roomsFilter.length > 0 &&
-      (ROOMS as readonly string[]).includes(tr as string) &&
-      !roomsFilter.includes(tr as MainCalendarRoom)
-    ) {
-      const alt = roomsFilter.find((r) => r !== anchor.room)
-      if (alt) tr = alt
-    }
 
     let chosenRoom: Room = tr
     let chosenStart: number
@@ -6158,6 +6248,7 @@ function MusterWeekEditorGrid({
   availabilityHighlightColor,
 }: MusterWeekEditorGridProps) {
   const slotsN = slotCount()
+  const lane = MUSTER_EDITOR_LANE_ROOM
   return (
     <div className="muster-three-weeks-editor">
       {Array.from({ length: weekCount }, (_, weekIndex) => (
@@ -6174,34 +6265,139 @@ function MusterWeekEditorGrid({
             <div className="muster-day-column-head">{WEEKDAY_SHORT_DE[wd]}</div>
             <div className="grid-wrap muster-mini-grid-wrap">
               <div
-                className="plan-grid day-grid muster-mini-day-grid"
+                className="plan-grid day-grid muster-mini-day-grid muster-mini-day-grid--single-lane"
                 style={{
-                  gridTemplateColumns: `minmax(2.25rem, 2.75rem) repeat(${ROOMS.length}, minmax(2.75rem, 1fr))`,
+                  gridTemplateColumns:
+                    'minmax(2.25rem, 2.75rem) minmax(3.25rem, 1fr)',
                 }}
               >
                 <div className="corner" style={{ gridColumn: 1, gridRow: 1 }} />
-                {ROOMS.map((r, ri) => (
-                  <div
-                    key={r}
-                    className="col-head muster-mini-col-head"
-                    style={{ gridColumn: ri + 2, gridRow: 1 }}
-                  >
-                    {r}
-                  </div>
-                ))}
+                <div
+                  className="col-head muster-mini-col-head muster-mini-col-head--lane"
+                  style={{ gridColumn: 2, gridRow: 1 }}
+                >
+                  Termine
+                </div>
                 {Array.from({ length: slotsN }, (_, slotIndex) => {
-                  const rowMergeNext = ROOMS.some((room) => {
-                    const d = draftCells[makeSlotKey(dayDk, room, slotIndex)]
+                  const rowMergeNext = (() => {
+                    const d = draftCells[makeSlotKey(dayDk, lane, slotIndex)]
                     if (!isCellBooked(d)) return false
                     const seg = daySlotBlockSegment(
                       draftCells,
                       dayDk,
-                      room,
+                      lane,
                       slotIndex,
                       slotsN,
                     )
                     return seg === 'start' || seg === 'middle'
-                  })
+                  })()
+                  const room = lane
+                  const gridCol = 2
+                  const kHere = makeSlotKey(dayDk, room, slotIndex)
+                  const dataHere = draftCells[kHere]
+                  const booked = isCellBooked(dataHere)
+                  const bounds = booked
+                    ? findBlockBounds(
+                        draftCells,
+                        dayDk,
+                        room,
+                        slotIndex,
+                      )
+                    : null
+                  const spanLen = bounds
+                    ? bounds.end - bounds.start + 1
+                    : 1
+                  const skipBecauseSpanned =
+                    booked &&
+                    bounds !== null &&
+                    spanLen > 1 &&
+                    slotIndex !== bounds.start
+                  if (skipBecauseSpanned) {
+                    return null
+                  }
+                  const slotIndicesForShell =
+                    booked && bounds
+                      ? Array.from(
+                          { length: spanLen },
+                          (_, i) => bounds.start + i,
+                        )
+                      : [slotIndex]
+                  const gridRow =
+                    booked && bounds
+                      ? `${bounds.start + 2} / ${bounds.end + 3}`
+                      : slotIndex + 2
+                  const anchorSl = slotIndicesForShell[0]
+                  const anchorKey = makeSlotKey(dayDk, room, anchorSl)
+                  const anchorData = draftCells[anchorKey]
+                  const artOnlyLabel =
+                    anchorData?.art?.trim() ||
+                    cellTerminLabelParts(anchorData).art ||
+                    '—'
+                  const accent = cellAccentColor(anchorData)
+                  const blockSegFirst = daySlotBlockSegment(
+                    draftCells,
+                    dayDk,
+                    room,
+                    anchorSl,
+                    slotsN,
+                  )
+                  const lastSl =
+                    slotIndicesForShell[slotIndicesForShell.length - 1]
+                  const blockSegLast = daySlotBlockSegment(
+                    draftCells,
+                    dayDk,
+                    room,
+                    lastSl,
+                    slotsN,
+                  )
+                  const showBlockLabel =
+                    booked &&
+                    blockSegFirst !== null &&
+                    (blockSegFirst === 'single' ||
+                      blockSegFirst === 'start')
+                  const edgeStyle = booked
+                    ? ({
+                        '--block-edge': accent ?? 'var(--booked-edge)',
+                      } as CSSProperties)
+                    : undefined
+                  const pauseBlock = isMusterPauseCell(anchorData)
+                  const showResizeTop =
+                    booked &&
+                    !pauseBlock &&
+                    blockSegFirst !== null &&
+                    (blockSegFirst === 'start' ||
+                      blockSegFirst === 'single')
+                  const showResizeBottom =
+                    booked &&
+                    !pauseBlock &&
+                    blockSegLast !== null &&
+                    (blockSegLast === 'end' ||
+                      blockSegLast === 'single')
+                  const shellBookedStyle = booked
+                    ? ({
+                        ...edgeStyle,
+                        gridColumn: gridCol,
+                        gridRow,
+                        ...(accent
+                          ? {
+                              background: `color-mix(in srgb, ${accent} 35%, var(--slot-free))`,
+                            }
+                          : { background: 'var(--booked)' }),
+                      } as CSSProperties)
+                    : ({
+                        gridColumn: gridCol,
+                        gridRow,
+                      } as CSSProperties)
+                  const shellDragActive = slotIndicesForShell.some(
+                    (sl) =>
+                      dragOverKey === makeSlotKey(dayDk, room, sl),
+                  )
+                  const mergeNextClass =
+                    booked &&
+                    spanLen === 1 &&
+                    blockSegFirst &&
+                    (blockSegFirst === 'start' ||
+                      blockSegFirst === 'middle')
                   return (
                     <div
                       key={slotIndex}
@@ -6214,273 +6410,163 @@ function MusterWeekEditorGrid({
                       >
                         {slotIndexToLabel(slotIndex)}
                       </div>
-                      {ROOMS.map((room, roomIdx) => {
-                        const gridCol = roomIdx + 2
-                        const kHere = makeSlotKey(dayDk, room, slotIndex)
-                        const dataHere = draftCells[kHere]
-                        const booked = isCellBooked(dataHere)
-                        const bounds = booked
-                          ? findBlockBounds(
+                      <div
+                        key={anchorKey}
+                        className={[
+                          'slot-cell-shell',
+                          spanLen > 1 ? 'slot-cell-shell--span-block' : '',
+                          shellDragActive ? 'drag-over' : '',
+                          mergeNextClass ? 'slot-shell--merge-next' : '',
+                        ]
+                          .filter(Boolean)
+                          .join(' ')}
+                        style={shellBookedStyle}
+                      >
+                        {showResizeTop ? (
+                          <div
+                            className="slot-resize-handle slot-resize-handle--top"
+                            draggable
+                            onDragStart={(e) => {
+                              e.stopPropagation()
+                              startResizeDrag(
+                                e,
+                                dayDk,
+                                room,
+                                'top',
+                                anchorSl,
+                              )
+                            }}
+                            onDragEnd={endPanelOrCellDrag}
+                            title="Am oberen Rand verlängern oder verkürzen"
+                            aria-label="Oberen Rand ziehen"
+                          />
+                        ) : null}
+                        <div className="slot-cell-span-body">
+                          {slotIndicesForShell.map((sl) => {
+                            const k = makeSlotKey(dayDk, room, sl)
+                            const data = draftCells[k]
+                            const subBooked = isCellBooked(data)
+                            const subSeg = daySlotBlockSegment(
                               draftCells,
                               dayDk,
                               room,
-                              slotIndex,
+                              sl,
+                              slotsN,
                             )
-                          : null
-                        const spanLen = bounds
-                          ? bounds.end - bounds.start + 1
-                          : 1
-                        const skipBecauseSpanned =
-                          booked &&
-                          bounds !== null &&
-                          spanLen > 1 &&
-                          slotIndex !== bounds.start
-                        if (skipBecauseSpanned) {
-                          return null
-                        }
-                        const slotIndicesForShell =
-                          booked && bounds
-                            ? Array.from(
-                                { length: spanLen },
-                                (_, i) => bounds.start + i,
-                              )
-                            : [slotIndex]
-                        const gridRow =
-                          booked && bounds
-                            ? `${bounds.start + 2} / ${bounds.end + 3}`
-                            : slotIndex + 2
-                        const anchorSl = slotIndicesForShell[0]
-                        const anchorKey = makeSlotKey(dayDk, room, anchorSl)
-                        const anchorData = draftCells[anchorKey]
-                        const artOnlyLabel =
-                          anchorData?.art?.trim() ||
-                          cellTerminLabelParts(anchorData).art ||
-                          '—'
-                        const accent = cellAccentColor(anchorData)
-                        const blockSegFirst = daySlotBlockSegment(
-                          draftCells,
-                          dayDk,
-                          room,
-                          anchorSl,
-                          slotsN,
-                        )
-                        const lastSl =
-                          slotIndicesForShell[slotIndicesForShell.length - 1]
-                        const blockSegLast = daySlotBlockSegment(
-                          draftCells,
-                          dayDk,
-                          room,
-                          lastSl,
-                          slotsN,
-                        )
-                        const showBlockLabel =
-                          booked &&
-                          blockSegFirst !== null &&
-                          (blockSegFirst === 'single' ||
-                            blockSegFirst === 'start')
-                        const edgeStyle = booked
-                          ? ({
-                              '--block-edge': accent ?? 'var(--booked-edge)',
-                            } as CSSProperties)
-                          : undefined
-                        const pauseBlock = isMusterPauseCell(anchorData)
-                        const showResizeTop =
-                          booked &&
-                          !pauseBlock &&
-                          blockSegFirst !== null &&
-                          (blockSegFirst === 'start' ||
-                            blockSegFirst === 'single')
-                        const showResizeBottom =
-                          booked &&
-                          !pauseBlock &&
-                          blockSegLast !== null &&
-                          (blockSegLast === 'end' ||
-                            blockSegLast === 'single')
-                        const shellBookedStyle = booked
-                          ? ({
-                              ...edgeStyle,
-                              gridColumn: gridCol,
-                              gridRow,
-                              ...(accent
-                                ? {
-                                    background: `color-mix(in srgb, ${accent} 35%, var(--slot-free))`,
-                                  }
-                                : { background: 'var(--booked)' }),
-                            } as CSSProperties)
-                          : ({
-                              gridColumn: gridCol,
-                              gridRow,
-                            } as CSSProperties)
-                        const shellDragActive = slotIndicesForShell.some(
-                          (sl) =>
-                            dragOverKey === makeSlotKey(dayDk, room, sl),
-                        )
-                        const mergeNextClass =
-                          booked &&
-                          spanLen === 1 &&
-                          blockSegFirst &&
-                          (blockSegFirst === 'start' ||
-                            blockSegFirst === 'middle')
-                        return (
-                          <div
-                            key={anchorKey}
-                            className={[
-                              'slot-cell-shell',
-                              spanLen > 1 ? 'slot-cell-shell--span-block' : '',
-                              shellDragActive ? 'drag-over' : '',
-                              mergeNextClass ? 'slot-shell--merge-next' : '',
-                            ]
-                              .filter(Boolean)
-                              .join(' ')}
-                            style={shellBookedStyle}
-                          >
-                            {showResizeTop ? (
-                              <div
-                                className="slot-resize-handle slot-resize-handle--top"
-                                draggable
-                                onDragStart={(e) => {
-                                  e.stopPropagation()
-                                  startResizeDrag(
-                                    e,
-                                    dayDk,
-                                    room,
-                                    'top',
-                                    anchorSl,
-                                  )
-                                }}
-                                onDragEnd={endPanelOrCellDrag}
-                                title="Am oberen Rand verlängern oder verkürzen"
-                                aria-label="Oberen Rand ziehen"
-                              />
-                            ) : null}
-                            <div className="slot-cell-span-body">
-                              {slotIndicesForShell.map((sl) => {
-                                const k = makeSlotKey(dayDk, room, sl)
-                                const data = draftCells[k]
-                                const subBooked = isCellBooked(data)
-                                const subSeg = daySlotBlockSegment(
-                                  draftCells,
-                                  dayDk,
-                                  room,
-                                  sl,
-                                  slotsN,
-                                )
-                                const staffAvailShade =
-                                  Boolean(availabilityHighlightKeys?.has(k)) &&
-                                  !isMusterPauseCell(data) &&
-                                  !slotIndexInCalendarLunchPause(sl)
-                                return (
-                                  <button
-                                    key={k}
-                                    type="button"
-                                    className={`slot-cell slot-cell-main ${subBooked ? 'booked' : ''} ${subBooked && subSeg ? `slot-block--${subSeg}` : ''} ${staffAvailShade ? 'slot-cell--muster-staff-avail' : ''}`}
-                                    style={
-                                      subBooked
-                                        ? {
-                                            ...edgeStyle,
-                                            ...(accent
-                                              ? {
-                                                  background: `color-mix(in srgb, ${accent} 35%, var(--slot-free))`,
-                                                }
-                                              : {
-                                                  background: 'var(--booked)',
-                                                }),
-                                            ...(staffAvailShade && availabilityHighlightColor
-                                              ? ({
-                                                  '--art-drop-tint':
-                                                    availabilityHighlightColor,
-                                                } as CSSProperties)
-                                              : {}),
-                                          }
-                                        : staffAvailShade && availabilityHighlightColor
+                            const staffAvailShade =
+                              Boolean(availabilityHighlightKeys?.has(k)) &&
+                              !isMusterPauseCell(data) &&
+                              !slotIndexInCalendarLunchPause(sl)
+                            return (
+                              <button
+                                key={k}
+                                type="button"
+                                className={`slot-cell slot-cell-main ${subBooked ? 'booked' : ''} ${subBooked && subSeg ? `slot-block--${subSeg}` : ''} ${staffAvailShade ? 'slot-cell--muster-staff-avail' : ''}`}
+                                style={
+                                  subBooked
+                                    ? {
+                                        ...edgeStyle,
+                                        ...(accent
+                                          ? {
+                                              background: `color-mix(in srgb, ${accent} 35%, var(--slot-free))`,
+                                            }
+                                          : {
+                                              background: 'var(--booked)',
+                                            }),
+                                        ...(staffAvailShade && availabilityHighlightColor
                                           ? ({
                                               '--art-drop-tint':
                                                 availabilityHighlightColor,
                                             } as CSSProperties)
-                                          : undefined
-                                    }
-                                    draggable={subBooked && !isMusterPauseCell(data)}
-                                    onClick={() => {
-                                      if (
-                                        Date.now() - suppressClickAfterDrag.current <
-                                        450
-                                      ) {
-                                        return
+                                          : {}),
                                       }
-                                      if (isMusterPauseCell(data)) return
-                                      onCellPickRequest(dayDk, room, sl)
-                                    }}
-                                    onDragStart={(e) => {
-                                      if (!subBooked || isMusterPauseCell(data))
-                                        return
-                                      e.stopPropagation()
-                                      startCellMoveDrag(e, dayDk, room, sl)
-                                    }}
-                                    onDragEnd={() => {
-                                      endPanelOrCellDrag()
-                                      suppressClickAfterDrag.current =
-                                        Date.now()
-                                    }}
-                                    onDragOver={(e) => {
-                                      e.preventDefault()
-                                      e.stopPropagation()
-                                      e.dataTransfer.dropEffect =
-                                        dragSourceRef.current === 'cell'
-                                          ? 'move'
-                                          : 'copy'
-                                      setDragOverKey(k)
-                                    }}
-                                    onDragLeave={() =>
-                                      setDragOverKey((key) =>
-                                        key === k ? null : key,
-                                      )
-                                    }
-                                    onDrop={(e) =>
-                                      onEditorDrop(e, dayDk, room, sl)
-                                    }
-                                    aria-label={
-                                      isMusterPauseCell(data)
-                                        ? `${room} ${slotIndexToLabel(sl)} Pause, nicht bearbeitbar`
-                                        : subBooked
-                                          ? `${room} ${slotIndexToLabel(sl)} ${artOnlyLabel}, Klick zur Belegungsart`
-                                          : `${room} ${slotIndexToLabel(sl)} frei, Klick zur Belegungsart`
-                                    }
-                                  />
-                                )
-                              })}
-                            </div>
-                            {showResizeBottom ? (
-                              <div
-                                className="slot-resize-handle slot-resize-handle--bottom"
-                                draggable
-                                onDragStart={(e) => {
-                                  e.stopPropagation()
-                                  startResizeDrag(
-                                    e,
-                                    dayDk,
-                                    room,
-                                    'bottom',
-                                    lastSl,
-                                  )
+                                    : staffAvailShade && availabilityHighlightColor
+                                      ? ({
+                                          '--art-drop-tint':
+                                            availabilityHighlightColor,
+                                        } as CSSProperties)
+                                      : undefined
+                                }
+                                draggable={subBooked && !isMusterPauseCell(data)}
+                                onClick={() => {
+                                  if (
+                                    Date.now() - suppressClickAfterDrag.current <
+                                    450
+                                  ) {
+                                    return
+                                  }
+                                  if (isMusterPauseCell(data)) return
+                                  onCellPickRequest(dayDk, room, sl)
                                 }}
-                                onDragEnd={endPanelOrCellDrag}
-                                title="Am unteren Rand verlängern oder verkürzen"
-                                aria-label="Unteren Rand ziehen"
+                                onDragStart={(e) => {
+                                  if (!subBooked || isMusterPauseCell(data))
+                                    return
+                                  e.stopPropagation()
+                                  startCellMoveDrag(e, dayDk, room, sl)
+                                }}
+                                onDragEnd={() => {
+                                  endPanelOrCellDrag()
+                                  suppressClickAfterDrag.current =
+                                    Date.now()
+                                }}
+                                onDragOver={(e) => {
+                                  e.preventDefault()
+                                  e.stopPropagation()
+                                  e.dataTransfer.dropEffect =
+                                    dragSourceRef.current === 'cell'
+                                      ? 'move'
+                                      : 'copy'
+                                  setDragOverKey(k)
+                                }}
+                                onDragLeave={() =>
+                                  setDragOverKey((key) =>
+                                    key === k ? null : key,
+                                  )
+                                }
+                                onDrop={(e) =>
+                                  onEditorDrop(e, dayDk, room, sl)
+                                }
+                                aria-label={
+                                  isMusterPauseCell(data)
+                                    ? `${slotIndexToLabel(sl)} Pause, nicht bearbeitbar`
+                                    : subBooked
+                                      ? `${slotIndexToLabel(sl)} ${artOnlyLabel}, Klick zur Belegungsart`
+                                      : `${slotIndexToLabel(sl)} frei, Klick zur Belegungsart`
+                                }
                               />
-                            ) : null}
-                            {showBlockLabel ? (
-                              <div
-                                className="slot-cell-label slot-cell-termin-span-overlay muster-template-block-label"
-                                title={artOnlyLabel}
-                              >
-                                <span className="muster-template-art-text">
-                                  {artOnlyLabel}
-                                </span>
-                              </div>
-                            ) : null}
+                            )
+                          })}
+                        </div>
+                        {showResizeBottom ? (
+                          <div
+                            className="slot-resize-handle slot-resize-handle--bottom"
+                            draggable
+                            onDragStart={(e) => {
+                              e.stopPropagation()
+                              startResizeDrag(
+                                e,
+                                dayDk,
+                                room,
+                                'bottom',
+                                lastSl,
+                              )
+                            }}
+                            onDragEnd={endPanelOrCellDrag}
+                            title="Am unteren Rand verlängern oder verkürzen"
+                            aria-label="Unteren Rand ziehen"
+                          />
+                        ) : null}
+                        {showBlockLabel ? (
+                          <div
+                            className="slot-cell-label slot-cell-termin-span-overlay muster-template-block-label"
+                            title={artOnlyLabel}
+                          >
+                            <span className="muster-template-art-text">
+                              {artOnlyLabel}
+                            </span>
                           </div>
-                        )
-                      })}
+                        ) : null}
+                      </div>
                     </div>
                   )
                 })}
@@ -10868,16 +10954,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     for (let dayIndex = 0; dayIndex < dayCount; dayIndex++) {
       const dayDk = templateDkForDayIndex(dayIndex)
       const wd = weekdayMon0FromDate(parseDateKey(dayDk))
-      for (const room of ROOMS) {
-        for (let sl = 0; sl < slotsN; sl++) {
-          if (slotIndexInCalendarLunchPause(sl)) continue
-          if (
-            eligible.every((s) =>
-              isStaffSlotAvailableForDate(s, dayDk, wd, sl),
-            )
-          ) {
-            keys.add(makeSlotKey(dayDk, room, sl))
-          }
+      for (let sl = 0; sl < slotsN; sl++) {
+        if (slotIndexInCalendarLunchPause(sl)) continue
+        if (
+          eligible.every((s) =>
+            isStaffSlotAvailableForDate(s, dayDk, wd, sl),
+          )
+        ) {
+          keys.add(makeSlotKey(dayDk, MUSTER_EDITOR_LANE_ROOM, sl))
         }
       }
     }
@@ -10979,13 +11063,16 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             {musterModal.templateWeekCount === 1
               ? 'Eine Woche (Mo–So nebeneinander). '
               : 'Drei Wochen untereinander (je Mo–So nebeneinander). '}
-            <strong>Klick auf eine Zelle</strong> öffnet die Auswahl der Belegungsart;
-            Belegungsarten lassen sich weiter per Drag & Drop platzieren. Blöcke wie
-            im Kalender verschieben und am Rand kürzen oder verlängern. Anzeige nur der
-            Art-Bezeichnung. Pro Belegungsart kann der Schalter die Zellen schattieren,
-            in denen alle Mitarbeiter mit Freigabe für diese Art an dem Slot verfügbar
-            sind (nur eine Art gleichzeitig). Täglich 12:00–13:30 ist fest als „Pause“
-            reserviert (keine Belegungsart, wird nicht in den Hauptkalender übernommen).
+            Pro Tag nur noch <strong>eine Termin-Spalte</strong> (keine Raum-Spalten mehr):
+            Beim Anwenden des Musters wird jede Belegungsart zu der jeweiligen Uhrzeit
+            <strong> zufällig in einen der in der Art freigegebenen Räume</strong> gelegt.
+            <strong> Klick auf eine Zelle</strong> öffnet die Auswahl der Belegungsart;
+            Belegungsarten lassen sich weiter per Drag & Drop platzieren. Blöcke wie im
+            Kalender verschieben und am Rand kürzen oder verlängern. Pro Belegungsart kann
+            der Schalter die Zellen schattieren, in denen alle Mitarbeiter mit Freigabe für
+            diese Art an dem Slot verfügbar sind (nur eine Art gleichzeitig). Täglich
+            12:00–13:30 ist fest als „Pause“ reserviert (keine Belegungsart, wird nicht in
+            den Hauptkalender übernommen).
           </p>
           <div className="muster-modal-grid-scroll">
             <MusterWeekEditorGrid

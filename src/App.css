@@ -3253,6 +3253,12 @@
   word-break: break-word;
 }
 
+.muster-mini-day-grid--single-lane .col-head.muster-mini-col-head--lane {
+  font-size: 0.62rem;
+  font-weight: 600;
+  text-align: center;
+}
+
 .muster-mini-day-grid .time-label {
   font-size: 0.58rem;
   padding: 0.1rem 0.15rem;
