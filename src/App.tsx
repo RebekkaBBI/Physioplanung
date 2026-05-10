@@ -11373,6 +11373,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               width={240}
               height={96}
               priority
+              unoptimized
             />
             <h1 className="app-title">Physio PlanungsApp</h1>
           </div>
