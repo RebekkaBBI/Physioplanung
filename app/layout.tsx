@@ -1,4 +1,5 @@
 import type { Metadata } from 'next'
+import { AppErrorBoundary } from '@/AppErrorBoundary'
 import { Providers } from './providers'
 import '@/index.css'
 
@@ -14,7 +15,9 @@ export default function RootLayout({
   return (
     <html lang="de">
       <body>
-        <Providers>{children}</Providers>
+        <AppErrorBoundary>
+          <Providers>{children}</Providers>
+        </AppErrorBoundary>
       </body>
     </html>
   )

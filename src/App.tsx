@@ -3118,11 +3118,64 @@ function shuffleArrayInPlace<T>(arr: T[]): T[] {
   return arr
 }
 
+/** Physiotherapy + Massage/MLD: beim Muster andere Raum-Reihenfolge als bei anderen Arten. */
+const MUSTER_PHYSIO_MASSAGE_ROOM_BIAS_ART_IDS: ReadonlySet<string> = new Set([
+  'art-physiotherapy',
+  'art-massage-mld',
+])
+
+const PATIENTENZIMMER_ROOM = 'Patientenzimmer' as MainCalendarRoom
+const PHYSIO1_ROOM = 'Physio 1' as MainCalendarRoom
+const PHYSIO2_ROOM = 'Physio 2' as MainCalendarRoom
+
+function artUsesMusterPhysioMassageRoomBias(art: BelegungsartItem): boolean {
+  if (MUSTER_PHYSIO_MASSAGE_ROOM_BIAS_ART_IDS.has(art.id)) return true
+  const L = art.label.toLowerCase()
+  const hasPhysio =
+    L.includes('physiotherapie') || L.includes('physiotherapy')
+  const hasMassage = L.includes('massage') || /\bmld\b/.test(L)
+  return hasPhysio && hasMassage
+}
+
+/**
+ * Reihenfolge der Räume beim automatischen Muster legen.
+ * Mehrwoche: Woche 1 → Patientenzimmer zuerst; ab Woche 2 → Physio 1 & 2.
+ * Einwoche: vornehmlich Physio 1 & 2.
+ */
+function orderedMainRoomsForMusterPhysioMassageBias(
+  allowed: MainCalendarRoom[],
+  templateWeekIndex: number,
+  templateWeekCount: number,
+): MainCalendarRoom[] {
+  const pool = [...allowed]
+  const inPool = (r: MainCalendarRoom) => pool.includes(r)
+  if (templateWeekCount > 1) {
+    if (templateWeekIndex === 0) {
+      const head: MainCalendarRoom[] = []
+      if (inPool(PATIENTENZIMMER_ROOM)) head.push(PATIENTENZIMMER_ROOM)
+      const rest = pool.filter((r) => !head.includes(r))
+      shuffleArrayInPlace(rest)
+      return [...head, ...rest]
+    }
+    const head = [PHYSIO1_ROOM, PHYSIO2_ROOM].filter(inPool)
+    shuffleArrayInPlace(head)
+    const rest = pool.filter((r) => !head.includes(r))
+    shuffleArrayInPlace(rest)
+    return [...head, ...rest]
+  }
+  const head = [PHYSIO1_ROOM, PHYSIO2_ROOM].filter(inPool)
+  shuffleArrayInPlace(head)
+  const rest = pool.filter((r) => !head.includes(r))
+  shuffleArrayInPlace(rest)
+  return [...head, ...rest]
+}
+
 /** Für Muster-Anwendung: zufälliger Hauptkalender-Raum aus den erlaubten (optional ohne Anker-Raum). */
 function randomPickAllowedMainRoom(
   artItem: BelegungsartItem | undefined,
   roomsFilter: MainCalendarRoom[] | undefined,
   excludeRoom?: Room,
+  templateWeekBias?: { weekIndex: number; weekCount: number },
 ): MainCalendarRoom {
   let pool: MainCalendarRoom[] =
     roomsFilter && roomsFilter.length > 0
@@ -3133,6 +3186,18 @@ function randomPickAllowedMainRoom(
   if (excludeRoom && (ROOMS as readonly string[]).includes(excludeRoom as string)) {
     const filtered = pool.filter((r) => r !== excludeRoom)
     if (filtered.length > 0) pool = filtered
+  }
+  if (
+    artItem &&
+    templateWeekBias &&
+    templateWeekBias.weekCount >= 1 &&
+    artUsesMusterPhysioMassageRoomBias(artItem)
+  ) {
+    return orderedMainRoomsForMusterPhysioMassageBias(
+      pool,
+      templateWeekBias.weekIndex,
+      templateWeekBias.weekCount,
+    )[0]!
   }
   shuffleArrayInPlace(pool)
   return pool[0]!
@@ -3350,6 +3415,7 @@ function tryApplyMusterWeekToSlots(
     idealStart: number
     cells: CellData[]
     artItem: BelegungsartItem
+    templateWeekIndex: number
   }
   const ops: Op[] = []
   const max = slotCount()
@@ -3389,7 +3455,8 @@ function tryApplyMusterWeekToSlots(
             'Im Muster ist eine Belegungsart nicht im Katalog — bitte Stammdaten prüfen.',
         }
       }
-      ops.push({ tDk, idealStart: start, cells, artItem: ai })
+      const templateWeekIndex = Math.floor(dayIndex / 7)
+      ops.push({ tDk, idealStart: start, cells, artItem: ai, templateWeekIndex })
     }
   }
 
@@ -3405,6 +3472,8 @@ function tryApplyMusterWeekToSlots(
       op.idealStart,
       op.cells.length,
       op.artItem,
+      op.templateWeekIndex,
+      templateWeekCount,
     )
     if (placedKeys === null) {
       return {
@@ -3511,9 +3580,17 @@ function findAutoMusterSpanInRandomAllowedRoom(
   idealStart: number,
   span: number,
   artItem: BelegungsartItem,
+  templateWeekIndex: number,
+  templateWeekCount: number,
 ): string[] | null {
-  const rooms = [...artEffectiveAllowedRooms(artItem)]
-  shuffleArrayInPlace(rooms)
+  const allowed = [...artEffectiveAllowedRooms(artItem)]
+  const rooms = artUsesMusterPhysioMassageRoomBias(artItem)
+    ? orderedMainRoomsForMusterPhysioMassageBias(
+        allowed,
+        templateWeekIndex,
+        templateWeekCount,
+      )
+    : shuffleArrayInPlace(allowed)
   for (const room of rooms) {
     const keys = findAutoMusterSpanForTryApply(
       base,
@@ -3812,7 +3889,11 @@ function applyMusterWithPatientWeek(
         cells,
         artenList,
       )
-      const templateRoom = randomPickAllowedMainRoom(ai, roomsFilter)
+      const templateWeekIndex = Math.floor(dayIndex / 7)
+      const templateRoom = randomPickAllowedMainRoom(ai, roomsFilter, undefined, {
+        weekIndex: templateWeekIndex,
+        weekCount: templateWeekCount,
+      })
       ops.push({ tDk, wd, templateRoom, idealStart: start, cells })
     }
   }
@@ -4339,10 +4420,12 @@ function applyMusterFromOpBookingOnce(
         cells,
         artenList,
       )
+      const templateWeekIndex = Math.floor(dayIndex / 7)
       const templateRoom = randomPickAllowedMainRoom(
         ai,
         roomsFilter,
         anchor.room,
+        { weekIndex: templateWeekIndex, weekCount: templateWeekCount },
       )
       ops.push({ tDk, wd, templateRoom, idealStart: start, cells })
     }
@@ -6275,8 +6358,15 @@ function MusterWeekEditorGrid({
 }: MusterWeekEditorGridProps) {
   const slotsN = slotCount()
   const lane = MUSTER_EDITOR_LANE_ROOM
+  const oneWeekLayout = weekCount === 1
   return (
-    <div className="muster-three-weeks-editor">
+    <div
+      className={
+        oneWeekLayout
+          ? 'muster-three-weeks-editor muster-three-weeks-editor--one-week'
+          : 'muster-three-weeks-editor'
+      }
+    >
       {Array.from({ length: weekCount }, (_, weekIndex) => (
         <div key={weekIndex} className="muster-week-block">
           <div className="muster-week-block-head">
@@ -10973,10 +11063,14 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
 
   const musterModalArtCounts = useMemo(() => {
     if (musterModal === null) return []
-    return musterTemplateArtSlotCountsFullCatalog(
+    const rows = musterTemplateArtSlotCountsFullCatalog(
       virtualToMusterTemplate(musterDraftCells),
       arten,
     ).filter((row) => !MUSTER_MODAL_ART_SUMMARY_EXCLUDED_IDS.has(row.id))
+    return [...rows].sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count
+      return a.label.localeCompare(b.label, 'de', { sensitivity: 'base' })
+    })
   }, [musterModal, musterDraftCells, arten])
 
   const musterEditorAvailabilityKeys = useMemo(() => {
@@ -11036,7 +11130,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               ? 'Neues Belegungsmuster'
               : 'Belegungsmuster bearbeiten'}
           </h2>
-          <div className="muster-modal-label-row">
+          <div className="muster-modal-toolbar">
             <label className="muster-modal-label muster-modal-label--field">
               Bezeichnung
               <input
@@ -11048,71 +11142,70 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               />
             </label>
             {musterModalArtCounts.length > 0 ? (
-              <ul
-                className="muster-art-summary muster-art-summary--modal-beside muster-art-summary--modal-3-rows"
-                aria-label="Belegungsarten im Muster: Anzahl 30-Minuten-Slots je Art (ohne OP, Pause, Teammeeting, Orga und Teamleiterbesprechung)"
-              >
-                {musterModalArtCounts.map((row) => {
-                  const showAvailSwitch =
-                    row.id !== OP_BELEGUNGSART_ID &&
-                    row.id !== MUSTER_PAUSE_ART_ID
-                  return (
-                    <li
-                      key={`modal-${row.id}`}
-                      className="muster-art-summary-item muster-art-summary-item--with-switch"
-                    >
-                      <span
-                        className="muster-art-summary-dot"
-                        style={{ background: row.color }}
-                        aria-hidden
-                      />
-                      <span className="muster-art-summary-label">{row.label}</span>
-                      {showAvailSwitch ? (
-                        <button
-                          type="button"
-                          role="switch"
-                          className="muster-art-avail-switch"
-                          aria-checked={musterHighlightArtId === row.id}
-                          aria-label={`Verfügbarkeit für ${row.label} im Raster`}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            setMusterHighlightArtId((prev) =>
-                              prev === row.id ? null : row.id,
-                            )
-                          }}
-                        />
-                      ) : (
+              <div className="muster-modal-summary-card">
+                <p className="muster-modal-summary-heading" id="muster-modal-summary-heading">
+                  Buchungen im Muster
+                  <span className="muster-modal-summary-sub">
+                    {' '}
+                    (Anzahl 30-Min-Slots je Art)
+                  </span>
+                </p>
+                <ul
+                  className="muster-art-summary muster-art-summary--modal-beside muster-art-summary--modal-compact"
+                  aria-labelledby="muster-modal-summary-heading"
+                  aria-label="Belegungsarten im Muster: Anzahl 30-Minuten-Slots je Art (ohne OP, Pause, Teammeeting, Orga und Teamleiterbesprechung). Sortiert nach Häufigkeit."
+                >
+                  {musterModalArtCounts.map((row) => {
+                    const showAvailSwitch =
+                      row.id !== OP_BELEGUNGSART_ID &&
+                      row.id !== MUSTER_PAUSE_ART_ID
+                    return (
+                      <li
+                        key={`modal-${row.id}`}
+                        className="muster-art-summary-item muster-art-summary-item--with-switch"
+                      >
                         <span
-                          className="muster-art-avail-switch-placeholder"
+                          className="muster-art-summary-dot"
+                          style={{ background: row.color }}
                           aria-hidden
                         />
-                      )}
-                      <span className="muster-art-summary-count">{row.count}×</span>
-                    </li>
-                  )
-                })}
-              </ul>
+                        <span className="muster-art-summary-label">{row.label}</span>
+                        {showAvailSwitch ? (
+                          <button
+                            type="button"
+                            role="switch"
+                            className="muster-art-avail-switch"
+                            aria-checked={musterHighlightArtId === row.id}
+                            aria-label={`Verfügbarkeit für ${row.label} im Raster`}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setMusterHighlightArtId((prev) =>
+                                prev === row.id ? null : row.id,
+                              )
+                            }}
+                          />
+                        ) : (
+                          <span
+                            className="muster-art-avail-switch-placeholder"
+                            aria-hidden
+                          />
+                        )}
+                        <span className="muster-art-summary-count" title="30-Minuten-Slots">
+                          {row.count}×
+                        </span>
+                      </li>
+                    )
+                  })}
+                </ul>
+              </div>
             ) : (
-              <p className="muster-art-summary-empty muster-art-summary-empty--modal-beside">
-                Keine Belegungsarten konfiguriert
-              </p>
+              <div className="muster-modal-summary-card muster-modal-summary-card--empty">
+                <p className="muster-art-summary-empty muster-art-summary-empty--modal-beside">
+                  Keine Belegungsarten im Raster
+                </p>
+              </div>
             )}
           </div>
-          <p className="staff-modal-hint">
-            {musterModal.templateWeekCount === 1
-              ? 'Eine Woche (Mo–So nebeneinander). '
-              : 'Drei Wochen untereinander (je Mo–So nebeneinander). '}
-            Pro Tag nur noch <strong>eine Termin-Spalte</strong> (keine Raum-Spalten mehr):
-            Beim Anwenden des Musters wird jede Belegungsart zu der jeweiligen Uhrzeit
-            <strong> zufällig in einen der in der Art freigegebenen Räume</strong> gelegt.
-            <strong> Klick auf eine Zelle</strong> öffnet die Auswahl der Belegungsart;
-            Belegungsarten lassen sich weiter per Drag & Drop platzieren. Blöcke wie im
-            Kalender verschieben und am Rand kürzen oder verlängern. Pro Belegungsart kann
-            der Schalter die Zellen schattieren, in denen alle Mitarbeiter mit Freigabe für
-            diese Art an dem Slot verfügbar sind (nur eine Art gleichzeitig). Täglich
-            12:00–13:30 ist fest als „Pause“ reserviert (keine Belegungsart, wird nicht in
-            den Hauptkalender übernommen).
-          </p>
           <div className="muster-modal-grid-scroll">
             <MusterWeekEditorGrid
               weekCount={musterModal.templateWeekCount}
@@ -11269,7 +11362,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         <div className="app-title-row">
           <div className="app-title-brand">
             <Image
-              src="/logo-bbi.png"
+              src="/logo-bbi.svg"
               alt="BBI"
               className="app-logo"
               width={240}
