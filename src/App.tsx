@@ -515,6 +515,26 @@ function migrateLegacyRoomNamesInSlotMap(
   return anyRenamed ? out : cells
 }
 
+/** Muster-Editor-Keys dürfen nicht im Hauptkalender landen — sonst brechen Raster/Logik. */
+function stripMusterLaneRoomFromCalendarSlotMap(
+  cells: Record<string, CellData>,
+): Record<string, CellData> {
+  let stripped = false
+  const out: Record<string, CellData> = {}
+  for (const [k, v] of Object.entries(cells)) {
+    const parts = k.split('|')
+    if (
+      parts.length >= 3 &&
+      parts[parts.length - 2] === MUSTER_EDITOR_LANE_ROOM
+    ) {
+      stripped = true
+      continue
+    }
+    out[k] = v
+  }
+  return stripped ? out : cells
+}
+
 function migrateLegacyRoomInMusterTemplateKey(key: string): string {
   const parts = key.split('|')
   if (parts.length === 4) {
@@ -1740,7 +1760,9 @@ function loadSlotCells(): Record<string, CellData> {
     if (v2) {
       const o = JSON.parse(v2) as Record<string, CellData>
       const raw = o && typeof o === 'object' ? o : {}
-      return migrateLegacyRoomNamesInSlotMap(raw)
+      return stripMusterLaneRoomFromCalendarSlotMap(
+        migrateLegacyRoomNamesInSlotMap(raw),
+      )
     }
     const v1 = localStorage.getItem(STORAGE_KEY_V1)
     if (v1) {
@@ -1751,7 +1773,9 @@ function loadSlotCells(): Record<string, CellData> {
           out[k] = { art: 'Belegung' }
         }
       }
-      return migrateLegacyRoomNamesInSlotMap(out)
+      return stripMusterLaneRoomFromCalendarSlotMap(
+        migrateLegacyRoomNamesInSlotMap(out),
+      )
     }
   } catch {
     /* ignore */
@@ -1765,7 +1789,9 @@ function saveSlotCells(next: Record<string, CellData>) {
 
 function parseSlotCellsFromUnknown(parsed: unknown): Record<string, CellData> {
   if (!parsed || typeof parsed !== 'object') return {}
-  return migrateLegacyRoomNamesInSlotMap(parsed as Record<string, CellData>)
+  return stripMusterLaneRoomFromCalendarSlotMap(
+    migrateLegacyRoomNamesInSlotMap(parsed as Record<string, CellData>),
+  )
 }
 
 function normalizeMusterUsageCountById(raw: unknown): Record<string, number> {
@@ -6313,7 +6339,20 @@ function MusterWeekEditorGrid({
                     spanLen > 1 &&
                     slotIndex !== bounds.start
                   if (skipBecauseSpanned) {
-                    return null
+                    return (
+                      <div
+                        key={slotIndex}
+                        className="day-slot-row"
+                        style={{ display: 'contents' }}
+                      >
+                        <div
+                          className={`time-label ${rowMergeNext ? 'time-label--merge-next' : ''}`}
+                          style={{ gridColumn: 1, gridRow: slotIndex + 2 }}
+                        >
+                          {slotIndexToLabel(slotIndex)}
+                        </div>
+                      </div>
+                    )
                   }
                   const slotIndicesForShell =
                     booked && bounds
