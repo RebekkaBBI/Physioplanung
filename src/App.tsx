@@ -11169,7 +11169,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           style={{ background: row.color }}
                           aria-hidden
                         />
-                        <span className="muster-art-summary-label">{row.label}</span>
+                        <span className="muster-art-summary-name-with-count">
+                          <span className="muster-art-summary-label">{row.label}</span>
+                          <span
+                            className="muster-art-summary-count"
+                            title="30-Minuten-Slots"
+                          >
+                            {row.count}×
+                          </span>
+                        </span>
                         {showAvailSwitch ? (
                           <button
                             type="button"
@@ -11190,9 +11198,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                             aria-hidden
                           />
                         )}
-                        <span className="muster-art-summary-count" title="30-Minuten-Slots">
-                          {row.count}×
-                        </span>
                       </li>
                     )
                   })}

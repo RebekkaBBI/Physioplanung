@@ -2996,9 +2996,110 @@
   position: relative;
   max-width: min(96vw, 120rem);
   width: 96vw;
-  max-height: min(90vh, 56rem);
+  /* Höher: voller Arbeitstag pro Tag ohne Innen-Scroll */
+  max-height: min(94vh, 72rem);
   display: flex;
   flex-direction: column;
+}
+
+/*
+ * Muster-Editor: Mo–So als ein durchgehendes Band (nicht sieben einzelne Karten),
+ * kein Scroll pro Tag — kompakte Slot-Zeilen.
+ */
+.muster-modal-dialog .muster-week-editor-row {
+  gap: 0;
+  align-items: stretch;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--surface-2);
+  padding-bottom: 0;
+}
+
+.muster-modal-dialog .muster-day-column {
+  flex: 1 1 0;
+  min-width: 0;
+  border: none;
+  border-radius: 0;
+  border-right: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+}
+
+.muster-modal-dialog .muster-day-column:last-child {
+  border-right: none;
+}
+
+.muster-modal-dialog .muster-day-column-head {
+  padding: 0.22rem 0.15rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.muster-modal-dialog .muster-mini-grid-wrap {
+  max-height: none;
+  overflow: visible;
+  padding: 0.12rem;
+}
+
+.muster-modal-dialog .muster-mini-day-grid.plan-grid {
+  min-width: 0;
+  width: 100%;
+}
+
+.muster-modal-dialog .muster-mini-day-grid .corner {
+  min-height: 0;
+  padding: 0;
+}
+
+.muster-modal-dialog .muster-mini-day-grid .col-head.muster-mini-col-head {
+  min-height: 0;
+  padding: 0.08rem 0.1rem;
+  font-size: 0.52rem;
+  line-height: 1.1;
+}
+
+.muster-modal-dialog
+  .muster-mini-day-grid--single-lane
+  .col-head.muster-mini-col-head--lane {
+  font-size: 0.52rem;
+}
+
+.muster-modal-dialog .muster-mini-day-grid .time-label {
+  font-size: 0.5rem;
+  padding: 0.04rem 0.08rem;
+  line-height: 1.1;
+  min-height: 0;
+}
+
+.muster-modal-dialog .muster-mini-day-grid .slot-cell-shell {
+  min-height: 0.58rem;
+}
+
+.muster-modal-dialog .muster-mini-day-grid .slot-cell {
+  min-height: 0.58rem;
+}
+
+.muster-modal-dialog .muster-mini-day-grid .slot-cell-span-body {
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.muster-modal-dialog .slot-resize-handle {
+  height: 4px;
+}
+
+/* Mehrwöchig: äußere Wochen-Karte, innen durchgehende Tage */
+.muster-modal-dialog .muster-week-block {
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 0.35rem 0.35rem 0.45rem;
+  background: var(--surface);
+}
+
+.muster-modal-dialog .muster-three-weeks-editor--one-week .muster-week-block {
+  border: none;
+  padding: 0;
+  background: transparent;
 }
 
 .muster-art-picker-overlay {
@@ -3097,9 +3198,18 @@
   max-width: 100%;
   overflow: hidden;
   display: grid;
-  grid-template-columns: 0.85rem minmax(0, 1fr) 2.25rem minmax(2.25rem, auto);
+  grid-template-columns: 0.85rem minmax(0, 1fr) 2.25rem;
   align-items: center;
   column-gap: 0.4rem;
+}
+
+.muster-art-summary-name-with-count {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  gap: 0.3rem;
+  min-width: 0;
 }
 
 .muster-art-summary-item--with-switch {
@@ -3152,12 +3262,13 @@
 .muster-art-summary--modal-beside .muster-art-summary-label {
   min-width: 0;
   overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  white-space: normal;
-  word-break: break-word;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text-h);
+  line-height: 1.25;
 }
 
 .muster-art-summary--modal-beside .muster-art-summary-dot {
@@ -3167,12 +3278,12 @@
 }
 
 .muster-art-summary--modal-beside .muster-art-summary-count {
-  justify-self: end;
-  text-align: right;
+  flex-shrink: 0;
   font-variant-numeric: tabular-nums;
   font-size: 0.82rem;
   font-weight: 700;
   color: var(--text-h);
+  line-height: 1.25;
 }
 
 .muster-art-avail-switch-placeholder {
@@ -3183,7 +3294,11 @@
 }
 
 .muster-art-summary--modal-beside .muster-art-avail-switch {
-  justify-self: center;
+  justify-self: end;
+}
+
+.muster-art-summary--modal-beside .muster-art-avail-switch-placeholder {
+  justify-self: end;
 }
 
 .muster-art-summary-empty--modal-beside {
@@ -3239,98 +3354,13 @@
   gap: 1rem;
 }
 
-/* Muster mit nur einer Vorlagenwoche: Mo–So als durchgehende Tagesleiste, kompakte Slots */
+/* Nur eine Vorlagenwoche: kein Abstand zwischen Wochenblöcken, keine „Woche n“-Zeile */
 .muster-three-weeks-editor--one-week {
   gap: 0;
 }
 
-.muster-three-weeks-editor--one-week .muster-week-block {
-  border: none;
-  padding: 0;
-  background: transparent;
-}
-
 .muster-three-weeks-editor--one-week .muster-week-block-head {
   display: none;
-}
-
-.muster-three-weeks-editor--one-week .muster-week-editor-row {
-  gap: 0;
-  align-items: stretch;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  overflow: hidden;
-  background: var(--surface-2);
-}
-
-.muster-three-weeks-editor--one-week .muster-day-column {
-  flex: 1 1 0;
-  min-width: 0;
-  border: none;
-  border-radius: 0;
-  border-right: 1px solid var(--border-subtle);
-  background: var(--surface-2);
-}
-
-.muster-three-weeks-editor--one-week .muster-day-column:last-child {
-  border-right: none;
-}
-
-.muster-three-weeks-editor--one-week .muster-day-column-head {
-  padding: 0.22rem 0.15rem;
-  font-size: 0.68rem;
-  font-weight: 700;
-}
-
-.muster-three-weeks-editor--one-week .muster-mini-grid-wrap {
-  max-height: none;
-  overflow: visible;
-  padding: 0.12rem;
-}
-
-.muster-three-weeks-editor--one-week .muster-mini-day-grid.plan-grid {
-  min-width: 0;
-  width: 100%;
-}
-
-.muster-three-weeks-editor--one-week .muster-mini-day-grid .corner {
-  min-height: 0;
-  padding: 0;
-}
-
-.muster-three-weeks-editor--one-week .muster-mini-day-grid .col-head.muster-mini-col-head {
-  min-height: 0;
-  padding: 0.08rem 0.1rem;
-  font-size: 0.52rem;
-  line-height: 1.1;
-}
-
-.muster-three-weeks-editor--one-week .muster-mini-day-grid--single-lane .col-head.muster-mini-col-head--lane {
-  font-size: 0.52rem;
-}
-
-.muster-three-weeks-editor--one-week .muster-mini-day-grid .time-label {
-  font-size: 0.5rem;
-  padding: 0.04rem 0.08rem;
-  line-height: 1.1;
-  min-height: 0;
-}
-
-.muster-three-weeks-editor--one-week .muster-mini-day-grid .slot-cell-shell {
-  min-height: 0.65rem;
-}
-
-.muster-three-weeks-editor--one-week .muster-mini-day-grid .slot-cell {
-  min-height: 0.65rem;
-}
-
-.muster-three-weeks-editor--one-week .muster-mini-day-grid .slot-cell-span-body {
-  min-height: 0;
-  flex: 1 1 auto;
-}
-
-.muster-three-weeks-editor--one-week .slot-resize-handle {
-  height: 4px;
 }
 
 .muster-week-block {
