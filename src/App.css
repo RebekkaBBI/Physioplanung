@@ -3656,6 +3656,47 @@
   cursor: pointer;
 }
 
+.arten-edit-field--rooms > span:first-child {
+  display: block;
+  margin-bottom: 0.3rem;
+}
+
+.arten-edit-room-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  align-items: center;
+}
+
+.arten-edit-room-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.arten-edit-room-check input {
+  margin: 0;
+  cursor: pointer;
+}
+
+.art-create-modal-rooms {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.arten-inline-rooms {
+  font-size: 0.68rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  line-height: 1.25;
+  max-width: 14rem;
+}
+
 .arten-edit-actions {
   display: flex;
   flex-wrap: wrap;

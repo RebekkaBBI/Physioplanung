@@ -100,7 +100,32 @@ const OP_TAB_ROOM = 'OP-Saal' as const
 
 type Room = (typeof ROOMS)[number] | typeof OP_TAB_ROOM
 
-/** OP-Kalender: genau dieser Raum (nicht in ROOMS / Hauptkalender). */
+/** Spalten des Hauptkalenders (ohne OP-Saal). */
+type MainCalendarRoom = (typeof ROOMS)[number]
+
+function isMainCalendarRoomName(r: string): r is MainCalendarRoom {
+  return (ROOMS as readonly string[]).includes(r)
+}
+
+/** Aus Speicher: gültige Hauptkalender-Räume; leeres Array → undefined (alle Räume). */
+function normalizeArtAllowedRoomsFromStorage(
+  raw: unknown,
+): MainCalendarRoom[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: MainCalendarRoom[] = []
+  const seen = new Set<string>()
+  for (const x of raw) {
+    if (typeof x !== 'string') continue
+    const migrated = LEGACY_MAIN_CALENDAR_ROOM_KEYS[x.trim()] ?? x.trim()
+    if (isMainCalendarRoomName(migrated) && !seen.has(migrated)) {
+      seen.add(migrated)
+      out.push(migrated)
+    }
+  }
+  if (out.length === 0) return undefined
+  return out
+}
+
 type ViewMode = 'day' | 'week'
 
 const SLOT_MINUTES = 30
@@ -157,6 +182,8 @@ type BelegungsartItem = {
   slots: number
   /** Teammeeting: kein Patient; Teilnehmer als teamStaffIds; erscheint in deren Kalendern */
   teamMeeting?: boolean
+  /** Hauptkalender-Spalten; fehlt, leer oder alle Räume = überall buchbar. */
+  allowedRooms?: MainCalendarRoom[]
 }
 
 const OP_BELEGUNGSART_ID = 'art-op'
@@ -172,6 +199,47 @@ function artenWithFixedOpForMuster(artenList: BelegungsartItem[]): BelegungsartI
   return artenList.some((a) => a.id === OP_BELEGUNGSART_ID)
     ? artenList
     : [...artenList, OP_BELEGUNGSART_DEF]
+}
+
+function normalizeBelegungsArtLoaded(a: BelegungsartItem): BelegungsartItem {
+  const rooms = normalizeArtAllowedRoomsFromStorage(
+    (a as { allowedRooms?: unknown }).allowedRooms,
+  )
+  if (rooms === undefined) {
+    const { allowedRooms: _ar, ...rest } = a as BelegungsartItem & {
+      allowedRooms?: MainCalendarRoom[]
+    }
+    return rest
+  }
+  return { ...a, allowedRooms: rooms }
+}
+
+/** Leer/fehlend oder alle Räume = überall im Hauptkalender (Rückwärtskompatibilität). */
+function artEffectiveAllowedRooms(art: BelegungsartItem): MainCalendarRoom[] {
+  const r = art.allowedRooms
+  if (!r || r.length === 0 || r.length === ROOMS.length) return [...ROOMS]
+  return r
+}
+
+function artAllowedInMainCalendarRoom(art: BelegungsartItem, room: Room): boolean {
+  if (room === OP_TAB_ROOM) return art.id === OP_BELEGUNGSART_ID
+  if (!isMainCalendarRoomName(room)) return false
+  if (art.id === OP_BELEGUNGSART_ID) return false
+  return artEffectiveAllowedRooms(art).includes(room)
+}
+
+/** Muster-Raster: nur Spalten aus ROOMS; OP-Zellen dürfen in jeder Spalte liegen. */
+function artAllowedInMusterGridRoom(art: BelegungsartItem, room: Room): boolean {
+  if (!isMainCalendarRoomName(room)) return false
+  if (art.id === OP_BELEGUNGSART_ID) return true
+  return artEffectiveAllowedRooms(art).includes(room)
+}
+
+function formatArtRoomSummary(art: BelegungsartItem): string {
+  if (art.id === OP_BELEGUNGSART_ID) return ''
+  const r = art.allowedRooms
+  if (!r || r.length === 0 || r.length === ROOMS.length) return 'alle Räume'
+  return r.join(', ')
 }
 
 /** Pro Slot im Muster-Editor; Schlüssel `woche|wd|Raum|slot` (woche 0–2, wd 0=Mo … 6=So). Ältere Daten `wd|Raum|slot` = Woche 0. */
@@ -619,6 +687,19 @@ function findArtIdForCell(
   return undefined
 }
 
+function artMainRoomsFilterForMusterPlacement(
+  cells: CellData[],
+  artenList: BelegungsartItem[],
+): MainCalendarRoom[] | undefined {
+  const probe = cells[0]
+  if (!probe) return undefined
+  const artId = findArtIdForCell(probe, artenList)
+  if (!artId) return undefined
+  const art = artenList.find((a) => a.id === artId)
+  if (!art) return undefined
+  return artEffectiveAllowedRooms(art)
+}
+
 /** OP zählt nicht zur MA-Freigabe; nur echte Katalog-Arten prüfen. */
 function staffProfileMustAllowArt(artId: string): boolean {
   return artId !== OP_BELEGUNGSART_ID
@@ -656,6 +737,12 @@ function teamMeetingFromPanelBlockedReason(
   a: BelegungsartItem,
 ): string | null {
   if (!isTeamMeetingArt(a)) return 'Interner Fehler: keine Teammeeting-Art.'
+  if (
+    (ROOMS as readonly string[]).includes(room as string) &&
+    !artAllowedInMainCalendarRoom(a, room)
+  ) {
+    return `Die Belegungsart „${a.label}“ ist für den Raum „${room}“ nicht vorgesehen.`
+  }
   const max = slotCount()
   const span = Math.min(Math.max(1, a.slots), max - startSlot)
   if (slotRangeOverlapsMusterPause(startSlot, span)) {
@@ -754,6 +841,14 @@ function artFromPanelBlockedReason(
   }
   if (opTab && !isOpCalendarArt) {
     return 'Im OP-Kalender ist nur die Belegungsart OP erlaubt.'
+  }
+
+  if (
+    !opTab &&
+    (ROOMS as readonly string[]).includes(room as string) &&
+    !artAllowedInMainCalendarRoom(a, room)
+  ) {
+    return `Die Belegungsart „${a.label}“ ist für den Raum „${room}“ nicht vorgesehen (Räume in der Belegungsart bearbeiten).`
   }
 
   const wd = weekdayMon0FromDate(parseDateKey(dk))
@@ -857,6 +952,13 @@ function cellIsValidArtPanelDropPreview(
   if (opTab && isTeamMeetingArt(a)) return false
   if (opTab && a.id !== OP_BELEGUNGSART_ID) return false
   if (!opTab && a.id === OP_BELEGUNGSART_ID) return false
+  if (
+    !opTab &&
+    (ROOMS as readonly string[]).includes(room as string) &&
+    !artAllowedInMainCalendarRoom(a, room)
+  ) {
+    return false
+  }
   if (isTeamMeetingArt(a)) {
     return (
       teamMeetingFromPanelBlockedReason(cells, dk, room, startSlot, a) === null
@@ -1168,6 +1270,13 @@ function mergeArtenCatalogOnLoad(
 }
 
 const TEAM_MEETING_ART_ID = 'art-team-meeting'
+
+/** Im Dialog „Belegungsmuster bearbeiten“: obere Zählerliste ohne diese Arten. */
+const MUSTER_MODAL_ART_SUMMARY_EXCLUDED_IDS: ReadonlySet<string> = new Set([
+  TEAM_MEETING_ART_ID,
+  'art-orga',
+  'art-teamleiter-besprechung',
+])
 
 /** Hauptkalender: Belegungsarten, die im Termindialog als wöchentliche Reihe (gleiche Uhrzeit) angelegt werden können. */
 const WEEKLY_SERIES_MAIN_CALENDAR_ART_IDS: ReadonlySet<string> = new Set([
@@ -1798,7 +1907,9 @@ function parsePanelsFromJsonObject(parsed: unknown): LoadedPanels | null {
   const resolvedArten = mergeArtenCatalogOnLoad(
     catalogOk ? o.arten! : DEFAULT_ARTEN,
     storedCatalogVersion,
-  ).filter((a) => a.id !== OP_BELEGUNGSART_ID)
+  )
+    .filter((a) => a.id !== OP_BELEGUNGSART_ID)
+    .map(normalizeBelegungsArtLoaded)
   const artIdsForMigrate = resolvedArten.map((a) => a.id)
   const musterRaw = ensureVerlaengerungswocheMusterPreset(
     ensureOberschenkelOpMusterPreset(
@@ -3168,6 +3279,19 @@ function tryApplyMusterWeekToSlots(
         ) {
           continue
         }
+        const artId0 = findArtIdForCell(cells[0], artenList)
+        if (artId0) {
+          const ai = artenList.find((x) => x.id === artId0)
+          if (
+            ai &&
+            (ROOMS as readonly string[]).includes(room as string) &&
+            !artAllowedInMainCalendarRoom(ai, room)
+          ) {
+            return {
+              error: `Im Muster steht „${ai.label}“ im Raum „${room}“; diese Art ist dort nicht vorgesehen (Belegungsart bearbeiten: Räume).`,
+            }
+          }
+        }
         ops.push({ targetKeys, cells })
       }
     }
@@ -3395,10 +3519,21 @@ function findFreeSpanAnyRoom(
   span: number,
   preferRoom: Room,
   respectLunchPause: boolean,
+  restrictToRooms?: MainCalendarRoom[],
 ): { room: Room; start: number } | null {
   const max = slotCount()
   if (span > max) return null
-  const order: Room[] = [preferRoom, ...ROOMS.filter((r) => r !== preferRoom)]
+  const baseOrder: MainCalendarRoom[] =
+    restrictToRooms && restrictToRooms.length > 0
+      ? [...restrictToRooms]
+      : [...ROOMS]
+  const preferInOrder = baseOrder.includes(preferRoom as MainCalendarRoom)
+    ? (preferRoom as MainCalendarRoom)
+    : baseOrder[0]!
+  const order: Room[] = [
+    preferInOrder,
+    ...baseOrder.filter((r) => r !== preferInOrder),
+  ]
   for (const r of order) {
     for (let s = 0; s + span <= max; s++) {
       if (rangeFullyFree(cells, tDk, r, s, span, respectLunchPause)) {
@@ -3547,6 +3682,20 @@ function applyMusterWithPatientWeek(
         ) {
           continue
         }
+        const artId0 = findArtIdForCell(cells[0], artenList)
+        if (artId0) {
+          const ai = artenList.find((x) => x.id === artId0)
+          if (
+            ai &&
+            (ROOMS as readonly string[]).includes(room as string) &&
+            !artAllowedInMainCalendarRoom(ai, room)
+          ) {
+            alertOnce(
+              `Im Muster steht „${ai.label}“ im Raum „${room}“; diese Art ist dort nicht vorgesehen (Belegungsart bearbeiten: Räume). Das Muster wird nicht angewendet.`,
+            )
+            return prev
+          }
+        }
         ops.push({ tDk, wd, templateRoom: room, idealStart: start, cells })
       }
     }
@@ -3577,6 +3726,10 @@ function applyMusterWithPatientWeek(
   for (const op of ops) {
     const span = op.cells.length
     const { tDk, wd, templateRoom: tr, idealStart } = op
+    const roomsFilter = artMainRoomsFilterForMusterPlacement(
+      op.cells,
+      artenList,
+    )
 
     let chosenRoom: Room = tr
     let chosenStart: number
@@ -3610,7 +3763,7 @@ function applyMusterWithPatientWeek(
           chosenStart = wave
           collision = false
         } else {
-          const anyR = findFreeSpanAnyRoom(sim, tDk, span, tr, true)
+          const anyR = findFreeSpanAnyRoom(sim, tDk, span, tr, true, roomsFilter)
           if (anyR) {
             chosenRoom = anyR.room
             chosenStart = anyR.start
@@ -3888,11 +4041,15 @@ function relocateNonOpMusterOutOfOpTabRoom(
   chosenRoom: Room,
   chosenStart: number,
   collision: boolean,
+  restrictToRooms?: MainCalendarRoom[],
 ): { chosenRoom: Room; chosenStart: number; collision: boolean } {
   if (chosenRoom !== anchorRoom) {
     return { chosenRoom, chosenStart, collision }
   }
-  const alts = ROOMS.filter((r) => r !== anchorRoom)
+  let alts = ROOMS.filter((r) => r !== anchorRoom)
+  if (restrictToRooms && restrictToRooms.length > 0) {
+    alts = alts.filter((r) => restrictToRooms.includes(r))
+  }
   if (alts.length === 0) {
     return { chosenRoom, chosenStart, collision }
   }
@@ -3923,7 +4080,14 @@ function relocateNonOpMusterOutOfOpTabRoom(
       return { chosenRoom: alt, chosenStart: w, collision: false }
     }
   }
-  const ar = findFreeSpanAnyRoom(ghosted, tDk, span, alts[0]!, true)
+  const ar = findFreeSpanAnyRoom(
+    ghosted,
+    tDk,
+    span,
+    alts[0]!,
+    true,
+    restrictToRooms,
+  )
   if (ar && ar.room !== anchorRoom) {
     const free = rangeFullyFree(ghosted, tDk, ar.room, ar.start, span, true)
     return { chosenRoom: ar.room, chosenStart: ar.start, collision: !free }
@@ -4037,6 +4201,19 @@ function applyMusterFromOpBookingOnce(
         ) {
           continue
         }
+        const artId0 = findArtIdForCell(cells[0], artenList)
+        if (artId0) {
+          const ai = artenList.find((x) => x.id === artId0)
+          if (
+            ai &&
+            (ROOMS as readonly string[]).includes(room as string) &&
+            !artAllowedInMainCalendarRoom(ai, room)
+          ) {
+            return {
+              error: `Im Muster steht „${ai.label}“ im Raum „${room}“; diese Art ist dort nicht vorgesehen (Belegungsart bearbeiten: Räume).`,
+            }
+          }
+        }
         ops.push({ tDk, wd, templateRoom: room, idealStart: start, cells })
       }
     }
@@ -4070,10 +4247,23 @@ function applyMusterFromOpBookingOnce(
   for (const op of ops) {
     const span = op.cells.length
     const { tDk, wd, templateRoom: trRaw, idealStart } = op
-    const tr =
+    let tr: Room =
       trRaw === anchor.room
         ? (ROOMS.find((r) => r !== anchor.room) ?? trRaw)
         : trRaw
+    const roomsFilter = artMainRoomsFilterForMusterPlacement(
+      op.cells,
+      artenList,
+    )
+    if (
+      roomsFilter &&
+      roomsFilter.length > 0 &&
+      (ROOMS as readonly string[]).includes(tr as string) &&
+      !roomsFilter.includes(tr as MainCalendarRoom)
+    ) {
+      const alt = roomsFilter.find((r) => r !== anchor.room)
+      if (alt) tr = alt
+    }
 
     let chosenRoom: Room = tr
     let chosenStart: number
@@ -4107,7 +4297,7 @@ function applyMusterFromOpBookingOnce(
           chosenStart = wave
           collision = false
         } else {
-          const anyR = findFreeSpanAnyRoom(ghosted, tDk, span, tr, true)
+          const anyR = findFreeSpanAnyRoom(ghosted, tDk, span, tr, true, roomsFilter)
           if (anyR) {
             chosenRoom = anyR.room
             chosenStart = anyR.start
@@ -4162,6 +4352,7 @@ function applyMusterFromOpBookingOnce(
       chosenRoom,
       chosenStart,
       collision,
+      roomsFilter,
     )
     chosenRoom = rel.chosenRoom
     chosenStart = rel.chosenStart
@@ -4386,6 +4577,12 @@ function applyArtDropNoPatient(
     )
     return null
   }
+  if (!artAllowedInMusterGridRoom(a, room)) {
+    alertOnce(
+      `Die Belegungsart „${a.label}“ ist für den Raum „${room}“ im Muster nicht vorgesehen.`,
+    )
+    return null
+  }
   const next = { ...prev }
 
   for (let i = 0; i < span; i++) {
@@ -4477,6 +4674,26 @@ function cellMapApplyMove(
   const snapshot: CellData[] = sourceKeys.map((sk) => ({ ...prev[sk] }))
 
   const wdTo = weekdayMon0FromDate(parseDateKey(toDk))
+
+  if (fromRoom !== toRoom) {
+    const anchorCellForMove = snapshot[0]
+    const artId = findArtIdForCell(anchorCellForMove, arten)
+    const artItem = artId ? arten.find((x) => x.id === artId) : undefined
+    if (artItem) {
+      const restrictMuster = options?.blockLunchPauseAsMoveTarget === true
+      const ok = restrictMuster
+        ? artAllowedInMusterGridRoom(artItem, toRoom)
+        : artAllowedInMainCalendarRoom(artItem, toRoom)
+      if (!ok) {
+        alertOnce(
+          restrictMuster
+            ? 'Diese Belegungsart ist für den Zielraum im Muster nicht vorgesehen.'
+            : `Die Belegungsart „${artItem.label}“ darf nicht in den Raum „${toRoom}“ verschoben werden.`,
+        )
+        return null
+      }
+    }
+  }
 
   for (let i = 0; i < len; i++) {
     const tk = makeSlotKey(toDk, toRoom, toStartSlot + i)
@@ -6385,11 +6602,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const [newArtLabel, setNewArtLabel] = useState('')
   const [newArtMinutes, setNewArtMinutes] = useState(60)
   const [newArtColor, setNewArtColor] = useState('#0d9488')
+  const [newArtRoomIds, setNewArtRoomIds] = useState<MainCalendarRoom[]>(() => [
+    ...ROOMS,
+  ])
   const [newArtModalOpen, setNewArtModalOpen] = useState(false)
   const [editingArtId, setEditingArtId] = useState<string | null>(null)
   const [editArtLabel, setEditArtLabel] = useState('')
   const [editArtMinutes, setEditArtMinutes] = useState(60)
   const [editArtColor, setEditArtColor] = useState('#0d9488')
+  const [editArtRoomIds, setEditArtRoomIds] = useState<MainCalendarRoom[]>([])
   const [muster, setMuster] = useState<BelegungsmusterItem[]>(
     () => initialPanels?.muster ?? DEFAULT_MUSTER,
   )
@@ -9103,6 +9324,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           ) {
             fullKeys.add(k)
           } else if (
+            (isOpArt || artAllowedInMainCalendarRoom(a, room)) &&
             artSpanSlots > 1 &&
             !slotIndexInCalendarLunchPause(sl) &&
             (isTeamMeetingArt(a)
@@ -9204,6 +9426,15 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       hasPatient: !!sample.patient?.trim(),
     }
   }, [terminPickerModal, slotCells, arten, mitarbeiter])
+
+  const mainTerminArtPickList = useMemo(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') {
+      return arten
+    }
+    return arten.filter((a) =>
+      artAllowedInMainCalendarRoom(a, terminPickerModal.room),
+    )
+  }, [terminPickerModal, arten])
 
   const mainTerminWeeklySeriesEligible = useMemo(() => {
     if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') return false
@@ -9737,6 +9968,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       alertOnce('Bitte eine Bezeichnung für die Belegungsart eingeben.')
       return false
     }
+    if (newArtRoomIds.length === 0) {
+      alertOnce('Bitte mindestens einen Raum auswählen.')
+      return false
+    }
     const slots = Math.min(
       Math.max(1, Math.round(newArtMinutes / SLOT_MINUTES)),
       slotCount(),
@@ -9747,6 +9982,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       label,
       color: newArtColor,
       slots,
+      allowedRooms:
+        newArtRoomIds.length === ROOMS.length ? undefined : [...newArtRoomIds],
     }
     setArten((prev) => [...prev, item])
     setMitarbeiter((prev) =>
@@ -9765,6 +10002,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     setNewArtLabel('')
     setNewArtMinutes(60)
     setNewArtColor('#0d9488')
+    setNewArtRoomIds([...ROOMS])
     return true
   }
 
@@ -9776,6 +10014,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     setNewArtLabel('')
     setNewArtMinutes(60)
     setNewArtColor('#0d9488')
+    setNewArtRoomIds([...ROOMS])
     setNewArtModalOpen(true)
   }, [cloudSyncEnabled, mayArtenWrite])
 
@@ -9784,6 +10023,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     setNewArtLabel('')
     setNewArtMinutes(60)
     setNewArtColor('#0d9488')
+    setNewArtRoomIds([...ROOMS])
   }, [])
 
   const saveNewArtFromModal = () => {
@@ -9795,6 +10035,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     setEditArtLabel('')
     setEditArtMinutes(60)
     setEditArtColor('#0d9488')
+    setEditArtRoomIds([])
   }, [])
 
   const startEditArt = (a: BelegungsartItem) => {
@@ -9806,6 +10047,11 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     setEditArtLabel(a.label)
     setEditArtMinutes(a.slots * SLOT_MINUTES)
     setEditArtColor(a.color)
+    setEditArtRoomIds(
+      a.allowedRooms && a.allowedRooms.length > 0
+        ? [...a.allowedRooms]
+        : [...ROOMS],
+    )
   }
 
   const saveEditArt = () => {
@@ -9816,6 +10062,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       alertOnce('Bitte eine Bezeichnung eingeben.')
       return
     }
+    if (editArtRoomIds.length === 0) {
+      alertOnce('Bitte mindestens einen Raum auswählen.')
+      return
+    }
     const slots = Math.min(
       Math.max(1, Math.round(editArtMinutes / SLOT_MINUTES)),
       slotCount(),
@@ -9823,7 +10073,16 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     setArten((prev) =>
       prev.map((x) =>
         x.id === editingArtId
-          ? { ...x, label, slots, color: editArtColor }
+          ? {
+              ...x,
+              label,
+              slots,
+              color: editArtColor,
+              allowedRooms:
+                editArtRoomIds.length === ROOMS.length
+                  ? undefined
+                  : [...editArtRoomIds],
+            }
           : x,
       ),
     )
@@ -10233,6 +10492,31 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                         aria-label="Farbe bearbeiten"
                       />
                     </label>
+                    <div className="arten-edit-field arten-edit-field--rooms">
+                      <span>Räume (Hauptkalender)</span>
+                      <div
+                        className="arten-edit-room-checks"
+                        role="group"
+                        aria-label="Räume für diese Belegungsart"
+                      >
+                        {ROOMS.map((room) => (
+                          <label key={room} className="arten-edit-room-check">
+                            <input
+                              type="checkbox"
+                              checked={editArtRoomIds.includes(room)}
+                              onChange={() => {
+                                setEditArtRoomIds((prev) =>
+                                  prev.includes(room)
+                                    ? prev.filter((x) => x !== room)
+                                    : [...prev, room],
+                                )
+                              }}
+                            />
+                            <span>{room}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
                     <div className="arten-edit-actions">
                       <button
                         type="button"
@@ -10269,6 +10553,11 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                         <span className="arten-inline-time">
                           {a.slots * SLOT_MINUTES} Min
                         </span>
+                        {formatArtRoomSummary(a) ? (
+                          <span className="arten-inline-rooms">
+                            {formatArtRoomSummary(a)}
+                          </span>
+                        ) : null}
                       </span>
                     </button>
                     <div
@@ -10550,12 +10839,19 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     }
   }, [musterArtPicker, musterDraftCells])
 
+  const musterArtPickerAllowedArts = useMemo(() => {
+    if (!musterArtPicker) return artenForMusterEditor
+    return artenForMusterEditor.filter((a) =>
+      artAllowedInMusterGridRoom(a, musterArtPicker.room),
+    )
+  }, [musterArtPicker, artenForMusterEditor])
+
   const musterModalArtCounts = useMemo(() => {
     if (musterModal === null) return []
     return musterTemplateArtSlotCountsFullCatalog(
       virtualToMusterTemplate(musterDraftCells),
       arten,
-    )
+    ).filter((row) => !MUSTER_MODAL_ART_SUMMARY_EXCLUDED_IDS.has(row.id))
   }, [musterModal, musterDraftCells, arten])
 
   const musterEditorAvailabilityKeys = useMemo(() => {
@@ -10631,7 +10927,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
             {musterModalArtCounts.length > 0 ? (
               <ul
                 className="muster-art-summary muster-art-summary--modal-beside muster-art-summary--modal-3-rows"
-                aria-label="Belegungsarten im Muster: Anzahl 30-Minuten-Slots je Art (ohne OP und Pause)"
+                aria-label="Belegungsarten im Muster: Anzahl 30-Minuten-Slots je Art (ohne OP, Pause, Teammeeting, Orga und Teamleiterbesprechung)"
               >
                 {musterModalArtCounts.map((row) => {
                   const showAvailSwitch =
@@ -10762,10 +11058,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                   ersetzt.
                 </p>
                 <ul className="termin-staff-pick-list">
-                  {artenForMusterEditor.length === 0 ? (
-                    <li className="muted">Keine Belegungsarten angelegt.</li>
+                  {musterArtPickerAllowedArts.length === 0 ? (
+                    <li className="muted">
+                      Keine Belegungsart für diesen Muster-Raum vorgesehen.
+                    </li>
                   ) : (
-                    artenForMusterEditor.map((a) => (
+                    musterArtPickerAllowedArts.map((a) => (
                       <li key={a.id}>
                         <button
                           type="button"
@@ -13275,6 +13573,31 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                 aria-label="Farbe der Belegungsart"
               />
             </label>
+            <div className="staff-modal-label art-create-modal-rooms">
+              <span>Räume (Hauptkalender)</span>
+              <div
+                className="arten-edit-room-checks"
+                role="group"
+                aria-label="Räume für die neue Belegungsart"
+              >
+                {ROOMS.map((room) => (
+                  <label key={room} className="arten-edit-room-check">
+                    <input
+                      type="checkbox"
+                      checked={newArtRoomIds.includes(room)}
+                      onChange={() => {
+                        setNewArtRoomIds((prev) =>
+                          prev.includes(room)
+                            ? prev.filter((x) => x !== room)
+                            : [...prev, room],
+                        )
+                      }}
+                    />
+                    <span>{room}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
             <div className="staff-modal-footer">
               <button
                 type="button"
@@ -13625,12 +13948,13 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           Art wählen (Dauer und Farbe wie in den Belegungsarten).
                         </p>
                         <ul className="termin-staff-pick-list">
-                          {arten.length === 0 ? (
+                          {mainTerminArtPickList.length === 0 ? (
                             <li className="muted">
-                              Keine Belegungsarten angelegt.
+                              Keine Belegungsart für diesen Raum vorgesehen
+                              (Belegungsarten bearbeiten: Räume).
                             </li>
                           ) : (
-                            arten.map((a) => (
+                            mainTerminArtPickList.map((a) => (
                               <li key={a.id}>
                                 <button
                                   type="button"
