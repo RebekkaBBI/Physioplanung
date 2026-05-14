@@ -4196,7 +4196,10 @@ function normalizePatientsUniqueIds(raw: PatientItem[]): PatientItem[] {
   return out
 }
 
-/** OP: Muster + Hauptkalender-Termine entfernen, OP-Zeitblock ohne Muster-Verknüpfung behalten. */
+/** OP: Muster + Hauptkalender-Termine entfernen, OP-Zeitblock ohne Muster-Verknüpfung behalten.
+ * Alle Zellen mit derselben `musterLinkId` werden entfernt (auch Folgetermine nach Verschiebung
+ * im Hauptkalender), außer dem OP-Zeitfenster — dort bleibt die Buchung ohne Muster-Felder.
+ */
 function removeMusterLinkKeepOpBooking(
   prev: Record<string, CellData>,
   linkId: string,
@@ -9925,14 +9928,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       room,
       anchorSlot,
     )
-    const anchorK = makeSlotKey(dk, room, start)
-    const anchorCell = slotCells[anchorK]
-    if (anchorCell?.musterLinkId) {
-      alertOnce(
-        'Mit Belegungsmuster verknüpfte Termine können hier nicht verschoben werden. Bitte zuerst die Muster-Verknüpfung aufheben oder im Kalender per Drag verschieben.',
-      )
-      return
-    }
     const span = end - start + 1
     const max = slotCount()
     const allowedStarts = new Set<number>()
