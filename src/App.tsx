@@ -6859,7 +6859,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   const [musterEditorDragOverKey, setMusterEditorDragOverKey] = useState<
     string | null
   >(null)
-  /** Muster-Editor: genau eine Belegungsart — Zellen schattieren, in denen alle freigeschalteten MA verfügbar sind */
+  /** Muster-Editor: genau eine Belegungsart — Zellen schattieren, in denen mindestens ein freigeschalteter MA laut Wochenplan verfügbar ist */
   const [musterHighlightArtId, setMusterHighlightArtId] = useState<
     string | null
   >(null)
@@ -11090,7 +11090,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       for (let sl = 0; sl < slotsN; sl++) {
         if (slotIndexInCalendarLunchPause(sl)) continue
         if (
-          eligible.every((s) =>
+          eligible.some((s) =>
             isStaffSlotAvailableForDate(s, dayDk, wd, sl),
           )
         ) {
@@ -11184,7 +11184,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                             role="switch"
                             className="muster-art-avail-switch"
                             aria-checked={musterHighlightArtId === row.id}
-                            aria-label={`Verfügbarkeit für ${row.label} im Raster`}
+                            aria-label={`Verfügbarkeit: Slots schattieren, an denen mindestens ein Mitarbeiter mit Freigabe für ${row.label} laut Wochenplan frei ist`}
                             onClick={(e) => {
                               e.stopPropagation()
                               setMusterHighlightArtId((prev) =>
