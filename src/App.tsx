@@ -3824,7 +3824,7 @@ function mergePatientIntoMusterCell(
   return out
 }
 
-/** Muster auf Kalender mit Anker-Patient: Anker-Termin wird entfernt, dann freie Slots / Ausweichlage / Kollision (rot). */
+/** Muster auf Kalender mit Anker-Patient: Anker-Termin wird entfernt, dann freie Slots / Ausweichlage / Kollision (rot). Folgetermine auf Sa/So werden auf nahe Werktage verlegt (Anzahl gleich). */
 function applyMusterWithPatientWeek(
   prev: Record<string, CellData>,
   weekStart: Date,
@@ -3922,33 +3922,38 @@ function applyMusterWithPatientWeek(
 
   for (const op of ops) {
     const span = op.cells.length
-    const { tDk, wd, templateRoom: tr, idealStart } = op
+    const { templateRoom: tr, idealStart } = op
     const roomsFilter = artMainRoomsFilterForMusterPlacement(
       op.cells,
       artenList,
     )
 
-    let chosenRoom: Room = tr
-    let chosenStart: number
-    let collision: boolean
+    const targetDks = musterWeekdayCandidateTargetDks(op.tDk)
+    let picked: {
+      tDk: string
+      chosenRoom: Room
+      chosenStart: number
+      collision: boolean
+    } | null = null
+    let pickedCollisionFallback: {
+      tDk: string
+      chosenRoom: Room
+      chosenStart: number
+      collision: boolean
+    } | null = null
 
-    if (rangeFullyFree(sim, tDk, tr, idealStart, span, true)) {
-      chosenStart = idealStart
-      collision = false
-    } else {
-      const beside = findSlotBesideConflict(
-        sim,
-        tDk,
-        tr,
-        span,
-        idealStart,
-        true,
-      )
-      if (beside !== null) {
-        chosenStart = beside
+    for (const tDk of targetDks) {
+      const wd = weekdayMon0FromDate(parseDateKey(tDk))
+
+      let chosenRoom: Room = tr
+      let chosenStart: number
+      let collision: boolean
+
+      if (rangeFullyFree(sim, tDk, tr, idealStart, span, true)) {
+        chosenStart = idealStart
         collision = false
       } else {
-        const wave = findFreeSpanWaveSameRoom(
+        const beside = findSlotBesideConflict(
           sim,
           tDk,
           tr,
@@ -3956,55 +3961,92 @@ function applyMusterWithPatientWeek(
           idealStart,
           true,
         )
-        if (wave !== null) {
-          chosenStart = wave
+        if (beside !== null) {
+          chosenStart = beside
           collision = false
         } else {
-          const anyR = findFreeSpanAnyRoom(sim, tDk, span, tr, true, roomsFilter)
-          if (anyR) {
-            chosenRoom = anyR.room
-            chosenStart = anyR.start
+          const wave = findFreeSpanWaveSameRoom(
+            sim,
+            tDk,
+            tr,
+            span,
+            idealStart,
+            true,
+          )
+          if (wave !== null) {
+            chosenStart = wave
             collision = false
           } else {
-            const col = pickCollisionPlacement(
+            const anyR = findFreeSpanAnyRoom(
               sim,
               tDk,
-              tr,
               span,
-              idealStart,
+              tr,
               true,
+              roomsFilter,
             )
-            chosenRoom = col.room
-            chosenStart = col.start
-            collision = true
+            if (anyR) {
+              chosenRoom = anyR.room
+              chosenStart = anyR.start
+              collision = false
+            } else {
+              const col = pickCollisionPlacement(
+                sim,
+                tDk,
+                tr,
+                span,
+                idealStart,
+                true,
+              )
+              chosenRoom = col.room
+              chosenStart = col.start
+              collision = true
+            }
           }
         }
       }
+
+      if (
+        !collision &&
+        !staffAllowsMusterPlacement(
+          op.cells,
+          chosenStart,
+          tDk,
+          wd,
+          artenList,
+          staffList,
+        )
+      ) {
+        const col = pickCollisionPlacement(
+          sim,
+          tDk,
+          tr,
+          span,
+          idealStart,
+          true,
+        )
+        chosenRoom = col.room
+        chosenStart = col.start
+        collision = true
+      }
+
+      const chunk = { tDk, chosenRoom, chosenStart, collision }
+      if (!collision) {
+        picked = chunk
+        break
+      }
+      if (!pickedCollisionFallback) pickedCollisionFallback = chunk
     }
 
-    if (
-      !collision &&
-      !staffAllowsMusterPlacement(
-        op.cells,
-        chosenStart,
-        tDk,
-        wd,
-        artenList,
-        staffList,
+    const finalPick = picked ?? pickedCollisionFallback
+    if (!finalPick) {
+      alertOnce(
+        'Muster: Folgetermin auf Wochenende — kein Werktag für die Platzierung gefunden.',
       )
-    ) {
-      const col = pickCollisionPlacement(
-        sim,
-        tDk,
-        tr,
-        span,
-        idealStart,
-        true,
-      )
-      chosenRoom = col.room
-      chosenStart = col.start
-      collision = true
+      return prev
     }
+
+    const { tDk, chosenRoom, chosenStart, collision } = finalPick
 
     weekPlacements.push({
       tDk,
@@ -4295,6 +4337,44 @@ function relocateNonOpMusterOutOfOpTabRoom(
   return { chosenRoom, chosenStart, collision }
 }
 
+/** Montag=0 … Sonntag=6: Sa/So für Muster-Folgetermine als Wochenende behandeln. */
+function calendarWeekdayMon0IsWeekend(wd: number): boolean {
+  return wd >= 5
+}
+
+/**
+ * Idealdatum aus dem Muster-Raster: liegt es auf Sa/So, werden nahe Werktage
+ * (angrenzend, dann weiter) als Zielreihenfolge geliefert — damit bleiben
+ * Wochenenden frei und die Anzahl Folgetermine gleich.
+ */
+function musterWeekdayCandidateTargetDks(idealDk: string): string[] {
+  const d0 = parseDateKey(idealDk)
+  const wd0 = weekdayMon0FromDate(d0)
+  if (!calendarWeekdayMon0IsWeekend(wd0)) return [idealDk]
+  const out: string[] = []
+  const seen = new Set<string>()
+  const pushIfWeekday = (dk: string) => {
+    if (seen.has(dk)) return
+    const w = weekdayMon0FromDate(parseDateKey(dk))
+    if (calendarWeekdayMon0IsWeekend(w)) return
+    seen.add(dk)
+    out.push(dk)
+  }
+  const maxRings = 18
+  if (wd0 === 5) {
+    for (let i = 0; i < maxRings; i++) {
+      pushIfWeekday(dateKey(addDays(d0, -(i + 1))))
+      pushIfWeekday(dateKey(addDays(d0, (i + 1) + 1)))
+    }
+  } else {
+    for (let i = 0; i < maxRings; i++) {
+      pushIfWeekday(dateKey(addDays(d0, i + 1)))
+      pushIfWeekday(dateKey(addDays(d0, -(i + 2))))
+    }
+  }
+  return out
+}
+
 /**
  * Belegungsmuster auf OP-Buchung:
  * - Der Tag im Muster, an dem die Belegungsart „OP“ steht (eine Zeile im Muster-Editor),
@@ -4304,6 +4384,8 @@ function relocateNonOpMusterOutOfOpTabRoom(
  *   (addDays(weekStart, opAnchorDayIndex) === anchor-Datum).
  * - Alle übrigen Muster-Tage werden relativ dazu auf echte Kalendertage abgebildet
  *   und im Hauptkalender platziert (Mitarbeiter-Verfügbarkeit dort per echtem Wochentag).
+ * - Liegt ein Folgetermin auf Sa/So, wird er auf einen nahen Werktag verlegt (gleiche
+ *   Anzahl Termine; Wochenende bleibt frei, sofern im Kalender eine Lage möglich ist).
  * - Folgetermine werden nie im OP-Tab-Raum (Anker-Raum) gespeichert, damit sie nicht
  *   im OP-Kalender erscheinen.
  */
@@ -4458,33 +4540,38 @@ function applyMusterFromOpBookingOnce(
 
   for (const op of ops) {
     const span = op.cells.length
-    const { tDk, wd, templateRoom: tr, idealStart } = op
+    const { templateRoom: tr, idealStart } = op
     const roomsFilter = artMainRoomsFilterForMusterPlacement(
       op.cells,
       artenList,
     )
 
-    let chosenRoom: Room = tr
-    let chosenStart: number
-    let collision: boolean
+    const targetDks = musterWeekdayCandidateTargetDks(op.tDk)
+    let picked: {
+      tDk: string
+      chosenRoom: Room
+      chosenStart: number
+      collision: boolean
+    } | null = null
+    let pickedCollisionFallback: {
+      tDk: string
+      chosenRoom: Room
+      chosenStart: number
+      collision: boolean
+    } | null = null
 
-    if (rangeFullyFree(ghosted, tDk, tr, idealStart, span, true)) {
-      chosenStart = idealStart
-      collision = false
-    } else {
-      const beside = findSlotBesideConflict(
-        ghosted,
-        tDk,
-        tr,
-        span,
-        idealStart,
-        true,
-      )
-      if (beside !== null) {
-        chosenStart = beside
+    for (const tDk of targetDks) {
+      const wd = weekdayMon0FromDate(parseDateKey(tDk))
+
+      let chosenRoom: Room = tr
+      let chosenStart: number
+      let collision: boolean
+
+      if (rangeFullyFree(ghosted, tDk, tr, idealStart, span, true)) {
+        chosenStart = idealStart
         collision = false
       } else {
-        const wave = findFreeSpanWaveSameRoom(
+        const beside = findSlotBesideConflict(
           ghosted,
           tDk,
           tr,
@@ -4492,90 +4579,123 @@ function applyMusterFromOpBookingOnce(
           idealStart,
           true,
         )
-        if (wave !== null) {
-          chosenStart = wave
+        if (beside !== null) {
+          chosenStart = beside
           collision = false
         } else {
-          const anyR = findFreeSpanAnyRoom(ghosted, tDk, span, tr, true, roomsFilter)
-          if (anyR) {
-            chosenRoom = anyR.room
-            chosenStart = anyR.start
+          const wave = findFreeSpanWaveSameRoom(
+            ghosted,
+            tDk,
+            tr,
+            span,
+            idealStart,
+            true,
+          )
+          if (wave !== null) {
+            chosenStart = wave
             collision = false
           } else {
-            const col = pickCollisionPlacement(
+            const anyR = findFreeSpanAnyRoom(
               ghosted,
               tDk,
-              tr,
               span,
-              idealStart,
+              tr,
               true,
+              roomsFilter,
             )
-            chosenRoom = col.room
-            chosenStart = col.start
-            collision = true
+            if (anyR) {
+              chosenRoom = anyR.room
+              chosenStart = anyR.start
+              collision = false
+            } else {
+              const col = pickCollisionPlacement(
+                ghosted,
+                tDk,
+                tr,
+                span,
+                idealStart,
+                true,
+              )
+              chosenRoom = col.room
+              chosenStart = col.start
+              collision = true
+            }
           }
         }
       }
-    }
 
-    if (
-      !collision &&
-      !staffAllowsMusterPlacement(
-        op.cells,
-        chosenStart,
-        tDk,
-        wd,
-        artenList,
-        staffList,
-      )
-    ) {
-      const col = pickCollisionPlacement(
+      if (
+        !collision &&
+        !staffAllowsMusterPlacement(
+          op.cells,
+          chosenStart,
+          tDk,
+          wd,
+          artenList,
+          staffList,
+        )
+      ) {
+        const col = pickCollisionPlacement(
+          ghosted,
+          tDk,
+          tr,
+          span,
+          idealStart,
+          true,
+        )
+        chosenRoom = col.room
+        chosenStart = col.start
+        collision = true
+      }
+
+      const rel = relocateNonOpMusterOutOfOpTabRoom(
         ghosted,
         tDk,
-        tr,
-        span,
+        anchor.room,
         idealStart,
-        true,
+        span,
+        chosenRoom,
+        chosenStart,
+        collision,
+        roomsFilter,
       )
-      chosenRoom = col.room
-      chosenStart = col.start
-      collision = true
-    }
+      chosenRoom = rel.chosenRoom
+      chosenStart = rel.chosenStart
+      collision = rel.collision
 
-    const rel = relocateNonOpMusterOutOfOpTabRoom(
-      ghosted,
-      tDk,
-      anchor.room,
-      idealStart,
-      span,
-      chosenRoom,
-      chosenStart,
-      collision,
-      roomsFilter,
-    )
-    chosenRoom = rel.chosenRoom
-    chosenStart = rel.chosenStart
-    collision = rel.collision
-
-    if (
-      chosenRoom === anchor.room &&
-      ROOMS.some((r) => r !== anchor.room)
-    ) {
-      return {
-        error:
-          'Folgetermin kann nicht außerhalb des OP-Raums gebucht werden: in keinem anderen Raum ist eine passende freie Lage verfügbar. Bitte Zeiten im Hauptkalender freihalten.',
+      if (
+        chosenRoom === anchor.room &&
+        ROOMS.some((r) => r !== anchor.room)
+      ) {
+        continue
       }
-    }
 
-    for (let i = 0; i < span; i++) {
-      const pk = makeSlotKey(tDk, chosenRoom, chosenStart + i)
-      if (reserved.has(pk)) {
-        return {
-          error:
-            'Muster passt nicht: ein Termin würde den OP-Anker im Hauptkalender überschreiben.',
+      let overlapsReserved = false
+      for (let i = 0; i < span; i++) {
+        if (reserved.has(makeSlotKey(tDk, chosenRoom, chosenStart + i))) {
+          overlapsReserved = true
+          break
         }
       }
+      if (overlapsReserved) continue
+
+      const chunk = { tDk, chosenRoom, chosenStart, collision }
+      if (!collision) {
+        picked = chunk
+        break
+      }
+      if (!pickedCollisionFallback) pickedCollisionFallback = chunk
     }
+
+    const finalPick = picked ?? pickedCollisionFallback
+    if (!finalPick) {
+      return {
+        error:
+          'Folgetermin fällt auf ein Wochenende oder kollidiert: es konnte kein passender Werktag in der Nähe gebucht werden (Hauptkalender prüfen).',
+      }
+    }
+
+    const { tDk, chosenRoom, chosenStart, collision } = finalPick
 
     placements.push({
       tDk,
@@ -5371,7 +5491,6 @@ function TerminModalNotizFields({
         rows={3}
         value={draft}
         onChange={(e) => onDraftChange(e.target.value)}
-        placeholder="Nur intern sichtbar; wird bei Terminexport nicht mitgesendet."
         aria-label="Notiz zum Termin"
       />
       <button
@@ -9299,11 +9418,11 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       e.preventDefault()
       let w = (calendarHScrollAccumRef.current += dx)
       while (w >= THRESH) {
-        navPrev()
+        navNext()
         w -= THRESH
       }
       while (w <= -THRESH) {
-        navNext()
+        navPrev()
         w += THRESH
       }
       calendarHScrollAccumRef.current = w
@@ -11600,13 +11719,12 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         <div className="app-title-row">
           <div className="app-title-brand">
             <Image
-              src="/logo-bbi.svg"
-              alt="BBI"
+              src="/logo-bbi.png"
+              alt="BBI Institute"
               className="app-logo"
-              width={240}
-              height={96}
+              width={842}
+              height={595}
               priority
-              unoptimized
             />
             <h1 className="app-title">Physio PlanungsApp</h1>
           </div>
@@ -14404,11 +14522,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                   </p>
                   <div className="termin-reschedule-section">
                     <p className="staff-modal-label">Datum &amp; Uhrzeit</p>
-                    <p className="staff-modal-hint">
-                      Gleicher Raum. Zielzeiten ohne Mittagspause (12:00–13:30).
-                      Der Zielbereich muss frei sein; Mitarbeiter-Verfügbarkeit am
-                      neuen Tag wird geprüft.
-                    </p>
                     <div className="termin-reschedule-row">
                       <label className="termin-reschedule-field">
                         <span className="termin-reschedule-label">Datum</span>
@@ -14464,14 +14577,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                     <p className="staff-modal-label">Belegungsart</p>
                     {mainTerminEditArt ? (
                       <>
-                        <p className="staff-modal-hint">
-                          Art wählen (Dauer und Farbe wie in den Belegungsarten).
-                        </p>
                         <ul className="termin-staff-pick-list">
                           {mainTerminArtPickList.length === 0 ? (
                             <li className="muted">
-                              Keine Belegungsart für diesen Raum vorgesehen
-                              (Belegungsarten bearbeiten: Räume).
+                              Keine Belegungsart für diesen Raum vorgesehen.
                             </li>
                           ) : (
                             mainTerminArtPickList.map((a) => (
@@ -14521,13 +14630,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                     <p className="staff-modal-label">Mitarbeiter</p>
                     {mainTerminEditStaff ? (
                       <>
-                        <p className="staff-modal-hint">
-                          Es erscheinen nur Mitarbeiter, die im gesamten Termin
-                          verfügbar sind
-                          {terminModalDetail.blockArtId
-                            ? ' und für die gewählte Belegungsart freigeschaltet sind.'
-                            : '.'}
-                        </p>
                         <ul className="termin-staff-pick-list">
                           {mitarbeiter.length === 0 ? (
                             <li className="muted">Keine Mitarbeiter angelegt.</li>
@@ -14575,14 +14677,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                   </div>
                   {mainTerminWeeklySeriesEligible ? (
                     <>
-                      <p className="staff-modal-hint">
-                        Wöchentliche Wiederholung: der Termin wird an den
-                        Folgetagen derselben Wochenzeit eingetragen, sofern der
-                        Raum frei ist und der zugewiesene Mitarbeiter (falls
-                        vorhanden) nicht abwesend ist und im Wochenplan frei
-                        ist — andernfalls wird die jeweilige Woche
-                        übersprungen.
-                      </p>
                       <label className="staff-modal-label">
                         Reihentermin (Anzahl Wochen)
                         <input
@@ -14664,13 +14758,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                         </span>
                       </>
                     ) : null}
-                  </p>
-                  <p className="staff-modal-hint">
-                    Teilnehmer auswählen (Mehrfachauswahl). Bei
-                    Wiederholungen erscheint der Termin nur bei Mitarbeitern,
-                    die nicht abwesend sind und im Wochenplan frei sind —
-                    fehlen für eine Woche alle Teilnehmer, wird diese
-                    Wiederholung übersprungen.
                   </p>
                   <label className="staff-modal-label">
                     Reihentermin (Anzahl Wochen)
@@ -14864,10 +14951,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                           terminModalDetail.musterLabel ??
                           'Verknüpftes Muster'}
                       </p>
-                      <p className="muted op-termin-muster-hint">
-                        Zum Wechseln des Musters zuerst „Belegungsmuster löschen“
-                        wählen.
-                      </p>
                     </div>
                   ) : (
                     <div className="op-termin-muster-row">
@@ -14948,9 +15031,6 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
               ) : null
             ) : (
               <>
-                <p className="staff-modal-hint">
-                  Dieser Slot ist nicht mehr belegt.
-                </p>
                 <div className="staff-modal-footer termin-staff-footer">
                   <button
                     type="button"
