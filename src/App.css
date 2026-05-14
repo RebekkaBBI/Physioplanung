@@ -362,6 +362,7 @@
   flex-direction: column;
   min-height: 0;
   flex: 1 1 auto;
+  overscroll-behavior-x: contain;
 }
 
 /*
@@ -3457,6 +3458,67 @@
 
 .termin-staff-summary {
   margin-bottom: 0.35rem;
+}
+
+.termin-reschedule-section {
+  margin: 0.5rem 0 0.75rem;
+  padding: 0.55rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.termin-reschedule-section .staff-modal-label {
+  margin-top: 0;
+}
+
+.termin-reschedule-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.5rem 0.65rem;
+  margin-top: 0.45rem;
+}
+
+.termin-reschedule-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.termin-reschedule-field--grow {
+  flex: 1 1 7rem;
+}
+
+.termin-reschedule-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+}
+
+.termin-reschedule-input,
+.termin-reschedule-select {
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.4rem 0.45rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-h);
+  min-width: 0;
+}
+
+.termin-reschedule-select {
+  width: 100%;
+}
+
+.termin-reschedule-apply {
+  flex: 0 0 auto;
+  align-self: flex-end;
+  white-space: nowrap;
 }
 
 .termin-staff-line {

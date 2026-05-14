@@ -6905,6 +6905,10 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
   >([])
   const [teamMeetingRepeatWeeks, setTeamMeetingRepeatWeeks] = useState(1)
   const [mainTerminRepeatWeeks, setMainTerminRepeatWeeks] = useState(1)
+  /** Entwurf für „Datum & Uhrzeit“ im Hauptkalender-Termin-Dialog */
+  const [mainTerminRescheduleDk, setMainTerminRescheduleDk] = useState('')
+  const [mainTerminRescheduleStartSlot, setMainTerminRescheduleStartSlot] =
+    useState(0)
   const teamMeetingModalInitKeyRef = useRef<string | null>(null)
   const [terminNotizDraft, setTerminNotizDraft] = useState('')
   const [opTerminPatientDraft, setOpTerminPatientDraft] = useState('')
@@ -7667,6 +7671,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       toDk: string,
       toRoom: Room,
       toStartSlot: number,
+      moveOpts?: { blockLunchPauseAsMoveTarget?: boolean },
     ) => {
       setSlotCells((prev) =>
         cellMapApplyMove(
@@ -7679,6 +7684,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
           toStartSlot,
           arten,
           mitarbeiter,
+          moveOpts,
         ) ?? prev,
       )
     },
@@ -8783,6 +8789,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       mainTerminPickInitKeyRef.current = null
       setMainTerminEditArt(false)
       setMainTerminEditStaff(false)
+      setMainTerminRescheduleDk('')
+      setMainTerminRescheduleStartSlot(0)
       return
     }
     const key = `${terminPickerModal.dk}|${terminPickerModal.room}|${terminPickerModal.anchorSlot}`
@@ -8795,6 +8803,8 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         room,
         anchorSlot,
       )
+      setMainTerminRescheduleDk(dk)
+      setMainTerminRescheduleStartSlot(start)
       const sample = slotCells[makeSlotKey(dk, room, start)]
       setMainTerminEditArt(
         sample ? patientTerminNeedsArtChoice(sample, arten) : false,
@@ -9183,7 +9193,7 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     [staffTerminDetailModal, setSlotCells],
   )
 
-  const navPrev = () => {
+  const navPrev = useCallback(() => {
     if (calendarTabId === CALENDAR_TAB_OP) {
       setAnchorDate((d) => addDays(d, -OP_OVERVIEW_DAY_COUNT))
     } else if (viewMode === 'day') {
@@ -9191,9 +9201,9 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     } else {
       setAnchorDate((d) => addDays(d, -7))
     }
-  }
+  }, [calendarTabId, viewMode])
 
-  const navNext = () => {
+  const navNext = useCallback(() => {
     if (calendarTabId === CALENDAR_TAB_OP) {
       setAnchorDate((d) => addDays(d, OP_OVERVIEW_DAY_COUNT))
     } else if (viewMode === 'day') {
@@ -9201,7 +9211,106 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
     } else {
       setAnchorDate((d) => addDays(d, 7))
     }
-  }
+  }, [calendarTabId, viewMode])
+
+  const isCalendarSwipeNavBlocked = useMemo(
+    () =>
+      terminPickerModal !== null ||
+      staffAbsenceModalId !== null ||
+      staffTerminDetailModal !== null ||
+      newArtModalOpen ||
+      musterModal !== null ||
+      musterArtPicker !== null ||
+      staffModal !== null ||
+      patientExportOpen ||
+      staffExportOpen ||
+      roomExportOpen,
+    [
+      terminPickerModal,
+      staffAbsenceModalId,
+      staffTerminDetailModal,
+      newArtModalOpen,
+      musterModal,
+      musterArtPicker,
+      staffModal,
+      patientExportOpen,
+      staffExportOpen,
+      roomExportOpen,
+    ],
+  )
+
+  const isCalendarSwipeNavBlockedRef = useRef(isCalendarSwipeNavBlocked)
+  isCalendarSwipeNavBlockedRef.current = isCalendarSwipeNavBlocked
+
+  const calendarHScrollAccumRef = useRef(0)
+  useEffect(() => {
+    if (isCalendarSwipeNavBlocked) {
+      calendarHScrollAccumRef.current = 0
+    }
+  }, [isCalendarSwipeNavBlocked])
+
+  useEffect(() => {
+    calendarHScrollAccumRef.current = 0
+  }, [calendarTabId, viewMode])
+
+  const mainCalendarColumnRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = mainCalendarColumnRef.current
+    if (!el) return
+    const THRESH = 90
+    const onWheel = (e: WheelEvent) => {
+      if (isCalendarSwipeNavBlockedRef.current) return
+      if (e.ctrlKey) return
+      const rawTarget = e.target
+      if (!(rawTarget instanceof Element)) return
+      if (rawTarget.closest('[data-no-calendar-swipe-nav]')) return
+      if (rawTarget.closest('[role="dialog"]')) return
+      const field = rawTarget.closest('input, textarea, select, [contenteditable="true"]')
+      if (field) return
+
+      let dx = e.deltaX
+      let dy = e.deltaY
+      if (e.deltaMode === 1) {
+        dx *= 16
+        dy *= 16
+      } else if (e.deltaMode === 2) {
+        dx *= 520
+        dy *= 520
+      }
+      if (e.shiftKey && Math.abs(dy) >= Math.abs(dx)) {
+        dx = dy
+        dy = 0
+      }
+      if (Math.abs(dx) < Math.abs(dy) * 1.12) return
+
+      let node: HTMLElement | null =
+        rawTarget instanceof HTMLElement ? rawTarget : null
+      while (node && node !== el) {
+        const ox = window.getComputedStyle(node).overflowX
+        if (
+          (ox === 'auto' || ox === 'scroll') &&
+          node.scrollWidth > node.clientWidth + 2
+        ) {
+          return
+        }
+        node = node.parentElement
+      }
+
+      e.preventDefault()
+      let w = (calendarHScrollAccumRef.current += dx)
+      while (w >= THRESH) {
+        navPrev()
+        w -= THRESH
+      }
+      while (w <= -THRESH) {
+        navNext()
+        w += THRESH
+      }
+      calendarHScrollAccumRef.current = w
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [navPrev, navNext])
 
   const headerLabel =
     calendarTabId === CALENDAR_TAB_PT_ZOOM
@@ -9641,6 +9750,130 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
       hasPatient: !!sample.patient?.trim(),
     }
   }, [terminPickerModal, slotCells, arten, mitarbeiter])
+
+  const mainTerminRescheduleTimeOptions = useMemo(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') return []
+    const { dk, room, anchorSlot } = terminPickerModal
+    const { start, end } = findTerminBlockBoundsIgnoringStaff(
+      slotCells,
+      dk,
+      room,
+      anchorSlot,
+    )
+    const span = end - start + 1
+    const max = slotCount()
+    const out: { value: number; label: string }[] = []
+    for (let sl = 0; sl + span <= max; sl++) {
+      if (slotRangeOverlapsMusterPause(sl, span)) continue
+      const endSl = sl + span - 1
+      out.push({
+        value: sl,
+        label:
+          span === 1
+            ? slotIndexToLabel(sl)
+            : `${slotIndexToLabel(sl)}–${slotIndexToLabel(endSl)}`,
+      })
+    }
+    return out
+  }, [terminPickerModal, slotCells])
+
+  useEffect(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') return
+    if (mainTerminRescheduleTimeOptions.length === 0) return
+    if (
+      !mainTerminRescheduleTimeOptions.some(
+        (o) => o.value === mainTerminRescheduleStartSlot,
+      )
+    ) {
+      setMainTerminRescheduleStartSlot(mainTerminRescheduleTimeOptions[0].value)
+    }
+  }, [
+    terminPickerModal,
+    mainTerminRescheduleTimeOptions,
+    mainTerminRescheduleStartSlot,
+  ])
+
+  const applyMainTerminRescheduleFromModal = useCallback(() => {
+    if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') return
+    if (cloudSyncEnabled && !mayCalendarWrite) {
+      alertOnce('Keine Berechtigung zum Verschieben von Terminen im Kalender.')
+      return
+    }
+    const { dk, room, anchorSlot } = terminPickerModal
+    const { start, end } = findTerminBlockBoundsIgnoringStaff(
+      slotCells,
+      dk,
+      room,
+      anchorSlot,
+    )
+    const anchorK = makeSlotKey(dk, room, start)
+    const anchorCell = slotCells[anchorK]
+    if (anchorCell?.musterLinkId) {
+      alertOnce(
+        'Mit Belegungsmuster verknüpfte Termine können hier nicht verschoben werden. Bitte zuerst die Muster-Verknüpfung aufheben oder im Kalender per Drag verschieben.',
+      )
+      return
+    }
+    const span = end - start + 1
+    const max = slotCount()
+    const allowedStarts = new Set<number>()
+    for (let sl = 0; sl + span <= max; sl++) {
+      if (slotRangeOverlapsMusterPause(sl, span)) continue
+      allowedStarts.add(sl)
+    }
+    const targetStart = allowedStarts.has(mainTerminRescheduleStartSlot)
+      ? mainTerminRescheduleStartSlot
+      : [...allowedStarts][0] ?? start
+    if (
+      dk === mainTerminRescheduleDk &&
+      start === targetStart
+    ) {
+      return
+    }
+    let moved = false
+    setSlotCells((prev) => {
+      const next = cellMapApplyMove(
+        prev,
+        dk,
+        room,
+        start,
+        mainTerminRescheduleDk,
+        room,
+        targetStart,
+        arten,
+        mitarbeiter,
+        { blockLunchPauseAsMoveTarget: true },
+      )
+      if (next) moved = true
+      return next ?? prev
+    })
+    if (!moved) return
+    const newDk = mainTerminRescheduleDk
+    const newStart = targetStart
+    queueMicrotask(() => {
+      setTerminPickerModal((m) =>
+        m?.kind === 'mainTermin'
+          ? { ...m, dk: newDk, anchorSlot: newStart }
+          : m,
+      )
+      if (viewMode === 'day' && calendarTabId === 'main') {
+        openDayForCell(parseDateKey(newDk))
+      }
+    })
+  }, [
+    terminPickerModal,
+    slotCells,
+    mainTerminRescheduleDk,
+    mainTerminRescheduleStartSlot,
+    arten,
+    mitarbeiter,
+    setSlotCells,
+    cloudSyncEnabled,
+    mayCalendarWrite,
+    viewMode,
+    calendarTabId,
+    openDayForCell,
+  ])
 
   const mainTerminArtPickList = useMemo(() => {
     if (!terminPickerModal || terminPickerModal.kind !== 'mainTermin') {
@@ -11692,7 +11925,11 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
         </aside>
           ) : null}
 
-        <div className="main-column main-column--calendar" aria-label="Hauptkalender">
+        <div
+          ref={mainCalendarColumnRef}
+          className="main-column main-column--calendar"
+          aria-label="Hauptkalender"
+        >
           <div
             className="calendar-view-tabs"
             role="tablist"
@@ -14165,6 +14402,64 @@ export default function App({ cloudSyncEnabled = false }: AppProps = {}) {
                       </>
                     ) : null}
                   </p>
+                  <div className="termin-reschedule-section">
+                    <p className="staff-modal-label">Datum &amp; Uhrzeit</p>
+                    <p className="staff-modal-hint">
+                      Gleicher Raum. Zielzeiten ohne Mittagspause (12:00–13:30).
+                      Der Zielbereich muss frei sein; Mitarbeiter-Verfügbarkeit am
+                      neuen Tag wird geprüft.
+                    </p>
+                    <div className="termin-reschedule-row">
+                      <label className="termin-reschedule-field">
+                        <span className="termin-reschedule-label">Datum</span>
+                        <input
+                          type="date"
+                          className="termin-reschedule-input"
+                          value={mainTerminRescheduleDk}
+                          disabled={cloudSyncEnabled && !mayCalendarWrite}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+                              setMainTerminRescheduleDk(v)
+                            }
+                          }}
+                          aria-label="Neues Datum für den Termin"
+                        />
+                      </label>
+                      <label className="termin-reschedule-field termin-reschedule-field--grow">
+                        <span className="termin-reschedule-label">Beginn</span>
+                        <select
+                          className="termin-reschedule-select"
+                          value={mainTerminRescheduleStartSlot}
+                          disabled={cloudSyncEnabled && !mayCalendarWrite}
+                          onChange={(e) =>
+                            setMainTerminRescheduleStartSlot(Number(e.target.value))
+                          }
+                          aria-label="Neue Startzeit für den Termin"
+                        >
+                          {mainTerminRescheduleTimeOptions.length === 0 ? (
+                            <option value={mainTerminRescheduleStartSlot}>
+                              {slotIndexToLabel(mainTerminRescheduleStartSlot)}
+                            </option>
+                          ) : (
+                            mainTerminRescheduleTimeOptions.map((o) => (
+                              <option key={o.value} value={o.value}>
+                                {o.label}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      </label>
+                      <button
+                        type="button"
+                        className="btn-edit-save termin-reschedule-apply"
+                        disabled={cloudSyncEnabled && !mayCalendarWrite}
+                        onClick={() => applyMainTerminRescheduleFromModal()}
+                      >
+                        Termin verschieben
+                      </button>
+                    </div>
+                  </div>
                   <div className="termin-main-section">
                     <p className="staff-modal-label">Belegungsart</p>
                     {mainTerminEditArt ? (
